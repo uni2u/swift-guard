@@ -1,7 +1,7 @@
 # swift-guard
 Secure WebAssembly Inspection Framework for Traffic using Guard
 
-# XDP-Filter: High-Performance Adaptive Packet Processing Framework
+# Swift-Guard: High-Performance Adaptive Packet Processing Framework
 
 [![License: GPL v2](https://img.shields.io/badge/License-GPL%20v2-blue.svg)](https://www.gnu.org/licenses/old-licenses/gpl-2.0.en.html)
 [![Rust](https://img.shields.io/badge/rust-1.65%2B-orange.svg)](https://www.rust-lang.org/)
@@ -9,9 +9,9 @@ Secure WebAssembly Inspection Framework for Traffic using Guard
 
 ## 📝 Overview
 
-XDP-Filter provides a high-performance packet filtering and redirection framework leveraging the Linux kernel's eXpress Data Path (XDP) technology. This framework enables wire-speed packet processing with sophisticated traffic classification and dynamic redirection capabilities critical for adaptive security architectures.
+Swift-Guard provides a high-performance packet filtering and redirection framework leveraging the Linux kernel's eXpress Data Path (XDP) technology. This framework enables wire-speed packet processing with sophisticated traffic classification and dynamic redirection capabilities critical for adaptive security architectures.
 
-By operating at the network driver level, XDP-Filter achieves microsecond-level processing latency while maintaining the flexibility to implement complex filtering logic and redirection policies.
+By operating at the network driver level, Swift-Guard achieves microsecond-level processing latency while maintaining the flexibility to implement complex filtering logic and redirection policies.
 
 ## 🔑 Key Features
 
@@ -26,7 +26,7 @@ By operating at the network driver level, XDP-Filter achieves microsecond-level 
 
 ### Core Components
 
-XDP-Filter implements a two-tier architecture:
+Swift-Guard implements a two-tier architecture:
 
 ```
 [Kernel Space]
@@ -48,7 +48,7 @@ XDP-Filter implements a two-tier architecture:
 
 ### Performance Optimization Strategy
 
-XDP-Filter employs multiple optimization techniques:
+Swift-Guard employs multiple optimization techniques:
 
 1. **Memory Access Pattern Optimization**
    - Sequential packet header parsing to maximize cache locality
@@ -81,8 +81,8 @@ XDP-Filter employs multiple optimization techniques:
 $ sudo apt install -y clang llvm libelf-dev build-essential linux-headers-$(uname -r)
 
 # Clone repository
-$ git clone https://github.com/username/xdp-filter.git
-$ cd xdp-filter
+$ git clone https://github.com/uni2u/swift-guard.git
+$ cd swift-guard
 
 # Build
 $ cargo build --release
@@ -92,7 +92,7 @@ $ cargo build --release
 
 ### Basic Commands
 
-XDP-Filter provides a comprehensive CLI for managing packet filtering and redirection rules:
+Swift-Guard provides a comprehensive CLI for managing packet filtering and redirection rules:
 
 ```bash
 # Attach XDP program to network interface
@@ -160,7 +160,7 @@ For complete documentation of all commands, please see the [Command Reference](d
 
 ## 📊 Performance Benchmarks
 
-XDP-Filter delivers exceptional performance with minimal overhead:
+Swift-Guard delivers exceptional performance with minimal overhead:
 
 | Metric | Value | Notes |
 |--------|-------|-------|
@@ -173,7 +173,7 @@ XDP-Filter delivers exceptional performance with minimal overhead:
 
 ## 🔍 Integration with Security Frameworks
 
-XDP-Filter serves as a foundational component for advanced security architectures:
+Swift-Guard serves as a foundational component for advanced security architectures:
 
 - **WASM-based Inspection Modules**: Redirect suspicious traffic to WebAssembly-powered inspection containers
 - **Dynamic Defense Orchestration**: Trigger instantiation of security functions based on traffic patterns
