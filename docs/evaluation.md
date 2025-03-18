@@ -77,3 +77,9 @@ $ ./run_benchmarks.sh
 $ cd tests/security
 $ ./run_security_tests.sh
 ```
+
+### Test Results and Analysis
+Test results are saved in a structured JSON format. These results can be processed and visualized using analysis scripts:
+```bash
+$ ./analyze_results.py --input results.json --output report.pdf
+```
