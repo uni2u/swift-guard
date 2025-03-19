@@ -21,6 +21,7 @@ By operating at the network driver level, Swift-Guard achieves microsecond-level
 - **Real-time Policy Management**: Intuitive CLI for runtime policy configuration
 - **Self-adaptive Security Integration**: Foundation for trigger-based security module instantiation
 - **Comprehensive Telemetry**: Detailed performance and traffic statistics
+- **WebAssembly Integration**: Support for WASM-based packet inspection and security modules
 
 ## 🛠️ Technical Architecture
 
@@ -40,6 +41,11 @@ Swift-Guard implements a two-tier architecture:
     │     ├── [libbpf-rs Bindings] - Kernel interface
     │     ├── [Map Management Logic] - Policy CRUD operations
     │     └── [Telemetry Collector] - Performance and operational metrics
+    │
+    ├── [WASM Runtime]
+    │     ├── [Module Manager] - Module lifecycle control 
+    │     ├── [Packet Inspection API] - Interface for security modules
+    │     └── [Security Modules] - Pluggable traffic analysis routines
     │
     └── [CLI Interface]
           ├── [Command Parser] - Structured argument processing
@@ -84,8 +90,16 @@ $ sudo apt install -y clang llvm libelf-dev build-essential linux-headers-$(unam
 $ git clone https://github.com/uni2u/swift-guard.git
 $ cd swift-guard
 
-# Build
+# Build BPF program
+$ cd src/bpf
+$ make
+$ cd ../..
+
+# Build Rust components
 $ cargo build --release
+
+# Install
+$ sudo make install
 ```
 
 ## 📋 Usage
@@ -117,48 +131,7 @@ $ xdp-filter delete-rule --label "block-web-access"
 $ xdp-filter detach eth0
 ```
 
-### Command Reference
-
-#### Attach Command
-
-```
-xdp-filter attach <interface> [FLAGS] [OPTIONS]
-
-ARGS:
-    <interface>    Network interface name
-
-FLAGS:
-    -h, --help     Prints help information
-    --force        Skip check for XDP support
-
-OPTIONS:
-    --mode <mode>  Attach mode (default: driver, options: driver, offload, generic)
-```
-
-#### Add-Rule Command
-
-```
-xdp-filter add-rule --action <action> [OPTIONS]
-
-OPTIONS:
-    --src-ip <src_ip>            Source IP address (format: a.b.c.d or a.b.c.d/prefix)
-    --dst-ip <dst_ip>            Destination IP address (format: a.b.c.d or a.b.c.d/prefix)
-    --src-port <src_port>        Source port or port range (format: port or port1-port2)
-    --dst-port <dst_port>        Destination port or port range (format: port or port1-port2)
-    --protocol <protocol>        Protocol (options: tcp, udp, icmp, any)
-    --tcp-flags <tcp_flags>      TCP flags to match (format: SYN,ACK,FIN,RST,PSH,URG)
-    --pkt-len <pkt_len>          Packet length range to match (format: min-max)
-    --action <action>            Action (options: pass, drop, redirect, count)
-    --redirect-if <redirect_if>  Redirect interface (required for redirect action)
-    --priority <priority>        Rule priority (higher number = higher priority, default: 0)
-    --rate-limit <rate_limit>    Rate limit in packets per second (0 = unlimited)
-    --expire <expire>            Rule expiration time in seconds (0 = no expiration)
-    --label <label>              Rule name/label for identification
-```
-
-For complete documentation of all commands, please see the [Command Reference](docs/commands.md).
-
-## 📊 Performance Benchmarks
+## 📊 Research and Performance Benchmarks
 
 Swift-Guard delivers exceptional performance with minimal overhead:
 
@@ -171,14 +144,34 @@ Swift-Guard delivers exceptional performance with minimal overhead:
 
 *Note: Performance metrics were measured on an Intel Xeon E5-2680v4 @ 2.4GHz with Linux 5.15.0*
 
-## 🔍 Integration with Security Frameworks
+## 🔍 WASM Integration for Security Inspection
 
-Swift-Guard serves as a foundational component for advanced security architectures:
+Swift-Guard integrates a WebAssembly (WASM) runtime to enable pluggable, language-agnostic security modules:
 
-- **WASM-based Inspection Modules**: Redirect suspicious traffic to WebAssembly-powered inspection containers
-- **Dynamic Defense Orchestration**: Trigger instantiation of security functions based on traffic patterns
-- **Zero-Trust Network Access**: Enforce fine-grained access control at the kernel level
-- **DDoS Mitigation**: Early-stage attack detection and mitigation before reaching application layers
+### WASM Module Architecture
+
+```
+[WASM Module]
+    ├── [Host Interface]
+    │     ├── [Memory Management API] - Allocation and buffer management
+    │     ├── [Logging API] - Diagnostic and alert facilities
+    │     └── [Configuration API] - Dynamic parameter tuning
+    │
+    ├── [Packet Inspection Logic]
+    │     ├── [Protocol Analysis] - Protocol-specific parsing
+    │     ├── [Security Policies] - Detection rules and signatures
+    │     └── [State Management] - Connection tracking
+    │
+    └── [Decision Interface]
+          └── [Verdict API] - Allow/block/redirect decision
+```
+
+### Benefits of WASM Integration
+
+- **Language Flexibility**: Write modules in Rust, C/C++, AssemblyScript, or any WASM-compatible language
+- **Security Isolation**: Sandboxed execution prevents system compromise
+- **Dynamic Updates**: Hot-reload modules without restarting the framework
+- **Performance**: Near-native execution speed with minimal overhead
 
 ## 🤝 Contributing
 
@@ -193,3 +186,4 @@ This project is licensed under the GNU General Public License v2 - see the [LICE
 - [XDP Documentation](https://github.com/xdp-project/xdp-tutorial)
 - [libbpf-rs Documentation](https://github.com/libbpf/libbpf-rs)
 - [eBPF & XDP Reference Guide](https://cilium.readthedocs.io/en/latest/bpf/)
+- [WebAssembly for Proxies](https://github.com/proxy-wasm/spec)

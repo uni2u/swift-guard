@@ -1,0 +1,56 @@
+[package]
+name = "swift-guard"
+version = "0.1.0"
+edition = "2021"
+authors = ["Your Name <your.email@example.com>"]
+description = "Secure WebAssembly Inspection Framework for Traffic using Guard"
+readme = "README.md"
+repository = "https://github.com/uni2u/swift-guard"
+license = "GPL-2.0"
+keywords = ["xdp", "ebpf", "network", "security", "wasm"]
+categories = ["network-programming", "command-line-utilities"]
+
+[workspace]
+members = [
+    "src/cli",
+    "src/daemon",
+    "src/common",
+]
+
+[dependencies]
+libbpf-rs = "0.19"
+libc = "0.2"
+clap = { version = "4.3", features = ["derive"] }
+anyhow = "1.0"
+thiserror = "1.0"
+tokio = { version = "1.28", features = ["full"] }
+log = "0.4"
+env_logger = "0.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+byteorder = "1.4"
+nix = "0.26"
+wasmtime = "12.0"
+chrono = "0.4"
+ctrlc = "3.4"
+ipnet = "2.8"
+crossbeam-channel = "0.5"
+
+[lib]
+name = "swift_guard"
+path = "src/common/lib.rs"
+
+[[bin]]
+name = "xdp-filter"
+path = "src/cli/main.rs"
+
+[[bin]]
+name = "swift-guard-daemon"
+path = "src/daemon/main.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+strip = true
+panic = "abort"
