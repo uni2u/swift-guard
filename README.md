@@ -52,57 +52,127 @@ Swift-Guard implements a two-tier architecture:
           └── [Policy Validator] - Syntax and semantic validation
 ```
 
-### Performance Optimization Strategy
+## 📋 Project Setup
 
-Swift-Guard employs multiple optimization techniques:
+### Project Structure
 
-1. **Memory Access Pattern Optimization**
-   - Sequential packet header parsing to maximize cache locality
-   - Strategic boundary checks positioned for verifier approval
-   - Zero-copy packet handling where possible
+Upon cloning the repository, you'll see the following directory structure:
 
-2. **Map Access Efficiency**
-   - LPM (Longest Prefix Match) Trie for efficient IP prefix handling
-   - Hot path map lookup minimization
-   - Per-CPU statistics to prevent atomic update contention
+```
+swift-guard/
+├── Cargo.toml                 # Rust project settings
+├── README.md                  # This file
+├── Makefile                   # Project-level build script
+├── src/
+│   ├── bpf/                   # XDP program source (C)
+│   ├── cli/                   # CLI tool source (Rust)
+│   ├── daemon/                # Control daemon source (Rust)
+│   └── common/                # Shared code
+├── include/                   # Header files
+├── wasm/                      # WebAssembly modules
+├── tools/                     # Benchmarking and analysis tools
+├── tests/                     # Test cases
+└── config/                    # Configuration examples
+```
 
-3. **Control Path Efficiency**
-   - Rust zero-cost abstractions for user-space components
-   - Minimal system call overhead in critical paths
-   - Efficient serialization/deserialization for BPF map interactions
+### Environment Requirements
+
+Before installing Swift-Guard, ensure your system meets the following requirements:
+
+- **Operating System**: Linux (Ubuntu 20.04+ or Debian 11+ recommended)
+- **Kernel Version**: 5.10 or newer (5.15+ recommended for best XDP support)
+- **Network Interface**: Network cards with XDP support (Intel X520/X540/X550 or newer recommended)
+- **Development Tools**: Rust 1.65+, LLVM/Clang 10+, Make, GCC
+
+You can check your kernel version with:
+```bash
+uname -r
+```
+
+To verify XDP support on your network interface:
+```bash
+ethtool -i <interface_name> | grep "driver\|firmware-version"
+```
 
 ## 🚀 Installation
 
-### Prerequisites
-
-- Linux kernel 5.10+ with XDP support
-- LLVM and Clang 10+
-- Rust 1.65+
-- libbpf-dev
-
-### Building from Source
+### 1. Install Dependencies
 
 ```bash
-# Install dependencies
-$ sudo apt install -y clang llvm libelf-dev build-essential linux-headers-$(uname -r)
+# Install system dependencies
+sudo apt update
+sudo apt install -y \
+    clang llvm \
+    libelf-dev \
+    build-essential \
+    linux-headers-$(uname -r) \
+    pkg-config \
+    git \
+    curl
 
-# Clone repository
-$ git clone https://github.com/uni2u/swift-guard.git
-$ cd swift-guard
-
-# Build BPF program
-$ cd src/bpf
-$ make
-$ cd ../..
-
-# Build Rust components
-$ cargo build --release
-
-# Install
-$ sudo make install
+# Install Rust (if not already installed)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source $HOME/.cargo/env
 ```
 
+### 2. Clone Repository
+
+```bash
+git clone https://github.com/uni2u/swift-guard.git
+cd swift-guard
+```
+
+### 3. Build BPF Program
+
+```bash
+# Build XDP program
+cd src/bpf
+make
+cd ../..
+```
+
+### 4. Build WASM Modules
+
+```bash
+# Build WebAssembly modules
+cd wasm
+./build.sh
+cd ..
+```
+
+### 5. Build Rust Components
+
+```bash
+# Build CLI and daemon
+cargo build --release
+```
+
+### 6. Install
+
+```bash
+# Install components to system
+sudo make install
+```
+
+If this is your first time running the installation, the Makefile will:
+- Copy XDP object files to `/usr/local/lib/swift-guard/`
+- Copy WASM modules to `/usr/local/lib/swift-guard/wasm/`
+- Install binaries to `/usr/local/bin/`
+- Create the default config in `/etc/swift-guard/`
+
 ## 📋 Usage
+
+### Starting the Daemon
+
+Before using the CLI, you need to start the daemon:
+
+```bash
+# Start the daemon
+sudo swift-guard-daemon
+
+# Or as a service
+sudo systemctl start swift-guard
+```
 
 ### Basic Commands
 
@@ -131,6 +201,87 @@ $ xdp-filter delete-rule --label "block-web-access"
 $ xdp-filter detach eth0
 ```
 
+### Working with WASM Modules
+
+Swift-Guard supports loading custom WebAssembly security modules:
+
+```bash
+# Load a WASM module
+$ xdp-filter wasm load --name http-inspector --file /path/to/http_inspector.wasm
+
+# List loaded WASM modules
+$ xdp-filter wasm list
+
+# View WASM module statistics
+$ xdp-filter wasm stats --name http-inspector
+
+# Unload a WASM module
+$ xdp-filter wasm unload --name http-inspector
+```
+
+### Configuration
+
+Swift-Guard can be configured through the configuration file at `/etc/swift-guard/config.yaml`:
+
+```bash
+# Edit configuration
+$ sudo nano /etc/swift-guard/config.yaml
+
+# Reload configuration
+$ sudo systemctl reload swift-guard
+```
+
+Example configuration templates are available in the `config/examples/` directory.
+
+## 🧪 Testing and Benchmarking
+
+The project includes various scripts for testing and benchmarking:
+
+```bash
+# Run basic throughput test
+$ cd tools/bench
+$ ./basic_throughput_test.sh --interface eth0
+
+# Test rule scaling performance
+$ ./rule_scaling_test.sh --interface eth0
+
+# Measure WASM overhead
+$ ./wasm_overhead_test.sh --interface eth0
+```
+
+For detailed analysis, use the included Python script:
+
+```bash
+$ cd tools/analysis
+$ ./analyze_performance.py
+```
+
+## 🛠️ Troubleshooting
+
+### Common Issues
+
+1. **XDP Loading Fails**:
+   - Check kernel version: `uname -r`
+   - Verify XDP support: `ip link show dev eth0`
+   - Try with generic mode: `xdp-filter attach eth0 --mode generic`
+
+2. **Performance Issues**:
+   - Check NIC offload features: `ethtool -k eth0`
+   - Disable certain offloads: `ethtool -K eth0 gso off tso off gro off`
+   - Monitor resource usage: `xdp-filter stats --interval 1`
+
+3. **WASM Module Errors**:
+   - Check module format: WASM modules must be compiled with compatible flags
+   - Review logs: `journalctl -u swift-guard -f`
+
+### Logging
+
+To increase log verbosity for debugging:
+
+```bash
+$ sudo RUST_LOG=debug swift-guard-daemon
+```
+
 ## 📊 Research and Performance Benchmarks
 
 Swift-Guard delivers exceptional performance with minimal overhead:
@@ -146,32 +297,16 @@ Swift-Guard delivers exceptional performance with minimal overhead:
 
 ## 🔍 WASM Integration for Security Inspection
 
-Swift-Guard integrates a WebAssembly (WASM) runtime to enable pluggable, language-agnostic security modules:
+Swift-Guard integrates a WebAssembly (WASM) runtime to enable pluggable, language-agnostic security modules. To create your own security module:
 
-### WASM Module Architecture
+1. Write your module in Rust, C/C++, or AssemblyScript
+2. Implement the required API functions:
+   - `allocate(size: i32) -> i32`
+   - `inspect_packet(ptr: i32, len: i32) -> i32`
+3. Compile to WebAssembly target
+4. Load using the CLI commands
 
-```
-[WASM Module]
-    ├── [Host Interface]
-    │     ├── [Memory Management API] - Allocation and buffer management
-    │     ├── [Logging API] - Diagnostic and alert facilities
-    │     └── [Configuration API] - Dynamic parameter tuning
-    │
-    ├── [Packet Inspection Logic]
-    │     ├── [Protocol Analysis] - Protocol-specific parsing
-    │     ├── [Security Policies] - Detection rules and signatures
-    │     └── [State Management] - Connection tracking
-    │
-    └── [Decision Interface]
-          └── [Verdict API] - Allow/block/redirect decision
-```
-
-### Benefits of WASM Integration
-
-- **Language Flexibility**: Write modules in Rust, C/C++, AssemblyScript, or any WASM-compatible language
-- **Security Isolation**: Sandboxed execution prevents system compromise
-- **Dynamic Updates**: Hot-reload modules without restarting the framework
-- **Performance**: Near-native execution speed with minimal overhead
+For examples, see the `wasm/modules/` directory.
 
 ## 🤝 Contributing
 
