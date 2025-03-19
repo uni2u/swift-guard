@@ -1,0 +1,29 @@
+[package]
+name = "swift-guard-daemon"
+version = "0.1.0"
+edition = "2021"
+authors = ["Your Name <your.email@example.com>"]
+description = "Control daemon for Swift-Guard"
+
+[[bin]]
+name = "swift-guard-daemon"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+thiserror = "1.0"
+libbpf-rs = "0.19"
+libc = "0.2"
+tokio = { version = "1.28", features = ["full"] }
+log = "0.4"
+env_logger = "0.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+clap = { version = "4.3", features = ["derive"] }
+nix = "0.26"
+wasmtime = "12.0"
+swift-guard-common = { path = "../common" }
+ipnet = "2.8"
+chrono = "0.4"
+ctrlc = "3.4"
