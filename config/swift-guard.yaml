@@ -1,0 +1,61 @@
+# Swift-Guard Configuration
+# This is the main configuration file for Swift-Guard
+
+# General settings
+general:
+  # Log level: debug, info, warn, error
+  log_level: "info"
+  # Working directory for temporary files
+  work_dir: "/var/lib/swift-guard"
+  # PID file location
+  pid_file: "/var/run/swift-guard.pid"
+
+# Telemetry settings
+telemetry:
+  # Enable logging of performance statistics
+  log_stats: true
+  # Statistics collection interval in seconds
+  interval: 10
+  # Enable telemetry export
+  export_enabled: false
+  # Export URL (when enabled)
+  export_url: null
+
+# WASM runtime settings
+wasm:
+  # Directory containing WASM modules
+  modules_dir: "/usr/local/lib/swift-guard/wasm"
+  # Automatically load modules at startup
+  auto_load: false
+  # List of modules to auto-load
+  auto_load_modules: []
+  # Module execution timeout in milliseconds
+  execution_timeout_ms: 10
+  # Memory limit in MB for WASM modules
+  memory_limit_mb: 32
+
+# Default interfaces to attach to at startup
+interfaces:
+  # Example: Auto-attach to eth0 in driver mode
+  # - name: "eth0"
+  #   mode: "driver"  # Options: driver, generic, offload
+  #   enabled: true
+
+# Default filter rules
+# These rules are loaded at startup
+rules:
+  # Example: Block SSH access from external networks
+  # - label: "block-external-ssh"
+  #   src_ip: "0.0.0.0/0"  # Any source IP
+  #   dst_port: 22
+  #   protocol: "tcp"
+  #   action: "drop"
+  #   priority: 100
+  
+  # Example: Redirect HTTP traffic to inspection
+  # - label: "inspect-http"
+  #   dst_port: 80
+  #   protocol: "tcp"
+  #   action: "redirect"
+  #   redirect_if: "wasm0"
+  #   priority: 50

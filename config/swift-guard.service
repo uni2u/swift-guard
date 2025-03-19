@@ -1,0 +1,27 @@
+[Unit]
+Description=Swift-Guard Packet Processing Framework
+Documentation=https://github.com/uni2u/swift-guard
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/swift-guard-daemon
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5s
+Environment="RUST_LOG=info"
+
+# Security settings
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_SYS_RESOURCE
+AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_SYS_RESOURCE
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target
