@@ -9,10 +9,12 @@ BPF_TARGET := bpf
 # 인클루드 디렉토리
 INCLUDE_DIR = ../../include
 KERNEL_INCLUDE = /usr/include
+KERNEL_ARCH_INCLUDE = /usr/include/$(shell uname -m)-linux-gnu/
+VMLINUX_INCLUDE = $(shell find /usr/lib/modules -name vmlinux.h | head -n1 | xargs dirname)
 
 # 컴파일 플래그
 CFLAGS := -g -O2 -Wall
-BPF_CFLAGS := -target bpf -D__TARGET_ARCH_$(ARCH) -I$(INCLUDE_DIR) -I$(KERNEL_INCLUDE)
+BPF_CFLAGS := -target bpf -D__TARGET_ARCH_$(ARCH) -I$(INCLUDE_DIR) -I$(KERNEL_INCLUDE) -I$(KERNEL_ARCH_INCLUDE) -I$(VMLINUX_INCLUDE)
 
 # 소스 및 대상 파일
 BPF_SOURCES := xdp_filter.c
