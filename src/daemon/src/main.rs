@@ -83,9 +83,8 @@ async fn run_daemon(args: Args) -> Result<()> {
         }
     });
     */
-        if let Err(e) = server.run().await {
-            error!("API server error: {}", e);
-        }
+    if let Err(e) = server.run().await {
+        error!("API server error: {}", e);
     }
     
 
