@@ -9,7 +9,9 @@ use tokio::time;
 
 use crate::bpf::XdpFilterSkel;
 use crate::config::DaemonConfig;
-use crate::api::SystemStats;
+#use crate::api::SystemStats;
+
+use swift_guard::api::SystemStats;
 
 /// 텔레메트리 수집기
 #[derive(Debug)]
@@ -79,7 +81,8 @@ impl TelemetryCollector {
         let key = 0u32.to_le_bytes();
         
         // 맵에서 통계 읽기
-        if let Ok(value) = self.stats_map.lookup(&key, 0) {
+//        if let Ok(value) = self.stats_map.lookup(&key, 0) {
+        if let Ok(Some(value)) = self.stats_map.lookup(&key, MapFlags::empty()) {
             if value.len() >= 16 {
                 // 통계 데이터 파싱
                 let packets = u64::from_le_bytes([

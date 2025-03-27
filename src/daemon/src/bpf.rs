@@ -1,7 +1,9 @@
 // src/daemon/src/bpf.rs
 use anyhow::{anyhow, Context, Result};
-use libbpf_rs::{MapFlags, Object, ObjectBuilder, Program, ProgramAttachTarget, ProgramAttachType, ProgramType};
-use log::{debug, error, info};
+//use libbpf_rs::{MapFlags, Object, ObjectBuilder, Program, ProgramAttachTarget, ProgramAttachType, ProgramType};
+use libbpf_rs::{MapFlags, Map, Object, ObjectBuilder, Program, ProgramType};
+//use log::{debug, error, info};
+use log::info;
 use std::path::Path;
 
 pub struct XdpFilterSkel {
@@ -40,13 +42,15 @@ impl XdpFilterSkelBuilder {
 
     pub fn open(self) -> Result<XdpFilterSkelOpenObject> {
         let builder = ObjectBuilder::default();
-        let builder = if let Some(path) = self.obj_path {
-            builder.file(path)?
-        } else {
-            return Err(anyhow!("No object file path provided"));
-        };
+//        let builder = if let Some(path) = self.obj_path {
+//            builder.file(path)?
+//        } else {
+//            return Err(anyhow!("No object file path provided"));
+//        };
+        let path = self.obj_path.ok_or_else(|| anyhow!("No Object file path provided"))?;
+        let object = builder.open_file(path)?;
 
-        let object = builder.open()?;
+//        let object = builder.open()?;
 
         Ok(XdpFilterSkelOpenObject {
             obj: object,
@@ -60,7 +64,8 @@ pub struct XdpFilterSkelOpenObject {
 
 impl XdpFilterSkelOpenObject {
     pub fn load(self) -> Result<XdpFilterSkel> {
-        let obj = self.obj.load()?;
+//        let obj = self.obj.load()?;
+        let obj = self.obj;
         Ok(XdpFilterSkel { obj })
     }
 }
@@ -69,6 +74,19 @@ pub struct XdpFilterMaps<'a> {
     obj: &'a Object,
 }
 
+impl<'a> XdpFilterMaps<'a> {
+    pub fn filter_rules(&self) -> Option<Map> {
+        self.obj.map("filter_rules").ok()
+    }
+    pub fn redirect_map(&self) -> Option<Map> {
+        self.obj.map("redirect_map").ok()
+    }
+    pub fn stats_map(&self) -> Option<Map> {
+        self.obj.map("stats_map").ok()
+    }
+}
+
+/*
 impl<'a> XdpFilterMaps<'a> {
     pub fn filter_rules(&self) -> Option<libbpf_rs::Map> {
         self.obj.map("filter_rules").ok()
@@ -82,6 +100,7 @@ impl<'a> XdpFilterMaps<'a> {
         self.obj.map("stats_map").ok()
     }
 }
+*/
 
 pub struct XdpFilterProgs<'a> {
     obj: &'a Object,
@@ -140,3 +159,4 @@ pub fn detach_xdp_program(interface: &str) -> Result<()> {
     info!("XDP program detached from {}", interface);
     Ok(())
 }
+

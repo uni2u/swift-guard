@@ -8,8 +8,11 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::bpf::XdpFilterSkel;
-use crate::api::{RuleInfo, RuleStats};
-use crate::utils;
+#use crate::api::{RuleInfo, RuleStats};
+#use crate::utils;
+
+use swift_guard::api::{RuleInfo, RuleStats};
+use swift_guard::utils;
 
 /// 필터 규칙 정보
 #[derive(Debug, Clone)]
@@ -245,7 +248,8 @@ impl MapManager {
     pub fn get_stats(&self) -> Result<(u64, u64)> {
         let key = 0u32.to_le_bytes();
         
-        if let Ok(value) = self.stats_map.lookup(&key, 0) {
+//        if let Ok(value) = self.stats_map.lookup(&key, 0) {
+          if let Ok(Some(value)) = self.stats_map.lookup(&key, MapFlags::empty()) {
             if value.len() >= 16 {
                 // 통계 데이터 파싱
                 let packets = u64::from_le_bytes([

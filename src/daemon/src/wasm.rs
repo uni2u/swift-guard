@@ -132,7 +132,8 @@ impl WasmInspector {
         
         // WASM 인스턴스 생성 및 링커 설정
         let mut linker = Linker::new(&self.engine);
-        linker.define("env", "log", log_func)
+//        linker.define("env", "log", log_func)
+        linker.define(&mut store, "env", "log", log_func)
             .context("Failed to define host function: log")?;
         
         let instance = linker.instantiate(&mut store, &module)
@@ -140,7 +141,8 @@ impl WasmInspector {
         
         // 메모리 획득
         let memory = instance
-            .get_memory(&mut store, "memory")
+//            .get_memory(&mut store, "memory")
+            .get_memory(&mut *store, "memory")
             .ok_or_else(|| anyhow!("WASM module has no exported memory"))?;
         
         // 초기화 함수 호출 (있는 경우)
@@ -172,7 +174,8 @@ impl WasmInspector {
         
         // 메모리 획득
         let memory = instance
-            .get_memory(store, "memory")
+//            .get_memory(store, "memory")
+            .get_memory(&mut *store, "memory")
             .ok_or_else(|| anyhow!("WASM module has no exported memory"))?;
             
         // 검사 함수 획득

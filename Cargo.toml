@@ -35,6 +35,7 @@ chrono = "0.4"
 ctrlc = "3.4"
 ipnet = "2.8"
 crossbeam-channel = "0.5"
+serde_yaml = "0.9"
 
 [lib]
 name = "swift_guard"

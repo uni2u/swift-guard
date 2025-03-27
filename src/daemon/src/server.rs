@@ -10,10 +10,13 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 
-use crate::api::{ApiRequest, ApiResponse};
+#use crate::api::{ApiRequest, ApiResponse};
 use crate::maps::{FilterRule, MapManager};
 use crate::telemetry::TelemetryCollector;
-use crate::utils;
+#use crate::utils;
+
+use swift_guard::api::{RuleInfo, RuleStats};
+use swift_guard::utils;
 
 /// API 서버
 #[derive(Debug)]
@@ -63,7 +66,8 @@ impl ApiServer {
                     let telemetry = self.telemetry.clone();
                     
                     tokio::spawn(async move {
-                        if let Err(e) = handle_connection(stream, map_manager, telemetry).await {
+//                        if let Err(e) = handle_connection(stream, map_manager, telemetry).await {
+                        if let Err(e) = handle_connection(stream, map_manager.clone(), telemetry.clone()).await {
                             error!("Connection error: {}", e);
                         }
                     });
