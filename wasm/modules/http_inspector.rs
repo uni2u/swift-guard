@@ -12,16 +12,21 @@ extern "C" {
 // 메모리 관리를 위한 전역 할당자
 #[no_mangle]
 pub extern "C" fn allocate(size: i32) -> i32 {
-    let mut buffer = Vec::with_capacity(size as usize);
+//    let mut buffer = Vec::with_capacity(size as usize);
+    let mut buffer = vec![0u8; size as usize];
     let ptr = buffer.as_mut_ptr();
     mem::forget(buffer);
-    ptr as i32
+    (ptr as *const () as usize) as i32
 }
 
 #[no_mangle]
 pub extern "C" fn deallocate(ptr: i32, capacity: i32) {
+    if ptr == 0 {
+        return;
+    }
     unsafe {
-        let _ = Vec::from_raw_parts(ptr as *mut u8, 0, capacity as usize);
+//        let _ = Vec::from_raw_parts(ptr as *mut u8, 0, capacity as usize);
+        drop(Vec::from_raw_parts(ptr as *mut u8, capacity as usize, capacity as usize);
     }
 }
 
@@ -53,12 +58,12 @@ fn parse_tcp_packet(data: &[u8], offset: usize) -> Option<(u16, u16, u8)> {
 
 // HTTP 메서드 확인
 fn check_http_method(payload: &[u8]) -> bool {
-    let methods = [
+    let methods: &[&[u8]] = &[
         b"GET ", b"POST ", b"PUT ", b"DELETE ", b"HEAD ", 
         b"OPTIONS ", b"CONNECT ", b"TRACE ", b"PATCH "
     ];
     
-    for method in &methods {
+    for method in methods {
         if payload.starts_with(method) {
             return true;
         }
@@ -70,24 +75,24 @@ fn check_http_method(payload: &[u8]) -> bool {
 // 의심스러운 HTTP 요청 검사
 fn check_suspicious_http(payload: &[u8]) -> bool {
     // SQL 인젝션 패턴
-    let sql_patterns = [
+    let sql_patterns: &[&[u8]] = &[
         b"UNION SELECT", b"OR 1=1", b"' OR '", b"DROP TABLE",
         b"--", b"/*", b"*/", b"EXEC(", b"EXECUTE(", b"xp_cmdshell"
     ];
     
     // XSS 패턴
-    let xss_patterns = [
+    let xss_patterns: &[&[u8]] = &[
         b"<script>", b"javascript:", b"onerror=", b"onload=", b"eval(", 
         b"document.cookie", b"alert(", b"String.fromCharCode("
     ];
     
     // 경로 순회 패턴
-    let traversal_patterns = [
+    let traversal_patterns: &[&[u8]] = &[
         b"../", b"..\\", b"/etc/passwd", b"\\windows\\system32", b"C:\\Windows"
     ];
     
     // 명령어 인젝션 패턴
-    let cmd_patterns = [
+    let cmd_patterns: &[&[u8]] = &[
         b";", b"|", b"&", b"$(", b"`", b"$()", b"${", b">"
     ];
     
@@ -98,28 +103,28 @@ fn check_suspicious_http(payload: &[u8]) -> bool {
     }
     
     // 패턴 검사
-    for pattern in &sql_patterns {
+    for pattern in sql_patterns {
         if payload.windows(pattern.len()).any(|window| window == *pattern) {
             log_message(&format!("SQL injection pattern detected: {:?}", pattern));
             return true;
         }
     }
     
-    for pattern in &xss_patterns {
+    for pattern in xss_patterns {
         if payload.windows(pattern.len()).any(|window| window == *pattern) {
             log_message(&format!("XSS pattern detected: {:?}", pattern));
             return true;
         }
     }
     
-    for pattern in &traversal_patterns {
+    for pattern in traversal_patterns {
         if payload.windows(pattern.len()).any(|window| window == *pattern) {
             log_message(&format!("Path traversal pattern detected: {:?}", pattern));
             return true;
         }
     }
     
-    for pattern in &cmd_patterns {
+    for pattern in cmd_patterns {
         if payload.windows(pattern.len()).any(|window| window == *pattern) {
             log_message(&format!("Command injection pattern detected: {:?}", pattern));
             return true;

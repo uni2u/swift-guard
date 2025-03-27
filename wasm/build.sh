@@ -42,7 +42,7 @@ for rust_file in $RUST_FILES; do
     echo "Building $base_name..."
     
     # Create temporary directory for the build
-    temp_dir=$(mktemp -d)
+    temp_dir=$(mktemp -d -t rustbuildXXXXXX)
     trap 'rm -rf "$temp_dir"' EXIT
     
     # Create temporary cargo project

@@ -42,11 +42,11 @@ path = "src/common/lib.rs"
 
 [[bin]]
 name = "xdp-filter"
-path = "src/cli/main.rs"
+path = "src/cli/src/main.rs"
 
 [[bin]]
 name = "swift-guard-daemon"
-path = "src/daemon/main.rs"
+path = "src/daemon/src/main.rs"
 
 [profile.release]
 lto = true
