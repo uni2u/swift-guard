@@ -76,11 +76,18 @@ async fn run_daemon(args: Args) -> Result<()> {
     let server = ApiServer::new(&args.api_addr, map_manager.clone(), telemetry.clone())
         .context("Failed to create API server")?;
 
+    /*
     let server_handle = tokio::spawn(async move {
         if let Err(e) = server.run().await {
             error!("API server error: {}", e);
         }
     });
+    */
+        if let Err(e) = server.run().await {
+            error!("API server error: {}", e);
+        }
+    }
+    
 
     // 종료 신호 처리
     let running = Arc::new(AtomicBool::new(true));
@@ -106,7 +113,7 @@ async fn run_daemon(args: Args) -> Result<()> {
 
     // 정리
     drop(skel);
-    server_handle.abort();
+//    server_handle.abort();
 
     info!("Swift-Guard daemon stopped");
     Ok(())
