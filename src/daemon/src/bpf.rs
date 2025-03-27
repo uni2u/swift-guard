@@ -191,7 +191,8 @@ pub fn detach_xdp_program(interface: &str) -> Result<()> {
         .context(format!("Failed to get interface index for {}", interface))?;
     
     // XDP 프로그램 분리
-    libbpf_rs::Xdp::detach(if_index as i32, 0)
+//    libbpf_rs::Xdp::detach(if_index as i32, 0)
+    Program::detach_xdp(if_index as i32)
         .context(format!("Failed to detach XDP program from interface {}", interface))?;
 
     info!("XDP program detached from {}", interface);

@@ -3,7 +3,7 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
+//use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
 use log::{debug, error, info, warn};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
