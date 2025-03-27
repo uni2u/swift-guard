@@ -73,9 +73,10 @@ impl ApiServer {
                     });
                 }
 */
-                // 직접 요청 처리
-                if let Err(e) = handle_connection(stream, map_manager.clone(), telemetry.clone()).await {
-                    error!("Connection error: {}", e);
+                    // 직접 요청 처리
+                    if let Err(e) = handle_connection(stream, map_manager.clone(), telemetry.clone()).await {
+                        error!("Connection error: {}", e);
+                    }
                 }
 
                 Err(e) => {

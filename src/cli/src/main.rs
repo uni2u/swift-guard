@@ -176,6 +176,9 @@ async fn main() -> Result<()> {
                 },
                 ApiResponse::Error { message } => {
                     return Err(anyhow!("Error: {}", message));
+                },
+                ApiResponse::Rules { .. } | ApiResponse::Stats { .. } => {
+                    return Err(anyhow!("Unexpected response type"))
                 }
             }
         },
@@ -196,6 +199,9 @@ async fn main() -> Result<()> {
                 },
                 ApiResponse::Error { message } => {
                     return Err(anyhow!("Error: {}", message));
+                },
+                ApiResponse::Rules { .. } | ApiResponse::Stats { .. } => {
+                    return Err(anyhow!("Unexpected response type"))
                 }
             }
         },
@@ -287,6 +293,9 @@ async fn main() -> Result<()> {
                 },
                 ApiResponse::Error { message } => {
                     return Err(anyhow!("Error: {}", message));
+                },
+                ApiResponse::Rules { .. } | ApiResponse::Stats { .. } => {
+                    return Err(anyhow!("Unexpected response type"))
                 }
             }
         },
@@ -307,6 +316,9 @@ async fn main() -> Result<()> {
                 },
                 ApiResponse::Error { message } => {
                     return Err(anyhow!("Error: {}", message));
+                },
+                ApiResponse::Rules { .. } | ApiResponse::Stats { .. } => {
+                    return Err(anyhow!("Unexpected response type"))
                 }
             }
         },
