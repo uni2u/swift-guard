@@ -64,7 +64,7 @@ impl ApiServer {
                     // 요청 처리 작업 생성
                     let map_manager = self.map_manager.clone();
                     let telemetry = self.telemetry.clone();
-                    
+/*                    
                     tokio::spawn(async move {
 //                        if let Err(e) = handle_connection(stream, map_manager, telemetry).await {
                         if let Err(e) = handle_connection(stream, map_manager.clone(), telemetry.clone()).await {
@@ -72,6 +72,12 @@ impl ApiServer {
                         }
                     });
                 }
+*/
+                // 직접 요청 처리
+                if let Err(e) = handle_connection(stream, map_manager.clone(), telemetry.clone()).await {
+                    error!("Connection error: {}", e);
+                }
+
                 Err(e) => {
                     error!("Failed to accept connection: {}", e);
                 }
