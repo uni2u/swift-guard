@@ -66,7 +66,11 @@ impl XdpFilterSkelOpenObject {
     pub fn load(self) -> Result<XdpFilterSkel> {
 //        let obj = self.obj.load()?;
 //        Ok(XdpFilterSkel { obj })
-        Ok(XdpFilterSkel { obj: self.obj })
+//        Ok(XdpFilterSkel { obj: self.obj })
+
+        // OpenObject를로드하여 Object로 변환
+        let obj = self.obj.load()?;
+        Ok(XdpFilterSkel { obj })
     }
 }
 
