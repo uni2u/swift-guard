@@ -65,8 +65,8 @@ pub struct XdpFilterSkelOpenObject {
 impl XdpFilterSkelOpenObject {
     pub fn load(self) -> Result<XdpFilterSkel> {
 //        let obj = self.obj.load()?;
-        let obj = self.obj;
-        Ok(XdpFilterSkel { obj })
+//        Ok(XdpFilterSkel { obj })
+        Ok(XdpFilterSkel { obj: self.obj })
     }
 }
 
@@ -76,13 +76,24 @@ pub struct XdpFilterMaps<'a> {
 
 impl<'a> XdpFilterMaps<'a> {
     pub fn filter_rules(&self) -> Option<Map> {
-        self.obj.map("filter_rules").ok()
+        match self.obj.map("filter_rules") {
+            Ok(map) => Some(map),
+            Err(_) => None,
+        }
     }
+    
     pub fn redirect_map(&self) -> Option<Map> {
-        self.obj.map("redirect_map").ok()
+        match self.obj.map("redirect_map") {
+            Ok(map) => Some(map),
+            Err(_) => None,
+        }
     }
+    
     pub fn stats_map(&self) -> Option<Map> {
-        self.obj.map("stats_map").ok()
+        match self.obj.map("stats_map") {
+            Ok(map) => Some(map),
+            Err(_) => None,
+        }
     }
 }
 
@@ -108,7 +119,11 @@ pub struct XdpFilterProgs<'a> {
 
 impl<'a> XdpFilterProgs<'a> {
     pub fn xdp_filter_func(&self) -> Option<Program> {
-        self.obj.prog("xdp_filter_func").ok()
+//        self.obj.prog("xdp_filter_func").ok()
+        match self.obj.prog("xdp_filter_func") {
+            Ok(prog) => Some(prog),
+            Err(_) => None,
+        }
     }
 }
 
@@ -120,6 +135,28 @@ pub enum XdpMode {
     Offload = 2, // 하드웨어 오프로드 모드
 }
 
+/// 
+pub fn attach_xdp_program(prog: &mut Program, interface: &str, mode: XdpMode) -> Result<()> {
+    // 인터페이스 인덱스 가져오기
+    let if_index = nix::net::if_::if_nametoindex(interface)
+        .context(format!("Failed to get interface index for {}", interface))?;
+
+    // ProgramType 비교 제거 (PartialEq 미구현)
+    /*
+    if prog.prog_type() != ProgramType::Xdp {
+        return Err(anyhow!("Program is not an XDP program"));
+    }
+    */
+
+    // 인수 하나만 전달
+    prog.attach_xdp(if_index as i32)
+        .context(format!("Failed to attach XDP program to interface {}", interface))?;
+
+    info!("XDP program attached to {} in {:?} mode", interface, mode);
+    Ok(())
+}
+
+/*
 /// XDP 프로그램을 네트워크 인터페이스에 연결
 pub fn attach_xdp_program(prog: &Program, interface: &str, mode: XdpMode, force: bool) -> Result<()> {
     // 인터페이스 인덱스 가져오기
@@ -145,6 +182,7 @@ pub fn attach_xdp_program(prog: &Program, interface: &str, mode: XdpMode, force:
     info!("XDP program attached to {} in {:?} mode", interface, mode);
     Ok(())
 }
+*/
 
 /// XDP 프로그램을 네트워크 인터페이스에서 분리
 pub fn detach_xdp_program(interface: &str) -> Result<()> {

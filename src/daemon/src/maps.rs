@@ -13,6 +13,7 @@ use crate::bpf::XdpFilterSkel;
 
 use swift_guard::api::{RuleInfo, RuleStats};
 use swift_guard::utils;
+use libbpf_rs::MapFlags;
 
 /// 필터 규칙 정보
 #[derive(Debug, Clone)]
@@ -82,6 +83,7 @@ pub struct RedirectIf {
     pub ifname: String,
 }
 
+/*
 /// 맵 관리자
 #[derive(Debug)]
 pub struct MapManager {
@@ -93,6 +95,23 @@ pub struct MapManager {
     stats_map: Map,
     /// 로컬 규칙 캐시
     rules: Vec<FilterRule>,
+}
+*/
+
+pub struct MapManager {
+    filter_rules_map: Map,
+    redirect_map: Map,
+    stats_map: Map,
+    rules: Vec<FilterRule>,
+}
+
+impl std::fmt::Debug for MapManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MapManager")
+            .field("rules", &self.rules)
+            // Map은 Debug할 수 없으므로 포함하지 않음
+            .finish()
+    }
 }
 
 impl MapManager {

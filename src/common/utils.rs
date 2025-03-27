@@ -117,6 +117,59 @@ pub fn format_size(bytes: u64) -> String {
     }
 }
 
+// src/common/utils.rs에 추가할 함수들
+
+/// 액션 번호를 액션 이름으로 변환
+pub fn action_num_to_name(num: u8) -> String {
+    match num {
+        1 => "pass".to_string(),
+        2 => "drop".to_string(),
+        3 => "redirect".to_string(),
+        4 => "count".to_string(),
+        _ => "unknown".to_string(),
+    }
+}
+
+/// 프로토콜 번호를 프로토콜 이름으로 변환
+pub fn protocol_num_to_name(num: u8) -> String {
+    match num {
+        1 => "icmp".to_string(),
+        6 => "tcp".to_string(),
+        17 => "udp".to_string(),
+        255 => "any".to_string(),
+        _ => format!("{}", num),
+    }
+}
+
+/// TCP 플래그 비트맵을 문자열로 변환
+pub fn tcp_flags_to_string(flags: u8) -> String {
+    let mut result = Vec::new();
+
+    if flags & 0x01 != 0 { result.push("FIN"); }
+    if flags & 0x02 != 0 { result.push("SYN"); }
+    if flags & 0x04 != 0 { result.push("RST"); }
+    if flags & 0x08 != 0 { result.push("PSH"); }
+    if flags & 0x10 != 0 { result.push("ACK"); }
+    if flags & 0x20 != 0 { result.push("URG"); }
+
+    if result.is_empty() {
+        "None".to_string()
+    } else {
+        result.join(",")
+    }
+}
+
+/// 포트 범위를 문자열로 변환
+pub fn port_range_to_string(min: u16, max: u16) -> Option<String> {
+    if min == 0 && max == 65535 {
+        None
+    } else if min == max {
+        Some(format!("{}", min))
+    } else {
+        Some(format!("{}-{}", min, max))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -12,6 +12,7 @@ use crate::config::DaemonConfig;
 //use crate::api::SystemStats;
 
 use swift_guard::api::SystemStats;
+use libbpf_rs::MapFlags;
 
 /// 텔레메트리 수집기
 #[derive(Debug)]
