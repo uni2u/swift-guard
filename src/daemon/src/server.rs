@@ -120,6 +120,7 @@ async fn handle_connection(
         .context("Failed to write response")?;
     
     Ok(())
+}
 
 /// 요청 처리
 async fn process_request(

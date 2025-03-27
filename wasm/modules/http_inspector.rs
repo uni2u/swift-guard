@@ -26,7 +26,7 @@ pub extern "C" fn deallocate(ptr: i32, capacity: i32) {
     }
     unsafe {
 //        let _ = Vec::from_raw_parts(ptr as *mut u8, 0, capacity as usize);
-        drop(Vec::from_raw_parts(ptr as *mut u8, capacity as usize, capacity as usize);
+        drop(Vec::from_raw_parts(ptr as *mut u8, capacity as usize, capacity as usize));
     }
 }
 
