@@ -66,11 +66,7 @@ impl XdpFilterSkelOpenObject {
     pub fn load(self) -> Result<XdpFilterSkel> {
 //        let obj = self.obj.load()?;
 //        Ok(XdpFilterSkel { obj })
-//        Ok(XdpFilterSkel { obj: self.obj })
-
-        // OpenObject를로드하여 Object로 변환
-        let obj = self.obj.load()?;
-        Ok(XdpFilterSkel { obj })
+        Ok(XdpFilterSkel { obj: self.obj })
     }
 }
 
@@ -80,24 +76,33 @@ pub struct XdpFilterMaps<'a> {
 
 impl<'a> XdpFilterMaps<'a> {
     pub fn filter_rules(&self) -> Option<Map> {
+        /*
         match self.obj.map("filter_rules") {
             Ok(map) => Some(map),
             Err(_) => None,
         }
+        */
+        self.obj.map("filter_rules").ok()
     }
     
     pub fn redirect_map(&self) -> Option<Map> {
+        /*
         match self.obj.map("redirect_map") {
             Ok(map) => Some(map),
             Err(_) => None,
         }
+        */
+        self.obj.map("redirect_map").ok()
     }
     
     pub fn stats_map(&self) -> Option<Map> {
+        /*
         match self.obj.map("stats_map") {
             Ok(map) => Some(map),
             Err(_) => None,
         }
+        */
+        self.obj.map("stats_map").ok()
     }
 }
 
@@ -123,11 +128,19 @@ pub struct XdpFilterProgs<'a> {
 
 impl<'a> XdpFilterProgs<'a> {
     pub fn xdp_filter_func(&self) -> Option<Program> {
-//        self.obj.prog("xdp_filter_func").ok()
+        self.obj.prog("xdp_filter_func").ok()
+/*
         match self.obj.prog("xdp_filter_func") {
             Ok(prog) => Some(prog),
             Err(_) => None,
         }
+*/
+    }
+}
+
+impl<'a> XdpFilterProgs<'a> {
+    pub fn xdp_filter_func(&self) -> Option<Program> {
+        self.obj.prog("xdp_filter_func").ok()
     }
 }
 
@@ -196,8 +209,17 @@ pub fn detach_xdp_program(interface: &str) -> Result<()> {
     
     // XDP 프로그램 분리
 //    libbpf_rs::Xdp::detach(if_index as i32, 0)
-    Program::detach_xdp(if_index as i32)
-        .context(format!("Failed to detach XDP program from interface {}", interface))?;
+//    Program::detach_xdp(if_index as i32)
+//        .context(format!("Failed to detach XDP program from interface {}", interface))?;
+
+    let status = std::process::Command::new("ip")
+        .args(&["link","set","dev",interface,"xdp","off"])
+        .status()
+        .context(format!("Failed to execute ip command to detach XDP from {}", interface))?;
+
+    if !status.success() {
+        return Err(anyhow!("Failed to detach XDP program from interface {}", interface));
+    }
 
     info!("XDP program detached from {}", interface);
     Ok(())

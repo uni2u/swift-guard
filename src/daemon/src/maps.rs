@@ -202,7 +202,8 @@ impl MapManager {
                 if let Some((src_ip, prefix_len)) = rule.src_ip {
                     let key = self.create_prefix_key(src_ip, prefix_len);
                     
-                    if let Ok(value) = self.filter_rules_map.lookup(&key, 0) {
+//                    if let Ok(value) = self.filter_rules_map.lookup(&key, 0) {
+                    if let Ok(value) = self.filter_rules_map.lookup(&key, MapFlags::empty()) {
                         if value.len() >= std::mem::size_of::<RuleStats>() {
                             let stats_offset = value.len() - std::mem::size_of::<RuleStats>();
                             let stats_bytes = &value[stats_offset..];

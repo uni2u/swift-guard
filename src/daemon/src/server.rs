@@ -275,7 +275,7 @@ async fn process_request(
             // WASM 모듈 로드 로직
 
             Ok(ApiResponse::Error {
-                message: "WASM module loading not implemented yet".to_string{},
+                message: "WASM module loading not implemented yet".to_string(),
             })
         },
 
@@ -283,15 +283,15 @@ async fn process_request(
             // WASM 모듈 언로드 로직
 
             Ok(ApiResponse::Error {
-                message: "WASM module unloading not implemented yet".to_string{},
+                message: "WASM module unloading not implemented yet".to_string(),
             })
         },
 
-        ApiRequest::ListWasmModule { } => {
+        ApiRequest::ListWasmModules { } => {
             // WASM 모듈 목록 조회
             
             Ok(ApiResponse::Error {
-                message: "WASM module listing not implemented yet".to_string{},
+                message: "WASM module listing not implemented yet".to_string(),
             })
         },
 
@@ -299,7 +299,7 @@ async fn process_request(
             // WASM 모듈 통계
 
             Ok(ApiResponse::Error {
-                message: "WASM module statistics not implemented yet".to_string{},
+                message: "WASM module statistics not implemented yet".to_string(),
             })
         },
     }
