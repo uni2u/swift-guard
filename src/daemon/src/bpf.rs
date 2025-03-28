@@ -46,7 +46,7 @@ impl XdpFilterSkelBuilder {
         let object = builder.open_file(path)?;
 
         Ok(XdpFilterSkel {
-            obj: object,
+            obj: object.load().expect("Failed to load object"),
         })
     }
 }
@@ -63,7 +63,7 @@ impl<'a> XdpFilterMaps<'a> {
             Err(_) => None,
         }
         */
-        self.obj.map("filter_rules")
+        self.obj.map("filter_rules").map(|map| map.clone())
     }
     
     pub fn redirect_map(&self) -> Option<Map> {
@@ -73,7 +73,7 @@ impl<'a> XdpFilterMaps<'a> {
             Err(_) => None,
         }
         */
-        self.obj.map("redirect_map")
+        self.obj.map("redirect_map").map(|map| map.clone())
     }
     
     pub fn stats_map(&self) -> Option<Map> {
@@ -83,7 +83,7 @@ impl<'a> XdpFilterMaps<'a> {
             Err(_) => None,
         }
         */
-        self.obj.map("stats_map")
+        self.obj.map("stats_map").map(|map| map.clone())
     }
 }
 
@@ -108,7 +108,7 @@ pub struct XdpFilterProgs<'a> {
 }
 
 impl<'a> XdpFilterProgs<'a> {
-    pub fn xdp_filter_func(&self) -> Option<Program> {
+    pub fn xdp_filter_func(&self) -> Option<&Program> {
         self.obj.prog("xdp_filter_func")
     }
 }

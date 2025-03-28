@@ -98,10 +98,9 @@ pub struct MapManager {
 }
 */
 
-pub struct MapManager {
-    filter_rules_map: Map,
-    redirect_map: Map,
-    stats_map: Map,
+pub struct MapManager<'a> {
+    // XdpFilterSkel에 대한 참조만 유지
+    skel: &'a XdpFilterSkel,
     rules: Vec<FilterRule>,
 }
 
@@ -114,27 +113,27 @@ impl std::fmt::Debug for MapManager {
     }
 }
 
-impl MapManager {
-    /// 새로운 맵 관리자 생성
-    pub fn new(skel: &mut XdpFilterSkel) -> Result<Self> {
-        // 맵 획득
-        let filter_rules_map = skel.maps().filter_rules()
-            .ok_or_else(|| anyhow!("Failed to get filter_rules map"))?;
-        
-        let redirect_map = skel.maps().redirect_map()
-            .ok_or_else(|| anyhow!("Failed to get redirect_map"))?;
-        
-        let stats_map = skel.maps().stats_map()
-            .ok_or_else(|| anyhow!("Failed to get stats_map"))?;
-        
-        Ok(Self {
-            filter_rules_map,
-            redirect_map,
-            stats_map,
+impl<'a> MapManager<'a> {
+    pub fn new(skel: &'a XdpFilterSkel) -> Self {
+        Self {
+            skel,
             rules: Vec::new(),
-        })
+        }
     }
     
+    // 필요할 때마다 skel에서 맵을 가져오는 헬퍼 메서드
+    fn filter_rules_map(&self) -> Option<&Map> {
+        self.skel.maps().filter_rules()
+    }
+    
+    fn redirect_map(&self) -> Option<&Map> {
+        self.skel.maps().redirect_map()
+    }
+    
+    fn stats_map(&self) -> Option<&Map> {
+        self.skel.maps().stats_map()
+    }
+
     /// 규칙 추가
     pub fn add_rule(&mut self, rule: FilterRule) -> Result<()> {
         debug!("Adding rule: {}", rule.label);
@@ -203,7 +202,7 @@ impl MapManager {
                     let key = self.create_prefix_key(src_ip, prefix_len);
                     
 //                    if let Ok(value) = self.filter_rules_map.lookup(&key, 0) {
-                    if let OkSome((value)) = self.filter_rules_map.lookup(&key, MapFlags::empty()) {
+                    if let Ok(Some(value)) = self.filter_rules_map.lookup(&key, MapFlags::empty()) {
                         if value.len() >= std::mem::size_of::<RuleStats>() {
                             let stats_offset = value.len() - std::mem::size_of::<RuleStats>();
                             let stats_bytes = &value[stats_offset..];
