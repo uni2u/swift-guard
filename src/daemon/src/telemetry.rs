@@ -15,7 +15,7 @@ use swift_guard::api::SystemStats;
 use libbpf_rs::MapFlags;
 
 /// 텔레메트리 수집기
-#[derive(Debug)]
+//#[derive(Debug)]
 pub struct TelemetryCollector {
     /// 통계 맵 참조
     stats_map: libbpf_rs::Map,
@@ -44,6 +44,15 @@ pub struct CollectedStats {
     prev_packets: u64,
     /// 이전 바이트
     prev_bytes: u64,
+}
+
+// Debug 구현
+impl std::fmt::Debug for TelemetryCollector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_> -> std::fmt::Result) {
+        f.debug_struct("TelemetryCollector")
+            .field("config", &self.config)
+            .finish()
+    }
 }
 
 impl TelemetryCollector {

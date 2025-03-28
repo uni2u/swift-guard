@@ -53,7 +53,7 @@ async fn run_daemon(args: Args) -> Result<()> {
     // 구성 로드
     let config = config::load_config(&args.config)
         .context("Failed to load configuration")?;
-
+/*
     // BPF 프로그램 로드
     let skel_builder = XdpFilterSkel::builder()
         .obj_path(&args.bpf_obj);
@@ -63,6 +63,11 @@ async fn run_daemon(args: Args) -> Result<()> {
 
     let mut skel = open_skel.load()
         .context("Failed to load BPF program")?;
+*/
+    let mut skel = XdpFilterSkel::builder()
+        .obj_path(&args.bpf_obj)
+        .open()
+        .context("Failed to open and load BPF program")?;
 
     // 맵 관리자 초기화
     let map_manager = Arc::new(MapManager::new(&mut skel)

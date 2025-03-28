@@ -40,33 +40,14 @@ impl XdpFilterSkelBuilder {
         self
     }
 
-    pub fn open(self) -> Result<XdpFilterSkelOpenObject> {
+    pub fn open(self) -> Result<XdpFilterSkel> {
         let builder = ObjectBuilder::default();
-//        let builder = if let Some(path) = self.obj_path {
-//            builder.file(path)?
-//        } else {
-//            return Err(anyhow!("No object file path provided"));
-//        };
         let path = self.obj_path.ok_or_else(|| anyhow!("No Object file path provided"))?;
         let object = builder.open_file(path)?;
 
-//        let object = builder.open()?;
-
-        Ok(XdpFilterSkelOpenObject {
+        Ok(XdpFilterSkel {
             obj: object,
         })
-    }
-}
-
-pub struct XdpFilterSkelOpenObject {
-    obj: Object,
-}
-
-impl XdpFilterSkelOpenObject {
-    pub fn load(self) -> Result<XdpFilterSkel> {
-//        let obj = self.obj.load()?;
-//        Ok(XdpFilterSkel { obj })
-        Ok(XdpFilterSkel { obj: self.obj })
     }
 }
 
@@ -82,7 +63,7 @@ impl<'a> XdpFilterMaps<'a> {
             Err(_) => None,
         }
         */
-        self.obj.map("filter_rules").ok()
+        self.obj.map("filter_rules")
     }
     
     pub fn redirect_map(&self) -> Option<Map> {
@@ -92,7 +73,7 @@ impl<'a> XdpFilterMaps<'a> {
             Err(_) => None,
         }
         */
-        self.obj.map("redirect_map").ok()
+        self.obj.map("redirect_map")
     }
     
     pub fn stats_map(&self) -> Option<Map> {
@@ -102,7 +83,7 @@ impl<'a> XdpFilterMaps<'a> {
             Err(_) => None,
         }
         */
-        self.obj.map("stats_map").ok()
+        self.obj.map("stats_map")
     }
 }
 
@@ -128,19 +109,7 @@ pub struct XdpFilterProgs<'a> {
 
 impl<'a> XdpFilterProgs<'a> {
     pub fn xdp_filter_func(&self) -> Option<Program> {
-        self.obj.prog("xdp_filter_func").ok()
-/*
-        match self.obj.prog("xdp_filter_func") {
-            Ok(prog) => Some(prog),
-            Err(_) => None,
-        }
-*/
-    }
-}
-
-impl<'a> XdpFilterProgs<'a> {
-    pub fn xdp_filter_func(&self) -> Option<Program> {
-        self.obj.prog("xdp_filter_func").ok()
+        self.obj.prog("xdp_filter_func")
     }
 }
 

@@ -26,7 +26,7 @@ pub enum ModuleState {
 }
 
 /// WASM 검사 모듈
-#[derive(Debug)]
+//#[derive(Debug)]
 pub struct WasmInspector {
     /// 모듈 ID
     id: String,
@@ -59,6 +59,19 @@ pub struct WasmInspectorData {
     result_buffer: Vec<u8>,
     /// 로그 버퍼
     log_buffer: String,
+}
+
+// Debug 구현
+impl std::fmt::Debug for WasmInspector {
+    fn fmt(&self, f: &mut std:fmt::Formatter<'_>) -> std::fmt::Result) {
+        f.debug_struct("WasmInspector")
+            .field("id", &self.id)
+            .field("path", &self.path)
+            .field("state", &self.state)
+            .field("processed_packets", &self.processed_packets)
+            .field("blocked_packets", &self.blocked_packets)
+            .finish()
+    }
 }
 
 impl WasmInspector {
@@ -142,7 +155,7 @@ impl WasmInspector {
         // 메모리 획득
         let memory = instance
 //            .get_memory(&mut store, "memory")
-            .get_memory(&mut *store, "memory")
+            .get_memory(store, "memory")
             .ok_or_else(|| anyhow!("WASM module has no exported memory"))?;
         
         // 초기화 함수 호출 (있는 경우)
@@ -175,7 +188,7 @@ impl WasmInspector {
         // 메모리 획득
         let memory = instance
 //            .get_memory(store, "memory")
-            .get_memory(&mut *store, "memory")
+            .get_memory(store, "memory")
             .ok_or_else(|| anyhow!("WASM module has no exported memory"))?;
             
         // 검사 함수 획득
