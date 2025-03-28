@@ -20,28 +20,25 @@ use swift_guard::utils;
 
 /// API 서버
 #[derive(Debug)]
-pub struct ApiServer {
+pub struct ApiServer<'a> {
     /// 바인드 주소
     addr: String,
     /// 맵 관리자
-    map_manager: Arc<Mutex<MapManager>>,
+    map_manager: Arc<Mutex<MapManager<'a>>>,
     /// 텔레메트리 수집기
     telemetry: Arc<TelemetryCollector>,
 }
 
-impl ApiServer {
+impl<'a> ApiServer<'a> {
     /// 새로운 API 서버 생성
     pub fn new(
         addr: &str,
-        map_manager: Arc<MapManager>,
+        map_manager: Arc<Mutex<MapManager<'a>>>,
         telemetry: Arc<TelemetryCollector>,
     ) -> Result<Self> {
         Ok(Self {
             addr: addr.to_string(),
-            map_manager: Arc::new(Mutex::new(
-                Arc::try_unwrap(map_manager)
-                    .map_err(|_| anyhow!("Failed to unwrap map_manager"))?
-            )),
+            map_manager,
             telemetry,
         })
     }
@@ -88,9 +85,9 @@ impl ApiServer {
 }
 
 /// 클라이언트 연결 처리
-async fn handle_connection(
+async fn handle_connection<'a>(
     mut stream: TcpStream,
-    map_manager: Arc<Mutex<MapManager>>,
+    map_manager: Arc<Mutex<MapManager<'a>>>,
     telemetry: Arc<TelemetryCollector>,
 ) -> Result<()> {
     // 요청 길이 수신 (4바이트 빅 엔디안)
@@ -134,9 +131,9 @@ async fn handle_connection(
 }
 
 /// 요청 처리
-async fn process_request(
+async fn process_request<'a>(
     request: ApiRequest,
-    map_manager: Arc<Mutex<MapManager>>,
+    map_manager: Arc<Mutex<MapManager<'a>>>,
     telemetry: Arc<TelemetryCollector>,
 ) -> Result<ApiResponse> {
     match request {

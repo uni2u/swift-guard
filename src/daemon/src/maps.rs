@@ -104,7 +104,7 @@ pub struct MapManager<'a> {
     rules: Vec<FilterRule>,
 }
 
-impl std::fmt::Debug for MapManager {
+impl<'a> std::fmt::Debug for MapManager<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MapManager")
             .field("rules", &self.rules)
@@ -143,9 +143,12 @@ impl<'a> MapManager<'a> {
             let key = self.create_prefix_key(src_ip, prefix_len);
             let value = self.create_filter_rule(&rule)?;
             
-            self.filter_rules_map
-                .update(&key, &value, libbpf_rs::MapFlags::ANY)
-                .context("Failed to update filter_rules map")?;
+            if let Some(map) = self.filter_rules_map() {
+                map.update(&key, &value, libbpf_rs::MapFlags::ANY)
+                    .context("Failed to update filter_rules map")?;
+            } else {
+                return Err(anyhow!("Failed to update filter_rules map"));
+            }
         }
         
         // 리디렉션 인터페이스 설정 (필요한 경우)
@@ -153,9 +156,12 @@ impl<'a> MapManager<'a> {
             let key = rule.redirect_ifindex.to_le_bytes();
             let if_redirect = self.create_if_redirect(rule.redirect_ifindex, &format!("if{}", rule.redirect_ifindex))?;
             
-            self.redirect_map
-                .update(&key, &if_redirect, libbpf_rs::MapFlags::ANY)
-                .context("Failed to update redirect_map")?;
+            if let Some(map) = self.redirect_map() {
+                map.update(&key, &if_redirect, libbpf_rs::MapFlags::ANY)
+                    .context("Failed to update redirect_map")?;
+            } else {
+                return Err(anyhow!("Failed to update redirect_map"));
+            }
         }
         
         // 로컬 캐시 업데이트
@@ -177,9 +183,12 @@ impl<'a> MapManager<'a> {
             if let Some((src_ip, prefix_len)) = rule.src_ip {
                 let key = self.create_prefix_key(src_ip, prefix_len);
                 
-                self.filter_rules_map
-                    .delete(&key)
-                    .context("Failed to delete from filter_rules map")?;
+                if let Some(map) = self.filter_rules_map() {
+                    map.delete(&key)
+                        .context("Failed to delete from filter_rules map")?;
+                } else {
+                    return Err(anyhow!("Failed to get filter_rules map"));
+                }
             }
             
             // 로컬 캐시 업데이트
@@ -202,7 +211,7 @@ impl<'a> MapManager<'a> {
                     let key = self.create_prefix_key(src_ip, prefix_len);
                     
 //                    if let Ok(value) = self.filter_rules_map.lookup(&key, 0) {
-                    if let Ok(Some(value)) = self.filter_rules_map.lookup(&key, MapFlags::empty()) {
+                    if let Ok(Some(value)) = self.filter_rules_map().lookup(&key, MapFlags::empty()) {
                         if value.len() >= std::mem::size_of::<RuleStats>() {
                             let stats_offset = value.len() - std::mem::size_of::<RuleStats>();
                             let stats_bytes = &value[stats_offset..];
@@ -268,7 +277,7 @@ impl<'a> MapManager<'a> {
         let key = 0u32.to_le_bytes();
         
 //        if let Ok(value) = self.stats_map.lookup(&key, 0) {
-          if let Ok(Some(value)) = self.stats_map.lookup(&key, MapFlags::empty()) {
+          if let Ok(Some(value)) = self.stats_map().lookup(&key, MapFlags::empty()) {
             if value.len() >= 16 {
                 // 통계 데이터 파싱
                 let packets = u64::from_le_bytes([

@@ -119,7 +119,7 @@ impl WasmInspector {
         );
         
         // WASM에 노출할 호스트 함수 정의
-        let log_func = Func::wrap(&mut store, |caller: Caller<'_, WasmInspectorData>, ptr: i32, len: i32| -> i32 {
+        let log_func = Func::wrap(&mut store, |mut caller: Caller<'_, WasmInspectorData>, ptr: i32, len: i32| -> i32 {
             let mem = match caller.get_export("memory") {
                 Some(Extern::Memory(mem)) => mem,
                 _ => return -1,
@@ -154,8 +154,7 @@ impl WasmInspector {
         
         // 메모리 획득
         let memory = instance
-//            .get_memory(&mut store, "memory")
-            .get_memory(store, "memory")
+            .get_memory(&mut store, "memory")
             .ok_or_else(|| anyhow!("WASM module has no exported memory"))?;
         
         // 초기화 함수 호출 (있는 경우)
@@ -187,8 +186,7 @@ impl WasmInspector {
         
         // 메모리 획득
         let memory = instance
-//            .get_memory(store, "memory")
-            .get_memory(store, "memory")
+            .get_memory(&mut *store, "memory")
             .ok_or_else(|| anyhow!("WASM module has no exported memory"))?;
             
         // 검사 함수 획득

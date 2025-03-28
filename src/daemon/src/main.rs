@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::signal;
 use tokio::time;
+use std::sync::Mutex;
 
 mod bpf;
 mod config;
@@ -70,8 +71,7 @@ async fn run_daemon(args: Args) -> Result<()> {
         .context("Failed to open and load BPF program")?;
 
     // 맵 관리자 초기화
-    let map_manager = Arc::new(MapManager::new(&mut skel)
-        .context("Failed to initialize map manager")?);
+    let map_manager = Arc::new(Mutex::new(MapManager::new(&skel)));
 
     // 텔레메트리 수집기 초기화
     let telemetry = Arc::new(TelemetryCollector::new(&skel, &config)

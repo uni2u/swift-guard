@@ -41,7 +41,7 @@ impl XdpFilterSkelBuilder {
     }
 
     pub fn open(self) -> Result<XdpFilterSkel> {
-        let builder = ObjectBuilder::default();
+        let mut builder = ObjectBuilder::default();
         let path = self.obj_path.ok_or_else(|| anyhow!("No Object file path provided"))?;
         let object = builder.open_file(path)?;
 
@@ -56,34 +56,34 @@ pub struct XdpFilterMaps<'a> {
 }
 
 impl<'a> XdpFilterMaps<'a> {
-    pub fn filter_rules(&self) -> Option<Map> {
+    pub fn filter_rules(&self) -> Option<&Map> {
         /*
         match self.obj.map("filter_rules") {
             Ok(map) => Some(map),
             Err(_) => None,
         }
         */
-        self.obj.map("filter_rules").map(|map| map.clone())
+        self.obj.map("filter_rules")
     }
     
-    pub fn redirect_map(&self) -> Option<Map> {
+    pub fn redirect_map(&self) -> Option<&Map> {
         /*
         match self.obj.map("redirect_map") {
             Ok(map) => Some(map),
             Err(_) => None,
         }
         */
-        self.obj.map("redirect_map").map(|map| map.clone())
+        self.obj.map("redirect_map")
     }
     
-    pub fn stats_map(&self) -> Option<Map> {
+    pub fn stats_map(&self) -> Option<&Map> {
         /*
         match self.obj.map("stats_map") {
             Ok(map) => Some(map),
             Err(_) => None,
         }
         */
-        self.obj.map("stats_map").map(|map| map.clone())
+        self.obj.map("stats_map")
     }
 }
 

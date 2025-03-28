@@ -63,7 +63,7 @@ impl TelemetryCollector {
             .ok_or_else(|| anyhow!("Failed to get stats_map"))?;
         
         Ok(Self {
-            stats_map,
+            stats_map: stats_map.clone(),
             config: config.clone(),
             stats: Arc::new(Mutex::new(CollectedStats {
                 total_packets: 0,
