@@ -3,7 +3,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
-use ipnet::IpNet;
+//use ipnet::IpNet;
 use log::{debug, error, info};
 use serde::Serialize;
 use std::net::IpAddr;

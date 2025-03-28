@@ -48,7 +48,7 @@ pub struct CollectedStats {
 
 // Debug 구현
 impl std::fmt::Debug for TelemetryCollector {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_> -> std::fmt::Result) {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TelemetryCollector")
             .field("config", &self.config)
             .finish()
