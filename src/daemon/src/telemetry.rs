@@ -13,6 +13,7 @@ use crate::config::DaemonConfig;
 
 use swift_guard::api::SystemStats;
 use libbpf_rs::MapFlags;
+use libbpf_rs::Map;
 
 /// 텔레메트리 수집기
 //#[derive(Debug)]
@@ -47,7 +48,7 @@ pub struct CollectedStats {
 }
 
 // Debug 구현
-impl std::fmt::Debug for TelemetryCollector {
+impl<'a> std::fmt::Debug for TelemetryCollector<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TelemetryCollector")
             .field("config", &self.config)
@@ -55,9 +56,9 @@ impl std::fmt::Debug for TelemetryCollector {
     }
 }
 
-impl TelemetryCollector {
+impl<'a> TelemetryCollector<'a> {
     /// 새로운 텔레메트리 수집기 생성
-    pub fn new<'a>(skel: &'a XdpFilterSkel, config: &DaemonConfig) -> Result<Self> {
+    pub fn new(skel: &'a XdpFilterSkel, config: &DaemonConfig) -> Result<Self> {
         // 통계 맵 획득
         let stats_map = skel.maps().stats_map()
             .ok_or_else(|| anyhow!("Failed to get stats_map"))?;
