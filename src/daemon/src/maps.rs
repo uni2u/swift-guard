@@ -238,12 +238,12 @@ impl<'a> MapManager<'a> {
                                     bytes,
                                     last_matched,
                                 
-                                } else {
-                                    RuleStats {
-                                        packets: 0,
-                                        bytes: 0,
-                                        last_matched: 0,
-                                    }
+                                }
+                            } else {
+                                 RuleStats {
+                                    packets: 0,
+                                    bytes: 0,
+                                    last_matched: 0,
                                 }
                             }
                         }
