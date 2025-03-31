@@ -308,6 +308,8 @@ impl<'a> MapManager<'a> {
             } else {
                 Ok((0, 0))
             }
+        } else {
+            Ok((0, 0))
         }
     }
     
