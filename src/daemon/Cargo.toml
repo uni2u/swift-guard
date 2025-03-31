@@ -23,7 +23,7 @@ serde_yaml = "0.9"
 clap = { version = "4.3", features = ["derive"] }
 nix = "0.26"
 wasmtime = "12.0"
-swift-guard-common = { path = "../common" }
+swift_guard = { package = "swift-guard-common", path = "../common" }
 ipnet = "2.8"
 chrono = "0.4"
 ctrlc = "3.4"

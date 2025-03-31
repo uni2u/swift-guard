@@ -11,6 +11,7 @@ mod config;
 mod maps;
 mod server;
 mod telemetry;
+mod wasm;
 
 use crate::maps::MapManager;
 use crate::telemetry::TelemetryCollector;
