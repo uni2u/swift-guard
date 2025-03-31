@@ -26,7 +26,7 @@ pub struct ApiServer<'a> {
     /// 맵 관리자
     map_manager: Arc<Mutex<MapManager<'a>>>,
     /// 텔레메트리 수집기
-    telemetry: Arc<TelemetryCollector>,
+    telemetry: Arc<TelemetryCollector<'a>>,
 }
 
 impl<'a> ApiServer<'a> {
@@ -88,7 +88,7 @@ impl<'a> ApiServer<'a> {
 async fn handle_connection<'a>(
     mut stream: TcpStream,
     map_manager: Arc<Mutex<MapManager<'a>>>,
-    telemetry: Arc<TelemetryCollector>,
+    telemetry: Arc<TelemetryCollector<'a>>,
 ) -> Result<()> {
     // 요청 길이 수신 (4바이트 빅 엔디안)
     let mut len_bytes = [0u8; 4];
@@ -134,7 +134,7 @@ async fn handle_connection<'a>(
 async fn process_request<'a>(
     request: ApiRequest,
     map_manager: Arc<Mutex<MapManager<'a>>>,
-    telemetry: Arc<TelemetryCollector>,
+    telemetry: Arc<TelemetryCollector<'a>>,
 ) -> Result<ApiResponse> {
     match request {
         ApiRequest::Attach { interface, mode, force } => {
