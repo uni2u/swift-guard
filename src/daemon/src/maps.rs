@@ -211,37 +211,40 @@ impl<'a> MapManager<'a> {
                     let key = self.create_prefix_key(src_ip, prefix_len);
                     
 //                    if let Ok(value) = self.filter_rules_map.lookup(&key, 0) {
-                    if let Ok(Some(value)) = self.filter_rules_map().lookup(&key, MapFlags::empty()) {
-                        if value.len() >= std::mem::size_of::<RuleStats>() {
-                            let stats_offset = value.len() - std::mem::size_of::<RuleStats>();
-                            let stats_bytes = &value[stats_offset..];
+                    if let Some(map) = self.filter_rules_map() {
+                        if let Ok(Some(value)) = map.lookup(&key, MapFlags::empty()) {
+                            if value.len() >= std::mem::size_of::<RuleStats>() {
+                                let stats_offset = value.len() - std::mem::size_of::<RuleStats>();
+                                let stats_bytes = &value[stats_offset..];
                             
-                            // 통계 데이터 파싱
-                            let packets = u64::from_le_bytes([
-                                stats_bytes[0], stats_bytes[1], stats_bytes[2], stats_bytes[3],
-                                stats_bytes[4], stats_bytes[5], stats_bytes[6], stats_bytes[7],
-                            ]);
+                                // 통계 데이터 파싱
+                                let packets = u64::from_le_bytes([
+                                    stats_bytes[0], stats_bytes[1], stats_bytes[2], stats_bytes[3],
+                                    stats_bytes[4], stats_bytes[5], stats_bytes[6], stats_bytes[7],
+                                ]);
                             
-                            let bytes = u64::from_le_bytes([
-                                stats_bytes[8], stats_bytes[9], stats_bytes[10], stats_bytes[11],
-                                stats_bytes[12], stats_bytes[13], stats_bytes[14], stats_bytes[15],
-                            ]);
+                                let bytes = u64::from_le_bytes([
+                                    stats_bytes[8], stats_bytes[9], stats_bytes[10], stats_bytes[11],
+                                    stats_bytes[12], stats_bytes[13], stats_bytes[14], stats_bytes[15],
+                                ]);
                             
-                            let last_matched = u64::from_le_bytes([
-                                stats_bytes[16], stats_bytes[17], stats_bytes[18], stats_bytes[19],
-                                stats_bytes[20], stats_bytes[21], stats_bytes[22], stats_bytes[23],
-                            ]);
+                                let last_matched = u64::from_le_bytes([
+                                    stats_bytes[16], stats_bytes[17], stats_bytes[18], stats_bytes[19],
+                                    stats_bytes[20], stats_bytes[21], stats_bytes[22], stats_bytes[23],
+                                ]);
                             
-                            RuleStats {
-                                packets,
-                                bytes,
-                                last_matched,
-                            }
-                        } else {
-                            RuleStats {
-                                packets: 0,
-                                bytes: 0,
-                                last_matched: 0,
+                                RuleStats {
+                                    packets,
+                                    bytes,
+                                    last_matched,
+                                
+                                } else {
+                                    RuleStats {
+                                        packets: 0,
+                                        bytes: 0,
+                                        last_matched: 0,
+                                    }
+                                }
                             }
                         }
                     } else {
@@ -277,25 +280,27 @@ impl<'a> MapManager<'a> {
         let key = 0u32.to_le_bytes();
         
 //        if let Ok(value) = self.stats_map.lookup(&key, 0) {
-          if let Ok(Some(value)) = self.stats_map().lookup(&key, MapFlags::empty()) {
-            if value.len() >= 16 {
-                // 통계 데이터 파싱
-                let packets = u64::from_le_bytes([
-                    value[0], value[1], value[2], value[3],
-                    value[4], value[5], value[6], value[7],
-                ]);
+        if let Some(map) = self.stats_map() {
+            if let Ok(Some(value)) = map().lookup(&key, MapFlags::empty()) {
+                if value.len() >= 16 {
+                    // 통계 데이터 파싱
+                    let packets = u64::from_le_bytes([
+                        value[0], value[1], value[2], value[3],
+                        value[4], value[5], value[6], value[7],
+                    ]);
                 
-                let bytes = u64::from_le_bytes([
-                    value[8], value[9], value[10], value[11],
-                    value[12], value[13], value[14], value[15],
-                ]);
+                    let bytes = u64::from_le_bytes([
+                        value[8], value[9], value[10], value[11],
+                        value[12], value[13], value[14], value[15],
+                    ]);
                 
-                Ok((packets, bytes))
+                    Ok((packets, bytes))
+                } else {
+                    Ok((0, 0))
+                }
             } else {
                 Ok((0, 0))
             }
-        } else {
-            Ok((0, 0))
         }
     }
     

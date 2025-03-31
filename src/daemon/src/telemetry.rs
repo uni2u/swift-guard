@@ -16,9 +16,9 @@ use libbpf_rs::MapFlags;
 
 /// 텔레메트리 수집기
 //#[derive(Debug)]
-pub struct TelemetryCollector {
+pub struct TelemetryCollector<'a> {
     /// 통계 맵 참조
-    stats_map: libbpf_rs::Map,
+    stats_map: &'a  Map,
     /// 구성 정보
     config: DaemonConfig,
     /// 수집된 통계
@@ -57,13 +57,13 @@ impl std::fmt::Debug for TelemetryCollector {
 
 impl TelemetryCollector {
     /// 새로운 텔레메트리 수집기 생성
-    pub fn new(skel: &XdpFilterSkel, config: &DaemonConfig) -> Result<Self> {
+    pub fn new<'a>(skel: &'a XdpFilterSkel, config: &DaemonConfig) -> Result<Self> {
         // 통계 맵 획득
         let stats_map = skel.maps().stats_map()
             .ok_or_else(|| anyhow!("Failed to get stats_map"))?;
         
         Ok(Self {
-            stats_map: stats_map.clone(),
+            stats_map,
             config: config.clone(),
             stats: Arc::new(Mutex::new(CollectedStats {
                 total_packets: 0,
