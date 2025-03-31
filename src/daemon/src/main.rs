@@ -57,10 +57,6 @@ async fn main() -> Result<()> {
 
     info!("Swift-Guard 데몬 시작 중...");
 
-    // 구성 로드
-    let config = config::load_config(&args.config)
-        .context("구성 로드 실패")?;
-
     // 특정 인터페이스에 XDP 프로그램 로드
     if let Some(interface) = &args.interface {
         info!("인터페이스 {}에 XDP 프로그램 로드 중...", interface);
@@ -69,35 +65,9 @@ async fn main() -> Result<()> {
         }
     }
 
-    // BPF 프로그램 로드
-    let skel = bpf::XdpFilterSkel::builder()
-        .obj_path(&args.bpf_obj)
-        .open()
-        .context("BPF 프로그램 로드 실패")?;
-
-    // 맵 관리자 초기화
-    let map_manager = Arc::new(Mutex::new(MapManager::new(&skel)));
-
-    // 텔레메트리 수집기 초기화
-    let telemetry = Arc::new(TelemetryCollector::new(&skel, &config)
-        .context("텔레메트리 수집기 초기화 실패")?);
-
-    // API 서버 시작
-    let server = server::ApiServer::new(&args.api_addr, map_manager.clone(), telemetry.clone())
-        .context("API 서버 생성 실패")?;
-    
-    let server_handle = tokio::spawn(async move {
-        if let Err(e) = server.run().await {
-            error!("API 서버 오류: {}", e);
-        }
-    });
-
     // Ctrl+C 대기
     info!("데몬 실행 중... Ctrl+C로 종료");
-    signal::ctrl_c().await?;
-    
-    // 서버 종료
-    server_handle.abort();
+    tokio::signal::ctrl_c().await?;
     
     // 종료 처리
     if let Some(interface) = &args.interface {
