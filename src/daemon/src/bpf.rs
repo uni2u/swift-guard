@@ -1,13 +1,12 @@
 // src/daemon/src/bpf.rs
 use anyhow::{anyhow, Context, Result};
-//use libbpf_rs::{MapFlags, Object, ObjectBuilder, Program, ProgramAttachTarget, ProgramAttachType, ProgramType};
-use libbpf_rs::{MapFlags, Map, Object, ObjectBuilder, Program, ProgramType};
-//use log::{debug, error, info};
-use log::info;
+use libbpf_rs::{Map, Object, ObjectBuilder, Program};
+use log::{debug, error, info};
 use std::path::Path;
+use std::process::Command;
 
 pub struct XdpFilterSkel {
-    obj: Object,
+    pub obj: Object,
 }
 
 impl XdpFilterSkel {
@@ -57,51 +56,17 @@ pub struct XdpFilterMaps<'a> {
 
 impl<'a> XdpFilterMaps<'a> {
     pub fn filter_rules(&self) -> Option<&Map> {
-        /*
-        match self.obj.map("filter_rules") {
-            Ok(map) => Some(map),
-            Err(_) => None,
-        }
-        */
         self.obj.map("filter_rules")
     }
     
     pub fn redirect_map(&self) -> Option<&Map> {
-        /*
-        match self.obj.map("redirect_map") {
-            Ok(map) => Some(map),
-            Err(_) => None,
-        }
-        */
         self.obj.map("redirect_map")
     }
     
     pub fn stats_map(&self) -> Option<&Map> {
-        /*
-        match self.obj.map("stats_map") {
-            Ok(map) => Some(map),
-            Err(_) => None,
-        }
-        */
         self.obj.map("stats_map")
     }
 }
-
-/*
-impl<'a> XdpFilterMaps<'a> {
-    pub fn filter_rules(&self) -> Option<libbpf_rs::Map> {
-        self.obj.map("filter_rules").ok()
-    }
-
-    pub fn redirect_map(&self) -> Option<libbpf_rs::Map> {
-        self.obj.map("redirect_map").ok()
-    }
-
-    pub fn stats_map(&self) -> Option<libbpf_rs::Map> {
-        self.obj.map("stats_map").ok()
-    }
-}
-*/
 
 pub struct XdpFilterProgs<'a> {
     obj: &'a Object,
@@ -121,76 +86,60 @@ pub enum XdpMode {
     Offload = 2, // 하드웨어 오프로드 모드
 }
 
-/// 
-pub fn attach_xdp_program(prog: &mut Program, interface: &str, mode: XdpMode) -> Result<()> {
-    // 인터페이스 인덱스 가져오기
-    let if_index = nix::net::if_::if_nametoindex(interface)
-        .context(format!("Failed to get interface index for {}", interface))?;
-
-    // ProgramType 비교 제거 (PartialEq 미구현)
-    /*
-    if prog.prog_type() != ProgramType::Xdp {
-        return Err(anyhow!("Program is not an XDP program"));
-    }
-    */
-
-    // 인수 하나만 전달
-    prog.attach_xdp(if_index as i32)
-        .context(format!("Failed to attach XDP program to interface {}", interface))?;
-
-    info!("XDP program attached to {} in {:?} mode", interface, mode);
-    Ok(())
-}
-
-/*
-/// XDP 프로그램을 네트워크 인터페이스에 연결
-pub fn attach_xdp_program(prog: &Program, interface: &str, mode: XdpMode, force: bool) -> Result<()> {
-    // 인터페이스 인덱스 가져오기
-    let if_index = nix::net::if_::if_nametoindex(interface)
-        .context(format!("Failed to get interface index for {}", interface))?;
-    
-    // 프로그램 타입 확인
-    if prog.prog_type() != ProgramType::Xdp {
-        return Err(anyhow!("Program is not an XDP program"));
+/// XDP 프로그램 로드
+pub fn load_xdp_program(obj_path: &Path, interface: &str) -> Result<()> {
+    // BPF 오브젝트 파일 존재 확인
+    if !obj_path.exists() {
+        return Err(anyhow!("BPF 오브젝트 파일이 존재하지 않습니다: {}", obj_path.display()));
     }
 
-    // XDP 플래그 설정
-    let flags = match mode {
-        XdpMode::Driver => 0, // XDP_FLAGS_DRV_MODE
-        XdpMode::Generic => 2, // XDP_FLAGS_SKB_MODE
-        XdpMode::Offload => 4, // XDP_FLAGS_HW_MODE
-    };
+    // 인터페이스 존재 확인
+    check_interface_exists(interface)?;
 
-    // 인터페이스에 XDP 프로그램 연결
-    prog.attach_xdp(if_index as i32, flags)
-        .context(format!("Failed to attach XDP program to interface {}", interface))?;
-
-    info!("XDP program attached to {} in {:?} mode", interface, mode);
-    Ok(())
-}
-*/
-
-/// XDP 프로그램을 네트워크 인터페이스에서 분리
-pub fn detach_xdp_program(interface: &str) -> Result<()> {
-    // 인터페이스 인덱스 가져오기
-    let _if_index = nix::net::if_::if_nametoindex(interface)
-        .context(format!("Failed to get interface index for {}", interface))?;
-    
-    // XDP 프로그램 분리
-//    libbpf_rs::Xdp::detach(if_index as i32, 0)
-//    Program::detach_xdp(if_index as i32)
-//        .context(format!("Failed to detach XDP program from interface {}", interface))?;
-
-    let status = std::process::Command::new("ip")
-        .args(&["link","set","dev",interface,"xdp","off"])
+    // ip 명령으로 XDP 프로그램 로드
+    let status = Command::new("ip")
+        .args(&["link", "set", "dev", interface, "xdp", "obj", 
+               obj_path.to_str().unwrap(), "sec", "xdp"])
         .status()
-        .context(format!("Failed to execute ip command to detach XDP from {}", interface))?;
+        .context(format!("인터페이스 {}에 XDP 프로그램 로드 실패", interface))?;
 
     if !status.success() {
-        return Err(anyhow!("Failed to detach XDP program from interface {}", interface));
+        return Err(anyhow!("인터페이스 {}에 XDP 프로그램 로드 실패", interface));
     }
 
-    info!("XDP program detached from {}", interface);
+    info!("인터페이스 {}에 XDP 프로그램이 로드되었습니다", interface);
     Ok(())
 }
 
+/// XDP 프로그램 언로드
+pub fn unload_xdp_program(interface: &str) -> Result<()> {
+    // 인터페이스 존재 확인
+    check_interface_exists(interface)?;
+
+    // ip 명령으로 XDP 프로그램 언로드
+    let status = Command::new("ip")
+        .args(&["link", "set", "dev", interface, "xdp", "off"])
+        .status()
+        .context(format!("인터페이스 {}에서 XDP 프로그램 언로드 실패", interface))?;
+
+    if !status.success() {
+        return Err(anyhow!("인터페이스 {}에서 XDP 프로그램 언로드 실패", interface));
+    }
+
+    info!("인터페이스 {}에서 XDP 프로그램이 언로드되었습니다", interface);
+    Ok(())
+}
+
+/// 인터페이스 존재 확인
+fn check_interface_exists(interface: &str) -> Result<()> {
+    let output = Command::new("ip")
+        .args(&["link", "show", "dev", interface])
+        .output()
+        .context(format!("인터페이스 {} 확인 실패", interface))?;
+
+    if !output.status.success() {
+        return Err(anyhow!("인터페이스 {}가 존재하지 않습니다", interface));
+    }
+
+    Ok(())
+}

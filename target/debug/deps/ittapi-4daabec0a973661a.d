@@ -1,0 +1,12 @@
+/Users/uni2u/code/swift-guard/target/debug/deps/libittapi-4daabec0a973661a.rmeta: /Users/uni2u/.cargo/registry/src/index.crates.io-6f17d22bba15001f/ittapi-0.3.5/src/lib.rs /Users/uni2u/.cargo/registry/src/index.crates.io-6f17d22bba15001f/ittapi-0.3.5/src/collection_control.rs /Users/uni2u/.cargo/registry/src/index.crates.io-6f17d22bba15001f/ittapi-0.3.5/src/domain.rs /Users/uni2u/.cargo/registry/src/index.crates.io-6f17d22bba15001f/ittapi-0.3.5/src/event.rs /Users/uni2u/.cargo/registry/src/index.crates.io-6f17d22bba15001f/ittapi-0.3.5/src/jit.rs /Users/uni2u/.cargo/registry/src/index.crates.io-6f17d22bba15001f/ittapi-0.3.5/src/string.rs /Users/uni2u/.cargo/registry/src/index.crates.io-6f17d22bba15001f/ittapi-0.3.5/src/task.rs /Users/uni2u/.cargo/registry/src/index.crates.io-6f17d22bba15001f/ittapi-0.3.5/src/util.rs
+
+/Users/uni2u/code/swift-guard/target/debug/deps/ittapi-4daabec0a973661a.d: /Users/uni2u/.cargo/registry/src/index.crates.io-6f17d22bba15001f/ittapi-0.3.5/src/lib.rs /Users/uni2u/.cargo/registry/src/index.crates.io-6f17d22bba15001f/ittapi-0.3.5/src/collection_control.rs /Users/uni2u/.cargo/registry/src/index.crates.io-6f17d22bba15001f/ittapi-0.3.5/src/domain.rs /Users/uni2u/.cargo/registry/src/index.crates.io-6f17d22bba15001f/ittapi-0.3.5/src/event.rs /Users/uni2u/.cargo/registry/src/index.crates.io-6f17d22bba15001f/ittapi-0.3.5/src/jit.rs /Users/uni2u/.cargo/registry/src/index.crates.io-6f17d22bba15001f/ittapi-0.3.5/src/string.rs /Users/uni2u/.cargo/registry/src/index.crates.io-6f17d22bba15001f/ittapi-0.3.5/src/task.rs /Users/uni2u/.cargo/registry/src/index.crates.io-6f17d22bba15001f/ittapi-0.3.5/src/util.rs
+
+/Users/uni2u/.cargo/registry/src/index.crates.io-6f17d22bba15001f/ittapi-0.3.5/src/lib.rs:
+/Users/uni2u/.cargo/registry/src/index.crates.io-6f17d22bba15001f/ittapi-0.3.5/src/collection_control.rs:
+/Users/uni2u/.cargo/registry/src/index.crates.io-6f17d22bba15001f/ittapi-0.3.5/src/domain.rs:
+/Users/uni2u/.cargo/registry/src/index.crates.io-6f17d22bba15001f/ittapi-0.3.5/src/event.rs:
+/Users/uni2u/.cargo/registry/src/index.crates.io-6f17d22bba15001f/ittapi-0.3.5/src/jit.rs:
+/Users/uni2u/.cargo/registry/src/index.crates.io-6f17d22bba15001f/ittapi-0.3.5/src/string.rs:
+/Users/uni2u/.cargo/registry/src/index.crates.io-6f17d22bba15001f/ittapi-0.3.5/src/task.rs:
+/Users/uni2u/.cargo/registry/src/index.crates.io-6f17d22bba15001f/ittapi-0.3.5/src/util.rs:

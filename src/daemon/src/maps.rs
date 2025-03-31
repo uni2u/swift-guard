@@ -129,21 +129,24 @@ impl<'a> MapManager<'a> {
     
     // 필요할 때마다 skel에서 맵을 가져오는 헬퍼 메서드
     fn filter_rules_map(&self) -> Option<&Map> {
-        self.skel.maps().filter_rules()
+//        self.skel.maps().filter_rules()
 //        let maps = &self.skel.maps();
 //        maps.filter_rules()
+        self.filter_rules_map
     }
     
     fn redirect_map(&self) -> Option<&Map> {
-        self.skel.maps().redirect_map()
+//        self.skel.maps().redirect_map()
 //        let maps = &self.skel.maps();
 //        maps.redirect_map()
+        self.redirect_map
     }
     
     fn stats_map(&self) -> Option<&Map> {
-        self.skel.maps().stats_map()
+//        self.skel.maps().stats_map()
 //        let maps = &self.skel.maps();
 //        maps.stats_map()
+        self.stats_map
     }
 
     /// 규칙 추가
