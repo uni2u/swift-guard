@@ -173,7 +173,7 @@ pub fn attach_xdp_program(prog: &Program, interface: &str, mode: XdpMode, force:
 /// XDP 프로그램을 네트워크 인터페이스에서 분리
 pub fn detach_xdp_program(interface: &str) -> Result<()> {
     // 인터페이스 인덱스 가져오기
-    let if_index = nix::net::if_::if_nametoindex(interface)
+    let _if_index = nix::net::if_::if_nametoindex(interface)
         .context(format!("Failed to get interface index for {}", interface))?;
     
     // XDP 프로그램 분리

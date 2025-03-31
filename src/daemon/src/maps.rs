@@ -246,6 +246,12 @@ impl<'a> MapManager<'a> {
                                     last_matched: 0,
                                 }
                             }
+                        } else {
+                            RuleStats {
+                                packets: 0,
+                                bytes: 0,
+                                last_matched: 0,
+                            }
                         }
                     } else {
                         RuleStats {
@@ -269,6 +275,7 @@ impl<'a> MapManager<'a> {
                 }
             };
             
+            
             result.push(rule.to_rule_info(stats));
         }
         
@@ -281,7 +288,7 @@ impl<'a> MapManager<'a> {
         
 //        if let Ok(value) = self.stats_map.lookup(&key, 0) {
         if let Some(map) = self.stats_map() {
-            if let Ok(Some(value)) = map().lookup(&key, MapFlags::empty()) {
+            if let Ok(Some(value)) = map.lookup(&key, MapFlags::empty()) {
                 if value.len() >= 16 {
                     // 통계 데이터 파싱
                     let packets = u64::from_le_bytes([
