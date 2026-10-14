@@ -1,5 +1,8 @@
 target/
 
 _workspace/
-_workspace_prev/
+_workspace*/
 .claude/settings.local.json
+
+# tools/bench 결과 (기본 --output-dir)
+results/

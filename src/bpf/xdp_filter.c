@@ -74,6 +74,16 @@ struct {
     __uint(map_flags, BPF_F_NO_PREALLOC);
 } filter_rules SEC(".maps");
 
+/* 목적지 IP prefix 룰. 키 addr = iph->daddr(네트워크 바이트 오더), 값 형식은
+ * filter_rules와 같은 struct filter_rule(88B). src 룰이 매치하지 않을 때만 평가된다. */
+struct {
+    __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+    __type(key, struct prefix_key);
+    __type(value, struct filter_rule);
+    __uint(max_entries, MAX_FILTER_RULES);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+} dst_rules SEC(".maps");
+
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __type(key, __u32);
@@ -106,6 +116,53 @@ static __always_inline void update_stats(struct filter_stats *stats, __u64 bytes
     if (value) {
         __sync_fetch_and_add(&value->packets, 1);
         __sync_fetch_and_add(&value->bytes, bytes);
+    }
+}
+
+/* 룰의 세부 조건(protocol / src_port 범위 / dst_port 범위 / TCP 플래그)이 맞으면 1.
+ * rule은 NULL 검사가 끝난 맵 값 포인터여야 한다. */
+static __always_inline int rule_matches(const struct filter_rule *rule, __u8 protocol,
+                                        __u16 src_port, __u16 dst_port, __u8 tcp_flags)
+{
+    return (rule->protocol == IPPROTO_ANY || rule->protocol == protocol) &&
+           (rule->src_port_min <= src_port && src_port <= rule->src_port_max) &&
+           (rule->dst_port_min <= dst_port && dst_port <= rule->dst_port_max) &&
+           ((protocol != IPPROTO_TCP) || ((rule->tcp_flags & tcp_flags) == rule->tcp_flags));
+}
+
+/* 매치된 룰의 액션을 수행하고 XDP 액션을 반환한다. redirect 실패(redirect_map에 없음)와
+ * 알 수 없는 action은 통계 없이 XDP_PASS. rule은 NULL 검사가 끝난 맵 값 포인터. */
+static __always_inline int apply_rule(struct xdp_md *ctx, struct filter_rule *rule)
+{
+    switch (rule->action) {
+    case ACTION_DROP:
+        update_stats(&rule->stats, (__u64)(ctx->data_end - ctx->data));
+        return XDP_DROP;
+
+    case ACTION_REDIRECT:
+        {
+            __u32 ifindex = rule->redirect_ifindex;
+            struct if_redirect *redirect;
+
+            redirect = bpf_map_lookup_elem(&redirect_map, &ifindex);
+            if (redirect && redirect->ifindex > 0) {
+                update_stats(&rule->stats, (__u64)(ctx->data_end - ctx->data));
+                return bpf_redirect(redirect->ifindex, 0);
+            }
+        }
+        return XDP_PASS;
+
+    case ACTION_PASS:
+        update_stats(&rule->stats, (__u64)(ctx->data_end - ctx->data));
+        return XDP_PASS;
+
+    case ACTION_COUNT:
+        /* 통계만 집계하고 통과 (P-m1) */
+        update_stats(&rule->stats, (__u64)(ctx->data_end - ctx->data));
+        return XDP_PASS;
+
+    default:
+        return XDP_PASS;
     }
 }
 
@@ -150,57 +207,24 @@ static __always_inline int handle_ipv4(struct xdp_md *ctx, void *data, void *dat
         dst_port = bpf_ntohs(udph->dest);
     }
     
-    /* 필터 룰 확인 */
+    /* 필터 룰 확인: (a) 출발지 룰 → (b) 목적지 룰 → (c) PASS.
+     * 출발지 룰이 매치하면 그 결과(redirect 실패로 인한 PASS 포함)로 끝나고 목적지 맵은 보지 않는다.
+     * apply_rule 호출은 한 곳에만 둔다(인라인 사본 1개). */
     struct prefix_key key = {0};
     struct filter_rule *rule;
-    
-    key.prefix_len = 32; // 정확한 IP 매치
-    key.addr = ip_src;
-    
-    rule = bpf_map_lookup_elem(&filter_rules, &key);
-    if (rule) {
-        /* 포트 및 프로토콜 매치 확인 */
-        if ((rule->protocol == IPPROTO_ANY || rule->protocol == protocol) &&
-            (rule->src_port_min <= src_port && src_port <= rule->src_port_max) &&
-            (rule->dst_port_min <= dst_port && dst_port <= rule->dst_port_max) &&
-            ((protocol != IPPROTO_TCP) || ((rule->tcp_flags & tcp_flags) == rule->tcp_flags))) {
-            
-            /* 룰에 따른 액션 수행 */
-            switch (rule->action) {
-            case ACTION_DROP:
-                update_stats(&rule->stats, (__u64)(ctx->data_end - ctx->data));
-                return XDP_DROP;
-                
-            case ACTION_REDIRECT:
-                {
-                    __u32 ifindex = rule->redirect_ifindex;
-                    struct if_redirect *redirect;
-                    
-                    redirect = bpf_map_lookup_elem(&redirect_map, &ifindex);
-                    if (redirect && redirect->ifindex > 0) {
-                        update_stats(&rule->stats, (__u64)(ctx->data_end - ctx->data));
-                        return bpf_redirect(redirect->ifindex, 0);
-                    }
-                }
-                break;
-                
-            case ACTION_PASS:
-                update_stats(&rule->stats, (__u64)(ctx->data_end - ctx->data));
-                return XDP_PASS;
 
-            case ACTION_COUNT:
-                /* 통계만 집계하고 통과 (P-m1) */
-                update_stats(&rule->stats, (__u64)(ctx->data_end - ctx->data));
-                return XDP_PASS;
-                
-            default:
-                break;
-            }
-        }
+    key.prefix_len = 32; // 정확한 IP 매치 (LPM: 최장 prefix 룰 1개)
+    key.addr = ip_src;
+    rule = bpf_map_lookup_elem(&filter_rules, &key);
+    if (!rule || !rule_matches(rule, protocol, src_port, dst_port, tcp_flags)) {
+        key.prefix_len = 32;
+        key.addr = ip_dst;
+        rule = bpf_map_lookup_elem(&dst_rules, &key);
+        if (!rule || !rule_matches(rule, protocol, src_port, dst_port, tcp_flags))
+            return XDP_PASS;
     }
-    
-    /* 기본적으로 패킷 통과 */
-    return XDP_PASS;
+
+    return apply_rule(ctx, rule);
 }
 
 SEC("xdp")

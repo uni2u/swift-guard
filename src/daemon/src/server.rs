@@ -26,6 +26,7 @@ use crate::telemetry::TelemetryCollector;
 use crate::wasm::WasmManager;
 
 use swift_guard::api::{ApiRequest, ApiResponse, SystemStats, WasmModuleInfo};
+use swift_guard::types::MatchSide;
 use swift_guard::utils;
 
 /// API 서버
@@ -439,19 +440,18 @@ impl ApiServer {
                 expire,
                 label,
             } => {
-                // P-M4: XDP 필터는 src IP prefix 로만 매칭한다
-                let src_ip = src_ip.ok_or_else(|| {
-                    anyhow!("src_ip is required: XDP filter matches by source IP prefix only")
-                })?;
-                if dst_ip.is_some() {
-                    return Err(anyhow!("dst_ip matching is not supported"));
-                }
+                // 룰 하나는 src_ip(filter_rules) 또는 dst_ip(dst_rules) 중 정확히 하나로 매칭한다
+                let (side, ip) = utils::select_match_ip(src_ip.as_deref(), dst_ip.as_deref())?;
 
                 // N-5/N-6: action/protocol 범위, redirect_if 와 action 의 짝
                 validate_add_rule(action, protocol, redirect_if.as_deref())?;
 
-                let src_ip_parsed = utils::parse_ip_prefix(&src_ip)
-                    .with_context(|| format!("Invalid src_ip '{}'", src_ip))?;
+                let field = match side {
+                    MatchSide::Src => "src_ip",
+                    MatchSide::Dst => "dst_ip",
+                };
+                let ip_parsed = utils::parse_ip_prefix(ip)
+                    .with_context(|| format!("Invalid {} '{}'", field, ip))?;
 
                 // P-M5: redirect_if 는 실제 인터페이스 이름 (검증 후 redirect 일 때만 Some)
                 let (redirect_ifindex, redirect_ifname) = match redirect_if {
@@ -460,7 +460,8 @@ impl ApiServer {
                 };
 
                 let rule = FilterRule {
-                    src_ip: Some(src_ip_parsed),
+                    src_ip: (side == MatchSide::Src).then_some(ip_parsed),
+                    dst_ip: (side == MatchSide::Dst).then_some(ip_parsed),
                     src_port_min,
                     src_port_max,
                     dst_port_min,

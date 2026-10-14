@@ -4,6 +4,8 @@
 use std::net::Ipv4Addr;
 use anyhow::{anyhow, Result};
 
+use crate::types::MatchSide;
+
 /// 포트 범위 문자열 파싱 (예: "80" 또는 "1024-2048")
 pub fn parse_port_range(s: &str) -> Result<(u16, u16)> {
     if s.contains('-') {
@@ -61,6 +63,20 @@ pub fn parse_ip_prefix(s: &str) -> Result<(u32, u32)> {
     }
     
     Ok((ip, prefix_len))
+}
+
+/// 룰의 매칭 IP 선택. src_ip / dst_ip 중 정확히 하나만 지정되어야 한다.
+/// 에러 문구는 daemon 응답(SSOT)으로 그대로 나가므로 문서·테스트와 글자 단위로 같아야 한다.
+pub fn select_match_ip<'a>(
+    src_ip: Option<&'a str>,
+    dst_ip: Option<&'a str>,
+) -> Result<(MatchSide, &'a str)> {
+    match (src_ip, dst_ip) {
+        (Some(_), Some(_)) => Err(anyhow!("specify either src_ip or dst_ip, not both")),
+        (None, None) => Err(anyhow!("src_ip or dst_ip is required")),
+        (Some(s), None) => Ok((MatchSide::Src, s)),
+        (None, Some(d)) => Ok((MatchSide::Dst, d)),
+    }
 }
 
 /// IPv4 주소를 문자열로 변환
@@ -192,6 +208,34 @@ mod tests {
         assert!(parse_ip_prefix("192.168.1.1/33").is_err());
     }
     
+    #[test]
+    fn select_match_ip_src_only() {
+        assert_eq!(
+            select_match_ip(Some("10.0.0.1"), None).unwrap(),
+            (MatchSide::Src, "10.0.0.1")
+        );
+    }
+
+    #[test]
+    fn select_match_ip_dst_only() {
+        assert_eq!(
+            select_match_ip(None, Some("10.200.0.11")).unwrap(),
+            (MatchSide::Dst, "10.200.0.11")
+        );
+    }
+
+    #[test]
+    fn select_match_ip_both_rejected() {
+        let e = select_match_ip(Some("10.0.0.1"), Some("10.0.0.2")).unwrap_err();
+        assert_eq!(e.to_string(), "specify either src_ip or dst_ip, not both");
+    }
+
+    #[test]
+    fn select_match_ip_none_rejected() {
+        let e = select_match_ip(None, None).unwrap_err();
+        assert_eq!(e.to_string(), "src_ip or dst_ip is required");
+    }
+
     #[test]
     fn test_ipv4_conversions() {
         let addr = Ipv4Addr::new(192, 168, 1, 1);

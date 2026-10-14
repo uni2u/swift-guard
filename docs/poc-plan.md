@@ -1,489 +1,158 @@
 # Swift-Guard PoC 계획 및 벤치마킹 가이드
 
-이 문서는 Swift-Guard 프로젝트의 Proof of Concept (PoC) 진행 및 SCIE 저널 투고를 위한 벤치마킹 계획을 설명합니다.
+이 문서는 Swift-Guard PoC와 SCIE 저널 투고를 위한 벤치마킹 계획이다. 실행 절차 요약은 [`linux-verification.md`의 Tier 3](linux-verification.md#tier-3--성능)에 있다.
 
-## 1. 테스트 환경 설정
+## 구현 상태
 
-### 테스트 환경 요구사항
+| 시나리오 | 스크립트 | 측정 가능 | 비고 |
+|----------|----------|-----------|------|
+| 기본 처리량 (2.1) | `tools/bench/basic_throughput_test.sh` | ✅ | 프레임 크기별 pps·Gbps·CPU |
+| 룰 스케일링 (2.2) | `tools/bench/rule_scaling_test.sh` | ✅ | 룰 수별 pps |
+| 룰 추가 지연 (2.2) | `tools/bench/rule_scaling_test.sh` (`add_rule_us_avg`) | △ | CLI 프로세스 생성·TCP 연결 포함. 순수 맵 갱신 지연 아님 |
+| 지연 P50/P99 | — | ❌ | 측정 도구 없음 (6장) |
+| WASM 오버헤드 (2.3) | — | ❌ | XDP→WASM 데이터 경로가 없다 |
+| 보안 효과성 (3.1) | — | ❌ | 같은 이유 + 공격 트래픽·판정 하네스 없음 |
+| 기존 솔루션 비교 | — | ❌ | 실측 스크립트 없음 |
 
-- **물리 서버 설정**:
-  - CPU: Intel Xeon E5-2680v4 이상 (최소 16코어)
-  - RAM: 32GB 이상
-  - NIC: Intel X520/X540/X550 계열 (10GbE 이상, XDP 지원)
-  - SSD: 256GB 이상
+흐름(스크립트가 끝까지 도는지)은 물리 NIC 없이 `sudo tools/test/bench_flow_check.sh`로 확인할 수 있다. 이때 나오는 수치는 성능 결과가 아니다.
 
-- **소프트웨어 환경**:
-  - 운영체제: Ubuntu 22.04 LTS 또는 최신 Debian
-  - 커널 버전: 5.15 이상 (XDP 기능 완전 지원)
-  - 패키지: clang, llvm, libelf-dev, build-essential, linux-headers
-  - Rust 버전: 1.65 이상
+## 1. 테스트 환경
 
-### 테스트 토폴로지
+### 하드웨어
+- CPU: Intel Xeon E5-2680v4급 이상 (16코어 이상 권장)
+- RAM: 32GB 이상
+- NIC: XDP driver 모드를 지원하는 10GbE 이상 (Intel X520/X540/X550/X710 등)
+- 송신 장비: 커널 pktgen을 돌릴 Linux 장비 1대(권장) 또는 DUT의 두 번째 NIC
 
+### 소프트웨어
+- OS: Ubuntu 22.04 LTS 이상, 커널 5.10+ (5.15 이상 권장)
+- Rust **1.78+** (Cargo.lock v4)
+- 패키지: `clang llvm libelf-dev libbpf-dev build-essential pkg-config linux-headers-$(uname -r) iproute2`
+- 분석: `python3`, `matplotlib` (`pip install -r tools/analysis/requirements.txt`. 없으면 summary.md만 만든다)
+
+### 토폴로지
 ```
-[트래픽 발생기] --- [Swift-Guard 장비] --- [목적지 서버]
-    (pktgen)           (DUT)             (Traffic Sink)
+(a) 권장: 송신 장비 ── 케이블 ── DUT NIC [XDP]
+          tools/bench/pktgen_tx.sh       basic_throughput_test.sh --generator external
+
+(b) 단일 호스트: DUT의 tx NIC ── 케이블 직결 ── DUT의 rx NIC [XDP]
+          basic_throughput_test.sh --generator pktgen --tx-dev <tx-nic>  (송신과 수신이 CPU를 나눠 쓴다)
+
+(c) 흐름 검증만: 실습 랩 veth sg-lab0 [XDP generic] ← python 송신
+          --generator lab  (성능 수치 아님)
 ```
+XDP_DROP 룰로 측정하므로 목적지 서버(트래픽 싱크)는 필요 없다.
+
+## 측정 전 공통 사항
+
+- **Tier 2 선행:** 같은 장비에서 `sudo tools/test/e2e_check.sh --build`를 먼저 통과시킨다.
+- **매치 룰이 필요하다:** `xdp-filter stats`의 전역 총계(BPF `stats_map`)는 **룰에 매치한 패킷만** 센다. 룰에 매치하지 않고 통과한 패킷, 비 IPv4는 집계되지 않는다. 그래서 스크립트는 트래픽 출발지(`--src-ip`, 기본 `198.18.0.2`)에 매치하는 룰 `bench-match`(`--protocol any`, 기본 `--rule-action drop`)를 넣고 측정한다. 송신 측 출발지 IP를 반드시 맞춘다. `--rule-action none`이면 xdp 통계는 0이고 `if_rx_pps`만 의미가 있다.
+- **daemon:** 스크립트가 API(`--api-server`, 기본 `127.0.0.1:7654`) 응답을 확인한다. 응답이 없으면 설정 파일 없이(기본값) daemon을 띄우고 끝나면 종료한다. 이미 실행 중이면 재사용한다. 이때는 기존 룰이 결과와 룰 한도에 영향을 준다는 경고를 출력하고, 끝나면 스크립트가 넣은 룰만 지운다. 재사용 daemon에 label `bench-match` 룰이 이미 있으면 지우지 않고 에러로 중단한다.
+- **attach:** 기본 `--mode driver`. 스크립트가 attach하고 끝나면 detach한다. 재사용 daemon이 이미 그 인터페이스에 붙여 두었으면 `--no-attach`를 쓴다(attach도 detach도 하지 않는다). `--force-attach`(다른 프로그램의 XDP를 교체)는 스크립트가 daemon을 띄운 경우에만 허용되고, 재사용 daemon에서는 거부된다 — 교체 후 정리 단계의 detach가 운영 중인 필터를 떼어내지 않게 하기 위해서다.
+- **실패 처리:** 측정 중 daemon이 응답하지 않거나 `xdp-filter stats`가 실패하면(데이터 행 0 포함) 그 측정의 요약 행을 기록하지 않고 종료 코드 1로 중단한다. 앞서 끝난 측정의 행은 남는다. 정리(trap)는 백그라운드 stats·생성기를 프로세스 그룹째 종료한다.
+- **비율 계산:** pps·Mbps는 CLI가 연속 두 샘플(1초 간격) 총계의 차이로 계산한다. 첫 샘플은 비율이 없다(CSV 빈 칸).
+- **튜닝 권고:** `irqbalance` 정지, 수신 큐 IRQ와 CPU 고정, CPU 주파수 고정(performance governor), 측정 중 다른 부하 금지.
+- **바이트 기준:** Gbps는 XDP가 보는 L2 프레임(FCS·프리앰블·IFG 제외) 기준이다. 선로 속도(line rate)와 다르다. 프레임 크기 옵션은 FCS를 포함한 L2 크기(64–1518)다.
 
 ## 2. 성능 벤치마크 시나리오
 
-### 2.1 기본 처리량 테스트
+### 2.1 기본 처리량
 
-- **목적**: Swift-Guard의 패킷 처리 성능 측정
-- **지표**: 초당 패킷 수(PPS), 처리량(Gbps), CPU 사용률
-
-```bash
-#!/bin/bash
-# basic_throughput_test.sh
-
-# 테스트 설정
-INTERFACE="enp1s0"
-DURATION=60  # 초 단위 테스트 시간
-TEST_SIZES=(64 128 512 1024 1518)  # 패킷 크기 목록
-
-# XDP 프로그램 로드
-echo "Loading XDP program..."
-sudo ./target/release/xdp-filter attach $INTERFACE --mode driver
-
-# 통계 수집 도구 시작
-echo "Starting statistics collection..."
-./target/release/xdp-filter stats --interval 1 > throughput_results.csv &
-STATS_PID=$!
-
-# pktgen 설정 및 실행
-for SIZE in "${TEST_SIZES[@]}"; do
-    echo "Testing with packet size: $SIZE bytes"
-    sudo pktgen_setup.sh --interface $INTERFACE --size $SIZE --duration $DURATION --output "pktgen_${SIZE}bytes.log"
-    sleep 5  # 시스템 안정화를 위한 대기 시간
-done
-
-# 통계 수집 도구 종료
-kill $STATS_PID
-
-# XDP 프로그램 언로드
-echo "Unloading XDP program..."
-sudo ./target/release/xdp-filter detach $INTERFACE
-
-echo "Test completed. Results saved to throughput_results.csv and pktgen_*.log files."
-```
-
-### 2.2 규칙 스케일링 테스트
-
-- **목적**: 필터링 규칙 수에 따른 성능 영향 측정
-- **지표**: 규칙 수에 따른 처리량, 지연 시간 증가
+- **목적:** 프레임 크기별 XDP 처리 성능
+- **지표:** pps, Gbps, CPU 사용률(전체·softirq·가장 바쁜 CPU), 인터페이스 rx pps, daemon RSS
 
 ```bash
-#!/bin/bash
-# rule_scaling_test.sh
+# 송신 장비
+sudo tools/bench/pktgen_tx.sh --dev <tx-nic> --dst-ip <DUT-IP> --dst-mac <DUT-MAC> --src-ip 198.18.0.2 --size 64 --duration 70
+# DUT (external: 크기마다 안내 후 Enter 대기)
+sudo tools/bench/basic_throughput_test.sh --interface <nic> --mode driver --generator external --packet-sizes 64 --duration 60
 
-# 테스트 설정
-INTERFACE="enp1s0"
-RULE_COUNTS=(10 100 1000 5000 10000)
-PACKET_SIZE=512  # 고정 패킷 크기
-DURATION=30
+# 단일 호스트 (pktgen이 크기별로 자동 송신)
+sudo tools/bench/basic_throughput_test.sh --interface <nic> --generator pktgen --tx-dev <tx-nic>
 
-# XDP 프로그램 로드
-echo "Loading XDP program..."
-sudo ./target/release/xdp-filter attach $INTERFACE --mode driver
-
-# 각 규칙 수에 대해 테스트
-for COUNT in "${RULE_COUNTS[@]}"; do
-    echo "Testing with $COUNT rules..."
-    
-    # 규칙 생성 스크립트 실행
-    ./generate_rules.sh $COUNT
-    
-    # 통계 수집 시작
-    ./target/release/xdp-filter stats --interval 1 > "rules_${COUNT}_stats.csv" &
-    STATS_PID=$!
-    
-    # 트래픽 발생
-    sudo pktgen_setup.sh --interface $INTERFACE --size $PACKET_SIZE --duration $DURATION --output "pktgen_rules_${COUNT}.log"
-    
-    # 통계 수집 종료
-    kill $STATS_PID
-    
-    # 규칙 삭제
-    ./clean_rules.sh
-    
-    sleep 5  # 시스템 안정화
-done
-
-# XDP 프로그램 언로드
-echo "Unloading XDP program..."
-sudo ./target/release/xdp-filter detach $INTERFACE
-
-echo "Test completed. Results saved to rules_*_stats.csv and pktgen_rules_*.log files."
+# 흐름 검증 (NIC 불필요, 수치 의미 없음)
+sudo tools/bench/basic_throughput_test.sh --generator lab --duration 5
 ```
+측정 1회(크기 하나)의 절차:
+1. `xdp-filter stats --format csv --interval 1 --count <duration+3>`을 백그라운드로 `throughput/stats_<size>.csv`에 기록
+2. 1초 뒤 `/proc/stat`·인터페이스 `rx_packets` 스냅샷 → 생성기 `duration`초 → 스냅샷
+3. 요약: pps가 0보다 큰 행(active)만 쓰고, 3행 이상이면 처음·마지막 행(부분 초)을 뺀 평균
 
-### 2.3 WASM 모듈 오버헤드 테스트
+### 2.2 룰 스케일링
 
-- **목적**: WASM 기반 검사 모듈의 성능 영향 측정
-- **지표**: WASM 모듈 유무에 따른 처리량, 지연 시간 차이
+- **목적:** 맵에 든 룰 수가 처리량에 주는 영향, 룰 추가 시간
+- **지표:** 룰 수별 pps(첫 단계 대비 %), `add_rule_us_avg`
 
 ```bash
-#!/bin/bash
-# wasm_overhead_test.sh
-
-# 테스트 설정
-INTERFACE="enp1s0"
-WASM_MODULES=("null_module.wasm" "basic_inspector.wasm" "complex_inspector.wasm")
-PACKET_SIZE=512
-DURATION=30
-
-# XDP 프로그램 로드
-echo "Loading XDP program..."
-sudo ./target/release/xdp-filter attach $INTERFACE --mode driver
-
-# 기본 XDP 성능 측정 (WASM 없음)
-echo "Testing with no WASM module..."
-./target/release/xdp-filter stats --interval 1 > "wasm_none_stats.csv" &
-STATS_PID=$!
-sudo pktgen_setup.sh --interface $INTERFACE --size $PACKET_SIZE --duration $DURATION --output "pktgen_wasm_none.log"
-kill $STATS_PID
-sleep 5
-
-# 각 WASM 모듈에 대해 테스트
-for MODULE in "${WASM_MODULES[@]}"; do
-    echo "Testing with WASM module: $MODULE"
-    
-    # WASM 모듈 로드
-    ./load_wasm_module.sh $MODULE
-    
-    # 통계 수집 시작
-    ./target/release/xdp-filter stats --interval 1 > "wasm_${MODULE}_stats.csv" &
-    STATS_PID=$!
-    
-    # 트래픽 발생
-    sudo pktgen_setup.sh --interface $INTERFACE --size $PACKET_SIZE --duration $DURATION --output "pktgen_wasm_${MODULE}.log"
-    
-    # 통계 수집 종료
-    kill $STATS_PID
-    
-    # WASM 모듈 언로드
-    ./unload_wasm_module.sh $MODULE
-    
-    sleep 5  # 시스템 안정화
-done
-
-# XDP 프로그램 언로드
-echo "Unloading XDP program..."
-sudo ./target/release/xdp-filter detach $INTERFACE
-
-echo "Test completed. Results saved to wasm_*_stats.csv and pktgen_wasm_*.log files."
+sudo tools/bench/rule_scaling_test.sh --interface <nic> --mode driver --generator external --duration 30
+sudo tools/bench/rule_scaling_test.sh --interface <nic> --generator pktgen --tx-dev <tx-nic> --side dst
+sudo tools/bench/rule_scaling_test.sh --generator lab --rule-counts 1,10,100 --duration 3     # 흐름 검증
 ```
+- 단계(`--rule-counts`, 기본 `1,10,100,1000,5000,10000`)마다 filler 룰을 **누적** 추가하고 측정한다. `rule_count`는 매치 룰을 포함한 bench 룰 총수다.
+- filler: `198.19.<i/256>.<i%256>/32`, label `bench-fill-<i>`, action pass. 트래픽과 매치하지 않는다. `--src-ip`·`--dst-ip`가 198.19.0.0/16이면 거부한다.
+- 데이터 구조: 출발지 맵(`filter_rules`)과 목적지 맵(`dst_rules`)이 각각 LPM trie, **맵당 최대 10240**(`MAX_FILTER_RULES`), **prefix당 룰 1개**. 패킷마다 `/32` 키로 출발지 맵을 1회 조회하고, 미스(또는 조건 불일치)면 목적지 맵을 1회 더 조회한다. `--side dst`는 매치 룰과 filler를 목적지 맵에 넣어 모든 패킷이 두 번 조회되게 한다.
+- `add_rule_us_avg` = 단계에서 추가한 filler 수로 나눈 벽시계 시간이다. `xdp-filter add-rule` 프로세스 생성과 TCP 연결을 포함하므로 **순수 맵 갱신 지연이 아니다.** 매치 룰은 준비 단계에서 넣으므로 `rules_added`에 포함되지 않는다.
+- 가설(미측정): LPM trie 조회 비용은 룰 수보다 prefix 길이 분포에 좌우되므로, 모두 /32인 이 시나리오에서는 룰 수에 대해 평탄할 것으로 예상한다.
+
+### 2.3 WASM 모듈 오버헤드 — 현재 측정 불가
+
+현재 WASM 모듈은 daemon에서 관리(load/list/stats/unload)만 된다. XDP가 패킷을 사용자 공간 WASM 모듈로 넘기는 경로가 없으므로 오버헤드를 원리상 측정할 수 없다. 선행 구현이 필요하다.
+- XDP → 사용자 공간 데이터 경로 (AF_XDP 또는 perf/ring buffer)
+- 사용자 공간에서 WASM `inspect_packet` 호출, 판정 결과를 룰/맵에 반영하는 경로
+
+### 결과 파일과 열
+
+`--output-dir`(기본 `./results`)에 다음을 만든다. 두 스크립트는 자기 파일만 덮어쓰므로 같은 디렉토리에 공존한다.
+
+| 파일 | 내용 |
+|------|------|
+| `meta_throughput.txt` / `meta_rule_scaling.txt` | `key=value`: date, git_rev, kernel, cpu_model, nproc, interface, driver, mode, generator, rule_action, duration, src_ip, dst_ip, daemon_reused (+ packet_sizes / side, packet_size, rule_counts) |
+| `throughput_results.csv` | `packet_size,generator,mode,rule_action,duration_sec,samples,pps,pps_peak,gbps,cpu_util,cpu_softirq,cpu_busiest,if_rx_pps,daemon_rss_kb` |
+| `rule_scaling_results.csv` | `rule_count,side,packet_size,generator,mode,rule_action,duration_sec,samples,pps,pps_peak,gbps,cpu_util,cpu_softirq,cpu_busiest,if_rx_pps,daemon_rss_kb,rules_added,add_rules_sec,add_rule_us_avg` |
+| `throughput/stats_<size>.csv`, `rule_scaling/stats_<count>.csv` | `xdp-filter stats --format csv` 원본: `timestamp_ms,total_packets,total_bytes,pps,mbps` |
+| `throughput/generator_<size>.log`, `rule_scaling/generator_<count>.log` | 생성기 출력 |
+| `daemon.log` | 스크립트가 daemon을 띄운 경우 |
+| `plots/` | 분석기 출력 (4장) |
+
+| 열 | 의미 |
+|----|------|
+| `samples` | 원본 stats CSV의 데이터 행 수 |
+| `pps` | active 행(pps>0) 평균, 3행 이상이면 처음·마지막 제외. 정수 |
+| `pps_peak` | 전체 행 pps 최대 |
+| `gbps` | active 행 mbps 평균 / 1000 (소수 4자리, L2 바이트 기준) |
+| `cpu_util` | 측정 구간 전체 CPU busy% = (total − idle − iowait) / total |
+| `cpu_softirq` | softirq / total (%) |
+| `cpu_busiest` | CPU별 busy% 중 최대 — XDP는 수신 큐 CPU에서 돌므로 이 값이 병목을 보여 준다 |
+| `if_rx_pps` | 인터페이스 `rx_packets` 증가율. 드라이버마다 XDP_DROP 패킷 계수 여부가 달라 참고용 |
+| `daemon_rss_kb` | daemon VmRSS (pid를 모르면 빈 칸) |
+| `rules_added`, `add_rules_sec`, `add_rule_us_avg` | 단계에서 추가한 filler 수, 걸린 초, 룰당 µs. `rules_added=0`이면 뒤 두 칸은 빈 칸 |
 
 ## 3. 보안 효과성 테스트
 
-### 3.1 공격 탐지 및 차단 테스트
+### 3.1 공격 탐지 및 차단 — 현재 측정 불가
 
-- **목적**: Swift-Guard의 보안 효과성 검증
-- **지표**: 탐지율, 오탐률, 차단 지연 시간
-
-```bash
-#!/bin/bash
-# security_effectiveness_test.sh
-
-# 테스트 설정
-INTERFACE="enp1s0"
-ATTACK_TYPES=("syn_flood" "http_injection" "port_scan" "malformed_packet")
-WASM_MODULE="security_inspector.wasm"
-
-# XDP 프로그램 및 보안 WASM 모듈 로드
-echo "Loading XDP program and security WASM module..."
-sudo ./target/release/xdp-filter attach $INTERFACE --mode driver
-./load_wasm_module.sh $WASM_MODULE
-
-# 각 공격 유형에 대해 테스트
-for ATTACK in "${ATTACK_TYPES[@]}"; do
-    echo "Testing against attack: $ATTACK"
-    
-    # 로깅 시작
-    ./capture_logs.sh "security_${ATTACK}.log" &
-    LOG_PID=$!
-    
-    # 공격 트래픽 생성
-    ./generate_attack.sh $ATTACK
-    
-    # 로깅 종료
-    sleep 5
-    kill $LOG_PID
-    
-    # 결과 수집
-    ./analyze_security_logs.sh "security_${ATTACK}.log" > "security_results_${ATTACK}.txt"
-    
-    sleep 5  # 시스템 안정화
-done
-
-# 모듈 및 XDP 프로그램 언로드
-echo "Unloading WASM module and XDP program..."
-./unload_wasm_module.sh $WASM_MODULE
-sudo ./target/release/xdp-filter detach $INTERFACE
-
-echo "Test completed. Results saved to security_results_*.txt files."
-```
+탐지율·오탐률은 WASM 검사 결과가 있어야 정의된다. 2.3과 같은 데이터 경로가 없으므로 원리상 측정할 수 없다. 선행 구현: XDP→WASM 데이터 경로, 판정 결과 반영 경로, 공격 트래픽 생성·판정 하네스(6장). 지금 할 수 있는 것은 정적 룰(drop/redirect)의 동작 확인이며, 이는 Tier 2(`tools/test/e2e_check.sh`)와 [`examples.md`](examples.md)가 다룬다.
 
 ## 4. 데이터 분석 및 그래프 생성
 
-### 4.1 성능 데이터 분석 스크립트
-
-```python
-#!/usr/bin/env python3
-# analyze_performance.py
-
-import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
-import numpy as np
-import os
-
-# 스타일 설정
-sns.set(style="whitegrid")
-plt.rcParams.update({'font.size': 12})
-
-def analyze_basic_throughput():
-    """기본 처리량 테스트 결과 분석"""
-    print("Analyzing basic throughput results...")
-    
-    # 결과 데이터 로드
-    df = pd.read_csv('throughput_results.csv')
-    
-    # 처리량 그래프
-    plt.figure(figsize=(12, 6))
-    
-    plt.subplot(1, 2, 1)
-    plt.plot(df['packet_size'], df['pps'], 'o-', linewidth=2)
-    plt.xlabel('Packet Size (bytes)')
-    plt.ylabel('Packets Per Second (PPS)')
-    plt.title('Packet Throughput vs Packet Size')
-    plt.grid(True)
-    
-    plt.subplot(1, 2, 2)
-    plt.plot(df['packet_size'], df['gbps'], 'o-', linewidth=2, color='orange')
-    plt.xlabel('Packet Size (bytes)')
-    plt.ylabel('Throughput (Gbps)')
-    plt.title('Bandwidth vs Packet Size')
-    plt.grid(True)
-    
-    plt.tight_layout()
-    plt.savefig('basic_throughput.png', dpi=300)
-    plt.close()
-
-def analyze_rule_scaling():
-    """규칙 스케일링 테스트 결과 분석"""
-    print("Analyzing rule scaling results...")
-    
-    rule_counts = [10, 100, 1000, 5000, 10000]
-    pps_values = []
-    latency_values = []
-    
-    # 각 규칙 수에 대한 결과 로드
-    for count in rule_counts:
-        df = pd.read_csv(f'rules_{count}_stats.csv')
-        pps_values.append(df['pps'].mean())
-        
-        # 지연 시간 데이터 로드 (별도 파일)
-        latency_df = pd.read_csv(f'pktgen_rules_{count}.log', delimiter='\s+')
-        latency_values.append(latency_df['latency_us'].mean())
-    
-    # 그래프 생성
-    plt.figure(figsize=(12, 6))
-    
-    plt.subplot(1, 2, 1)
-    plt.plot(rule_counts, pps_values, 'o-', linewidth=2)
-    plt.xlabel('Number of Rules')
-    plt.ylabel('Packets Per Second (PPS)')
-    plt.title('Throughput vs Rule Count')
-    plt.grid(True)
-    plt.xscale('log')
-    
-    plt.subplot(1, 2, 2)
-    plt.plot(rule_counts, latency_values, 'o-', linewidth=2, color='green')
-    plt.xlabel('Number of Rules')
-    plt.ylabel('Latency (μs)')
-    plt.title('Latency vs Rule Count')
-    plt.grid(True)
-    plt.xscale('log')
-    
-    plt.tight_layout()
-    plt.savefig('rule_scaling.png', dpi=300)
-    plt.close()
-
-def analyze_wasm_overhead():
-    """WASM 모듈 오버헤드 테스트 결과 분석"""
-    print("Analyzing WASM overhead results...")
-    
-    modules = ['none', 'null_module.wasm', 'basic_inspector.wasm', 'complex_inspector.wasm']
-    pps_values = []
-    cpu_values = []
-    
-    # 각 WASM 모듈에 대한 결과 로드
-    for module in modules:
-        df = pd.read_csv(f'wasm_{module}_stats.csv')
-        pps_values.append(df['pps'].mean())
-        cpu_values.append(df['cpu_util'].mean())
-    
-    # 모듈 이름 간소화
-    module_names = ['No WASM', 'Null Module', 'Basic Module', 'Complex Module']
-    
-    # 그래프 생성
-    plt.figure(figsize=(12, 6))
-    
-    plt.subplot(1, 2, 1)
-    bars = plt.bar(module_names, pps_values, color='skyblue')
-    plt.xlabel('WASM Module Type')
-    plt.ylabel('Packets Per Second (PPS)')
-    plt.title('Throughput vs WASM Module Type')
-    plt.xticks(rotation=45)
-    plt.grid(axis='y')
-    
-    # 성능 오버헤드 백분율 표시
-    baseline = pps_values[0]
-    for i, bar in enumerate(bars):
-        if i > 0:  # 첫 번째 바는 기준점
-            overhead = ((baseline - pps_values[i]) / baseline) * 100
-            plt.text(bar.get_x() + bar.get_width()/2., 
-                     bar.get_height() + 0.05 * max(pps_values),
-                     f'{overhead:.1f}%',
-                     ha='center', va='bottom', rotation=0)
-    
-    plt.subplot(1, 2, 2)
-    plt.bar(module_names, cpu_values, color='salmon')
-    plt.xlabel('WASM Module Type')
-    plt.ylabel('CPU Utilization (%)')
-    plt.title('CPU Usage vs WASM Module Type')
-    plt.xticks(rotation=45)
-    plt.grid(axis='y')
-    
-    plt.tight_layout()
-    plt.savefig('wasm_overhead.png', dpi=300)
-    plt.close()
-
-def analyze_security_effectiveness():
-    """보안 효과성 테스트 결과 분석"""
-    print("Analyzing security effectiveness results...")
-    
-    attack_types = ['syn_flood', 'http_injection', 'port_scan', 'malformed_packet']
-    detection_rates = []
-    false_positive_rates = []
-    reaction_times = []
-    
-    # 각 공격 유형에 대한 결과 로드
-    for attack in attack_types:
-        with open(f'security_results_{attack}.txt', 'r') as f:
-            lines = f.readlines()
-            for line in lines:
-                if 'Detection Rate:' in line:
-                    detection_rates.append(float(line.split(':')[1].strip().rstrip('%')))
-                elif 'False Positive Rate:' in line:
-                    false_positive_rates.append(float(line.split(':')[1].strip().rstrip('%')))
-                elif 'Average Reaction Time:' in line:
-                    reaction_times.append(float(line.split(':')[1].strip().rstrip('ms')))
-    
-    # 간단한 공격 유형 이름
-    attack_names = ['SYN Flood', 'HTTP Injection', 'Port Scan', 'Malformed Packet']
-    
-    # 그래프 생성
-    plt.figure(figsize=(15, 6))
-    
-    plt.subplot(1, 3, 1)
-    plt.bar(attack_names, detection_rates, color='green')
-    plt.xlabel('Attack Type')
-    plt.ylabel('Detection Rate (%)')
-    plt.title('Attack Detection Rate')
-    plt.xticks(rotation=45)
-    plt.ylim(0, 100)
-    plt.grid(axis='y')
-    
-    plt.subplot(1, 3, 2)
-    plt.bar(attack_names, false_positive_rates, color='red')
-    plt.xlabel('Attack Type')
-    plt.ylabel('False Positive Rate (%)')
-    plt.title('False Positive Rate')
-    plt.xticks(rotation=45)
-    plt.ylim(0, 20)  # 낮은 값이 좋으므로 스케일 조정
-    plt.grid(axis='y')
-    
-    plt.subplot(1, 3, 3)
-    plt.bar(attack_names, reaction_times, color='blue')
-    plt.xlabel('Attack Type')
-    plt.ylabel('Reaction Time (ms)')
-    plt.title('Average Reaction Time')
-    plt.xticks(rotation=45)
-    plt.grid(axis='y')
-    
-    plt.tight_layout()
-    plt.savefig('security_effectiveness.png', dpi=300)
-    plt.close()
-
-def create_comparison_chart():
-    """기존 솔루션과의 비교 차트 생성"""
-    print("Creating comparison chart...")
-    
-    solutions = ['Swift-Guard', 'Traditional FW', 'DPDK-based', 'XDP-vanilla']
-    metrics = ['Throughput (Gbps)', 'Latency (μs)', 'CPU Usage (%)', 'Features']
-    
-    # 예시 데이터 (실제 테스트 결과로 대체 필요)
-    data = {
-        'Throughput (Gbps)': [9.8, 3.2, 8.5, 7.1],
-        'Latency (μs)': [4.2, 85.3, 10.5, 8.7],
-        'CPU Usage (%)': [35, 75, 60, 45],
-        'Features': [0.9, 0.7, 0.5, 0.4]  # 표준화된 기능 점수 (0-1)
-    }
-    
-    # 레이더 차트 생성
-    categories = metrics
-    N = len(categories)
-    
-    # 데이터 표준화 (0-1 스케일)
-    normalized_data = {}
-    for metric in metrics:
-        if metric != 'Features':  # 이미 표준화된 기능 점수는 제외
-            values = data[metric]
-            if metric == 'Latency (μs)':  # 지연 시간은 낮을수록 좋음
-                normalized_data[metric] = [1 - (v - min(values)) / (max(values) - min(values)) for v in values]
-            else:  # 처리량과 기능은 높을수록 좋음
-                normalized_data[metric] = [(v - min(values)) / (max(values) - min(values)) for v in values]
-        else:
-            normalized_data[metric] = data[metric]
-    
-    # 각 솔루션을 하나의 데이터 포인트로 조정
-    angles = [n / float(N) * 2 * np.pi for n in range(N)]
-    angles += angles[:1]  # 폐곡선을 위한 반복
-    
-    plt.figure(figsize=(10, 8))
-    ax = plt.subplot(111, polar=True)
-    
-    for i, solution in enumerate(solutions):
-        values = [normalized_data[metric][i] for metric in metrics]
-        values += values[:1]  # 폐곡선을 위한 반복
-        
-        ax.plot(angles, values, linewidth=2, label=solution)
-        ax.fill(angles, values, alpha=0.1)
-    
-    # 차트 설정
-    plt.xticks(angles[:-1], categories)
-    ax.set_rlabel_position(0)
-    plt.yticks([0.25, 0.5, 0.75], ["0.25", "0.5", "0.75"], color="grey", size=8)
-    plt.ylim(0, 1)
-    
-    plt.legend(loc='upper right', bbox_to_anchor=(0.1, 0.1))
-    plt.title('Comparison of Network Security Solutions', size=15, y=1.1)
-    
-    plt.tight_layout()
-    plt.savefig('solution_comparison.png', dpi=300)
-    plt.close()
-
-if __name__ == "__main__":
-    # 모든 분석 실행
-    analyze_basic_throughput()
-    analyze_rule_scaling()
-    analyze_wasm_overhead()
-    analyze_security_effectiveness()
-    create_comparison_chart()
-    
-    print("Analysis completed. All graphs have been generated.")
+```bash
+pip install -r tools/analysis/requirements.txt          # matplotlib
+python3 tools/analysis/analyze_performance.py --results-dir results [--output-dir results/plots] [--no-plots]
 ```
+`tools/analysis/analyze_performance.py`는 위 CSV를 표준 `csv` 모듈로 읽는다. 출력(기본 `<results-dir>/plots/`):
+
+| 파일 | 내용 |
+|------|------|
+| `summary.md` | 요약 표 + meta |
+| `throughput.png` | 프레임 크기별 Mpps, Gbps |
+| `throughput_cpu.png` | `cpu_util`, `cpu_busiest` |
+| `throughput_timeseries.png` | `throughput/stats_*.csv`의 1초 pps 시계열 |
+| `rule_scaling.png` | 룰 수(log) 대비 Mpps, 첫 단계 대비 % |
+| `rule_add_latency.png` | `add_rule_us_avg` |
+
+- 입력 파일이 없거나 열이 계약과 다르면 그 분석만 건너뛴다. 입력이 하나도 없으면 종료 코드 1.
+- matplotlib이 없거나 `--no-plots`면 summary.md만 만든다.
+- `generator=lab` 행이 있으면 그래프 제목과 summary.md에 "FLOW CHECK ONLY (lab generator) — not a performance result"를 표시한다.
 
 ## 5. SCIE 저널 투고를 위한 결과 정리
 
@@ -529,15 +198,28 @@ if __name__ == "__main__":
    - 연구 요약 및 주요 발견
    - 향후 연구 방향
 
-### 5.2 주요 실험 결과 요약 (예상)
+### 5.2 주요 실험 결과 (가설 — 미측정)
 
-- **처리량 성능**: 기존 네트워크 보안 솔루션 대비 3-4배 향상된 처리량
-- **지연 시간**: 마이크로초 단위의 초저지연 패킷 처리 달성
-- **규칙 확장성**: 10,000개 이상의 규칙을 적용해도 성능 저하 최소화
-- **WASM 오버헤드**: 기본 XDP 성능 대비 10-15% 내외의 적은 오버헤드
-- **보안 효과성**: 주요 네트워크 공격에 대해 95% 이상의 탐지율, 5% 미만의 오탐률
+아래는 연구 목표로 세운 가설이며, 근거가 되는 측정은 아직 없다.
 
-## 6. 추가 개발 및 연구 방향
+- **처리량:** 기존 네트워크 보안 솔루션 대비 3–4배 처리량 (근거 없음 — 비교 대상 측정 스크립트 없음)
+- **지연 시간:** 마이크로초 단위 처리 (근거 없음 — 지연 측정 도구 없음)
+- **규칙 확장성:** 10,000개 규칙에서도 처리량 저하가 작음 (근거 없음 — 2.2로 검증 예정)
+- **WASM 오버헤드:** 기본 XDP 대비 10–15% (데이터 경로 구현 후 검증)
+- **보안 효과성:** 주요 공격 탐지율 95% 이상, 오탐률 5% 미만 (데이터 경로 구현 후 검증)
+
+## 6. 작성이 필요한 도구
+
+| 도구 | 용도 |
+|------|------|
+| 지연 측정 | P50/P99. 예: TRex latency stream, 또는 NIC 하드웨어 타임스탬프 |
+| XDP→WASM 데이터 경로 | AF_XDP 또는 perf/ring buffer로 패킷을 WASM `inspect_packet`에 전달, 판정 반영 (2.3, 3.1의 선행 조건) |
+| 공격 트래픽 생성·판정 하네스 | 공격 유형별 트래픽 생성, 탐지/차단 결과 수집 (3.1) |
+| BPF 맵 메모리 측정 자동화 | `bpftool map show`의 memlock을 결과에 기록 (현재는 `daemon_rss_kb`만) |
+| 비교 대상 측정 | iptables/nftables, 룰 없는 vanilla XDP(XDP_DROP) 같은 기준선 스크립트 |
+| 전체 패킷 카운터 | 룰 미매치 패킷도 세는 BPF 카운터 (현재 전역 통계는 매치 패킷만 센다 — BPF·daemon·API 변경 필요) |
+
+## 7. 추가 개발 및 연구 방향
 
 1. **분산 환경 지원**:
    - Kubernetes 환경 통합

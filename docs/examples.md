@@ -19,6 +19,8 @@
   - [예시 8. 검사 인터페이스로 리다이렉트](#예시-8-검사-인터페이스로-리다이렉트)
   - [예시 9. 거부되는 입력](#예시-9-거부되는-입력)
   - [예시 10. WASM 검사 모듈 관리](#예시-10-wasm-검사-모듈-관리)
+  - [예시 11. 목적지(서버 IP) 기준 차단](#예시-11-목적지서버-ip-기준-차단)
+  - [예시 12. 출발지 룰 우선과 목적지 룰로 넘어가기](#예시-12-출발지-룰-우선과-목적지-룰로-넘어가기)
 - [3. 정리](#3-정리)
 - [4. 실제 인터페이스에 적용할 때](#4-실제-인터페이스에-적용할-때)
 - [5. systemd 서비스로 운영](#5-systemd-서비스로-운영)
@@ -49,8 +51,8 @@ sudo tools/test/lab.sh up
 ```
 [netns sg-lab]  sg-lab-c0   10.200.0.2  .3  .4  .5     ← 클라이언트 4대 역할
                      ║ veth
-[root ns]       sg-lab0     10.200.0.1                 ← XDP를 붙일 인터페이스
-                서버: HTTP :8080, UDP echo :5353
+[root ns]       sg-lab0     10.200.0.1, 10.200.0.11    ← XDP를 붙일 인터페이스 (서버 IP 2개)
+                서버(두 IP 각각): HTTP :8080, UDP echo :5353
                 sg-lab-insp0 ══veth══ sg-lab-insp1      ← 리다이렉트 대상("검사 인터페이스")
 ```
 
@@ -62,7 +64,10 @@ sudo tools/test/lab.sh http 10.200.0.2        # TCP 8080 (HTTP)
 sudo tools/test/lab.sh udp  10.200.0.2        # UDP 5353
 sudo tools/test/lab.sh syn  10.200.0.2        # TCP 연결 시도만
 sudo tools/test/lab.sh insp-rx                # 검사 인터페이스 수신 패킷 수
+sudo tools/test/lab.sh --to 10.200.0.11 http 10.200.0.2   # 두 번째 서버 IP로
 ```
+
+목적지는 기본이 `10.200.0.1`이다. `--to 10.200.0.11`을 트래픽 명령 앞에 붙이면 두 번째 서버 IP로 보낸다(예시 11, 12). `--to`에는 이 두 주소만 쓸 수 있다.
 
 아래 예시에서는 편의상 `alias lab='sudo tools/test/lab.sh'`, `alias xf='sudo xdp-filter'`로 줄여 쓴다.
 
@@ -168,10 +173,10 @@ xf add-rule --src-ip 10.200.0.5    --action pass --label allow-admin
 xf list-rules
 ```
 ```
-LABEL                ACTION          SOURCE               DEST       PROTOCOL
---------------------------------------------------------------------------------
-block-subnet         drop            10.200.0.0/24        *          any
-allow-admin          pass            10.200.0.5           *          any
+LABEL                ACTION          SOURCE               DEST                 PROTOCOL
+------------------------------------------------------------------------------------------
+block-subnet         drop            10.200.0.0/24        *                    any
+allow-admin          pass            10.200.0.5           *                    any
 ```
 | 확인 | 결과 |
 |------|------|
@@ -194,28 +199,35 @@ lab ping 10.200.0.4; lab http 10.200.0.4        # 둘 다 OK
 xf list-rules --stats
 ```
 ```
-LABEL                ACTION          SOURCE               DEST       PROTOCOL
---------------------------------------------------------------------------------
-watch-host           count           10.200.0.4           *          any
+LABEL                ACTION          SOURCE               DEST                 PROTOCOL
+------------------------------------------------------------------------------------------
+watch-host           count           10.200.0.4           *                    any
   Packets: 9, Bytes: 777
 ```
-전체 통계는 1초 간격으로 계속 갱신되며, Ctrl+C로 끝낸다.
+전체 통계를 1초 간격으로 2번 출력한다. `--count`를 빼면 Ctrl+C까지 계속 출력한다.
 ```bash
-xf stats --interval 1
+xf stats --count 2
 ```
 ```
-Collecting statistics (press Ctrl+C to exit)...
-Timestamp: 2026-10-14 04:26:29
-Total packets: 37
-Total bytes: 3020 (0.00 MB)
+Collecting 2 samples every 1s...
+Timestamp: 2026-10-14 06:35:31
+Total packets: 38
+Total bytes: 3086 (0.00 MB)
+Packets/sec: n/a
+Bandwidth: n/a
+----------------------------------------
+Timestamp: 2026-10-14 06:35:32
+Total packets: 38
+Total bytes: 3086 (0.00 MB)
 Packets/sec: 0
 Bandwidth: 0.00 Mbps
 ----------------------------------------
 ```
+`Packets/sec`·`Bandwidth`는 CLI가 연속한 두 샘플의 총계 차이로 계산한다. 그래서 첫 샘플은 `n/a`이고, 그 사이에 트래픽이 없으면 0이다. 스크립트에서 쓰려면 `xf stats --format csv --count 60 > stats.csv`(헤더 `timestamp_ms,total_packets,total_bytes,pps,mbps`, 첫 행의 pps·mbps는 빈 칸)를 쓴다.
 ```bash
 xf delete-rule --label watch-host
 ```
-룰별 통계(`Packets`)는 그 룰에 매치한 패킷만 센다. 전체 통계(`Total packets`)는 모든 룰의 매치를 합한 값이다. 패킷 수는 환경에 따라 다를 수 있다.
+룰별 통계(`Packets`)는 그 룰에 매치한 패킷만 센다. 전체 통계(`Total packets`)는 모든 룰의 매치를 합한 값이다. **어떤 룰에도 매치하지 않은 패킷은 전체 통계에도 잡히지 않는다.** 패킷 수는 환경에 따라 다를 수 있다.
 
 ## 예시 8. 검사 인터페이스로 리다이렉트
 
@@ -240,12 +252,15 @@ daemon은 잘못된 룰을 받으면 에러로 응답한다. CLI 종료 코드�
 
 | 명령 | 출력 |
 |------|------|
-| `xf add-rule --protocol tcp --dst-port 80 --action drop --label bad1` | `Error: src_ip is required: XDP filter matches by source IP prefix only` |
-| `xf add-rule --src-ip 10.200.0.2 --dst-ip 10.200.0.1 --action drop --label bad2` | `Error: dst_ip matching is not supported` |
+| `xf add-rule --protocol tcp --dst-port 80 --action drop --label bad1` | `Error: src_ip or dst_ip is required` |
+| `xf add-rule --src-ip 10.200.0.2 --dst-ip 10.200.0.1 --action drop --label bad2` | `Error: specify either src_ip or dst_ip, not both` |
 | (같은 src에 룰이 이미 있을 때) `xf add-rule --src-ip 10.200.0.2 --protocol tcp --action pass --label dup-b` | `Error: a rule for 10.200.0.2/32 already exists (label 'dup-a')` |
+| (같은 목적지에 룰이 이미 있을 때) `xf add-rule --dst-ip 10.200.0.11 --protocol tcp --action pass --label dup-d` | `Error: a rule for dst 10.200.0.11/32 already exists (label 'dup-c')` |
 | `xf add-rule --src-ip 10.200.0.3 --action redirect --redirect-if nope0 --label bad3` | `Error: unknown interface 'nope0': ENODEV: No such device` |
 | `xf add-rule --src-ip 10.200.0.3 --action drop --redirect-if sg-lab-insp0 --label bad4` | `Error: redirect_if 'sg-lab-insp0' is only allowed with the redirect action` |
-| `xf add-rule --src-ip 10.200.0.3 --action redirect --label bad5` | `Error: redirect action requires redirect_if` |
+| `xf add-rule --src-ip 10.200.0.3 --action redirect --label bad5` | `Error: Redirect action requires '--redirect-if' parameter` ← CLI가 먼저 검사한다 |
+
+같은 prefix라도 출발지 룰과 목적지 룰은 따로 둘 수 있다(예: `--src-ip 10.200.0.2` 룰과 `--dst-ip 10.200.0.2` 룰을 함께 둘 수 있다). label은 전체에서 유일해야 한다.
 
 ## 예시 10. WASM 검사 모듈 관리
 
@@ -274,13 +289,74 @@ Module unloaded: WASM module 'http-inspector' unloaded
 - 신뢰할 수 있는 모듈만 로드한다. `init`과 패킷 검사에는 실행 시간 제한이 있고 메모리는 32MB로 제한되지만, 모듈 컴파일 자체에는 시간 제한이 없다.
 - 저장소 빌드본은 `wasm/modules/http_inspector.wasm`에 있다.
 
+## 예시 11. 목적지(서버 IP) 기준 차단
+
+출발지와 상관없이 두 번째 서버 IP(10.200.0.11)의 웹(TCP 8080)으로 오는 트래픽을 막는다. 같은 인터페이스의 다른 서버 IP(10.200.0.1)는 영향을 받지 않는다.
+```bash
+xf add-rule --dst-ip 10.200.0.11 --protocol tcp --dst-port 8080 --action drop --label protect-web2
+xf list-rules
+```
+```
+LABEL                ACTION          SOURCE               DEST                 PROTOCOL
+------------------------------------------------------------------------------------------
+protect-web2         drop            *                    10.200.0.11:8080     tcp
+```
+| 확인 | 결과 |
+|------|------|
+| `lab --to 10.200.0.11 http 10.200.0.2` | `BLOCKED` |
+| `lab --to 10.200.0.11 http 10.200.0.3` | `BLOCKED` ← 출발지와 무관 |
+| `lab --to 10.200.0.11 ping 10.200.0.2` | `OK` ← 포트 조건이 있어 ICMP와는 매치하지 않음 |
+| `lab --to 10.200.0.11 udp 10.200.0.2` | `OK` ← UDP는 통과 |
+| `lab http 10.200.0.2` | `OK` ← 10.200.0.1은 대상이 아님 |
+
+```bash
+xf delete-rule --label protect-web2        # → lab --to 10.200.0.11 http 10.200.0.2 : OK
+```
+`--dst-ip`도 `a.b.c.d/N` 대역을 받는다. 룰 하나에는 `--src-ip`와 `--dst-ip` 중 하나만 쓴다(예시 9).
+
+## 예시 12. 출발지 룰 우선과 목적지 룰로 넘어가기
+
+출발지 룰이 항상 먼저 평가된다. 출발지 룰이 없거나 세부 조건이 맞지 않을 때만 목적지 룰을 본다.
+```bash
+xf add-rule --dst-ip 10.200.0.11 --action drop --label block-srv2
+xf add-rule --src-ip 10.200.0.5 --action pass --label admin-pass
+xf add-rule --src-ip 10.200.0.4 --protocol udp --action count --label watch-udp4
+```
+| 확인 | 결과 |
+|------|------|
+| `lab --to 10.200.0.11 ping 10.200.0.2` | `BLOCKED` ← 출발지 룰 없음 → 목적지 룰(drop) |
+| `lab --to 10.200.0.11 ping 10.200.0.5` | `OK` ← 출발지 룰(pass)이 먼저 매치 |
+| `lab --to 10.200.0.11 udp 10.200.0.4` | `OK` ← 출발지 룰(count, udp)이 매치 → 목적지 룰까지 가지 않음 |
+| `lab --to 10.200.0.11 ping 10.200.0.4` | `BLOCKED` ← 출발지 룰 조건(udp) 불일치 → 목적지 룰 적용 |
+| `lab ping 10.200.0.4` | `OK` ← 10.200.0.1은 목적지 룰 대상이 아님 |
+
+```bash
+xf list-rules --stats
+```
+```
+LABEL                ACTION          SOURCE               DEST                 PROTOCOL
+------------------------------------------------------------------------------------------
+block-srv2           drop            *                    10.200.0.11          any
+  Packets: 6, Bytes: 588
+admin-pass           pass            10.200.0.5           *                    any
+  Packets: 3, Bytes: 294
+watch-udp4           count           10.200.0.4           *                    udp
+  Packets: 1, Bytes: 46
+```
+세 룰 모두 매치 수(`Packets`)가 0보다 크다. 수치는 환경에 따라 다를 수 있다. `admin-pass`처럼 출발지에 `pass` 룰을 두면 그 호스트는 **모든 목적지**의 목적지 룰을 피해 간다는 점에 주의한다.
+```bash
+xf delete-rule --label watch-udp4
+xf delete-rule --label admin-pass
+xf delete-rule --label block-srv2
+```
+
 ---
 
 ## 3. 정리
 
 ```bash
 xf detach sg-lab0                      # Success: XDP program detached from sg-lab0
-sudo kill %1                           # daemon 종료 (SIGTERM이면 붙어 있던 XDP를 자동 해제)
+sudo kill -INT $(pidof swift-guard-daemon)   # daemon 종료 (붙어 있던 XDP 자동 해제)
 lab down
 ```
 
@@ -314,10 +390,11 @@ sudo systemctl stop swift-guard           # SIGTERM → XDP 자동 해제
 
 | 규칙 | 설명 |
 |------|------|
-| 매칭 키 | **출발지 IP prefix만** 쓴다(`--src-ip`, 필수). 목적지 IP 매칭은 지원하지 않는다 |
-| prefix 우선순위 | 가장 긴 prefix가 이긴다(/32 > /24 > /8) |
-| prefix당 룰 1개 | 같은 prefix에 두 번째 룰을 넣으면 거부된다. 포트별로 다른 동작이 필요하면 prefix를 나눈다 |
-| 세부 조건 | 이긴 룰의 프로토콜·포트·TCP 플래그가 맞을 때만 액션을 실행한다. 맞지 않으면 **통과**한다. 더 짧은 prefix로 되돌아가 다시 찾지 않는다 |
+| 매칭 키 | 출발지 IP prefix(`--src-ip`) 또는 목적지 IP prefix(`--dst-ip`) 중 **정확히 하나** |
+| 평가 순서 | 출발지 룰 → (없거나 조건 불일치면) 목적지 룰 → 둘 다 아니면 통과 |
+| prefix 우선순위 | 각 맵(출발지·목적지) 안에서 가장 긴 prefix가 이긴다(/32 > /24 > /8) |
+| prefix당 룰 1개 | 출발지·목적지 맵별로 prefix당 1개. 같은 맵에 두 번째 룰을 넣으면 거부된다. label은 전체에서 유일하다. 포트별로 다른 동작이 필요하면 prefix를 나눈다 |
+| 세부 조건 | 이긴 룰의 프로토콜·포트·TCP 플래그가 맞을 때만 액션을 실행한다. 맞지 않으면 목적지 룰로 넘어가고, 그것도 아니면 **통과**한다. 같은 맵의 더 짧은 prefix로 되돌아가 다시 찾지 않는다 |
 | 프로토콜 | `tcp`, `udp`, `icmp`, `any`(기본값) |
 | 포트 | `N` 또는 `N-M`. ICMP는 포트가 0이므로, 포트 조건이 있는 룰과는 매치하지 않는다 |
 | 액션 | `drop`, `pass`, `count`(통과하며 집계), `redirect`(`--redirect-if` 필요) |
@@ -332,7 +409,7 @@ sudo systemctl stop swift-guard           # SIGTERM → XDP 자동 해제
 | `BPF object load failed` / `BTF is required` | `xdp_filter.o`를 `make -C src/bpf`로 다시 빌드한다(`-g`가 빠지면 BTF가 없다). 커널 5.10 이상인지 확인한다 |
 | attach 실패 (driver) | `--mode generic`으로 재시도한다. 드라이버 지원 여부는 `ethtool -i eth0`로 확인한다 |
 | `already attached` | 이미 붙어 있다. `xf detach <if>` 후 다시 붙이거나 `--force`를 쓴다 |
-| 룰을 넣었는데 매치가 안 됨 | [룰 매칭 규칙](#룰-매칭-규칙-요약)을 본다(같은 IP에 더 긴 prefix 룰이 있는지, 프로토콜·포트 조건). `xf list-rules --stats`로 매치 수를 확인한다 |
+| 룰을 넣었는데 매치가 안 됨 | [룰 매칭 규칙](#룰-매칭-규칙-요약)을 본다(같은 IP에 더 긴 prefix 룰이 있는지, 프로토콜·포트 조건, 목적지 룰이라면 같은 패킷에 매치하는 출발지 룰이 먼저 적용되지 않았는지). `xf list-rules --stats`로 매치 수를 확인한다 |
 | WASM `unreachable` trap | 오래된 모듈 빌드다. 호스트 함수는 `#[link(wasm_import_module = "env")]`로 선언해야 한다(`wasm/modules/http_inspector.rs` 참고) |
 
 자동 검증:

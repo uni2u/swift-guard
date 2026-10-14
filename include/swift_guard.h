@@ -32,7 +32,8 @@
 /* 구조체 정의 */
 struct prefix_key {
     __u32 prefix_len;  /* LPM 트라이의 프리픽스 길이 */
-    __u32 addr;        /* IPv4 주소 */
+    __u32 addr;        /* IPv4 주소, 네트워크 바이트 오더.
+                        * filter_rules: addr = 출발지, dst_rules: addr = 목적지 */
 };
 
 struct filter_stats {

@@ -33,6 +33,15 @@ impl XdpMode {
     }
 }
 
+/// 룰이 매칭하는 IP 쪽 (filter_rules = 출발지, dst_rules = 목적지)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchSide {
+    /// 출발지 IP prefix (`--src-ip`, filter_rules 맵)
+    Src,
+    /// 목적지 IP prefix (`--dst-ip`, dst_rules 맵)
+    Dst,
+}
+
 /// 액션 타입
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActionType {

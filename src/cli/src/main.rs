@@ -27,6 +27,81 @@ struct Cli {
     command: Commands,
 }
 
+/// `stats` 출력 형식
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum StatsFormat {
+    Text,
+    Csv,
+}
+
+/// `stats --format csv` 헤더 (벤치 스크립트·분석기와의 고정 계약)
+const STATS_CSV_HEADER: &str = "timestamp_ms,total_packets,total_bytes,pps,mbps";
+
+/// stats 샘플 1개: GetStats 응답 직후의 총계와 시각
+#[derive(Debug, Clone)]
+struct StatsSample {
+    /// 단조 시계 (비율 계산용)
+    instant: std::time::Instant,
+    /// UNIX epoch 밀리초 (클라이언트 벽시계)
+    timestamp_ms: u128,
+    total_packets: u64,
+    total_bytes: u64,
+}
+
+/// 직전 샘플 대비 (pps, mbps). 첫 샘플·총계 감소(daemon 재시작 등)·경과 0이면 None
+fn compute_rates(prev: Option<&StatsSample>, cur: &StatsSample) -> Option<(u64, f64)> {
+    let prev = prev?;
+    if cur.total_packets < prev.total_packets || cur.total_bytes < prev.total_bytes {
+        return None;
+    }
+    let elapsed = cur.instant.checked_duration_since(prev.instant)?.as_secs_f64();
+    if elapsed <= 0.0 {
+        return None;
+    }
+    let pps = ((cur.total_packets - prev.total_packets) as f64 / elapsed).round() as u64;
+    let mbps = (cur.total_bytes - prev.total_bytes) as f64 * 8.0 / elapsed / 1e6;
+    Some((pps, mbps))
+}
+
+/// CSV 데이터 행. 비율 없음이면 pps·mbps 빈 칸
+fn format_stats_csv_row(cur: &StatsSample, rates: Option<(u64, f64)>) -> String {
+    let (pps, mbps) = match rates {
+        Some((pps, mbps)) => (pps.to_string(), format!("{:.3}", mbps)),
+        None => (String::new(), String::new()),
+    };
+    format!(
+        "{},{},{},{},{}",
+        cur.timestamp_ms, cur.total_packets, cur.total_bytes, pps, mbps
+    )
+}
+
+/// 텍스트 모드 시작 줄
+fn stats_text_banner(interval: u64, count: u64) -> String {
+    match count {
+        0 => "Collecting statistics (press Ctrl+C to exit)...".to_string(),
+        1 => format!("Collecting 1 sample every {}s...", interval),
+        n => format!("Collecting {} samples every {}s...", n, interval),
+    }
+}
+
+/// 텍스트 모드 샘플 블록 (`Total packets:`/`Total bytes:` 줄 형식은 테스트 스크립트가 파싱하므로 불변)
+fn format_stats_text(cur: &StatsSample, rates: Option<(u64, f64)>) -> String {
+    let (pps, bw) = match rates {
+        Some((pps, mbps)) => (pps.to_string(), format!("{:.2} Mbps", mbps)),
+        None => ("n/a".to_string(), "n/a".to_string()),
+    };
+    format!(
+        "Timestamp: {}\nTotal packets: {}\nTotal bytes: {} ({:.2} MB)\nPackets/sec: {}\nBandwidth: {}\n{}",
+        chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+        cur.total_packets,
+        cur.total_bytes,
+        cur.total_bytes as f64 / (1024.0 * 1024.0),
+        pps,
+        bw,
+        "-".repeat(40)
+    )
+}
+
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// XDP 프로그램을 인터페이스에 연결
@@ -49,13 +124,13 @@ enum Commands {
         interface: String,
     },
 
-    /// 필터링 규칙 추가 (--src-ip 필수, --dst-ip 미지원, src prefix당 룰 1개)
+    /// 필터링 규칙 추가 (--src-ip 또는 --dst-ip 중 하나, prefix당 룰 1개)
     AddRule {
-        /// 소스 IP 주소 (a.b.c.d 또는 a.b.c.d/prefix) — 필수
+        /// 출발지 IP 또는 대역 (a.b.c.d[/N]) — --dst-ip와 둘 중 하나
         #[clap(long)]
         src_ip: Option<String>,
 
-        /// 대상 IP 주소 — 현재 미지원(지정하면 daemon이 Error를 반환)
+        /// 목적지 IP 또는 대역 (a.b.c.d[/N]) — --src-ip와 둘 중 하나. 출발지 룰이 매치하지 않을 때 평가
         #[clap(long)]
         dst_ip: Option<String>,
 
@@ -119,10 +194,20 @@ enum Commands {
     },
 
     /// 성능 통계 표시
+    ///
+    /// 총계는 룰에 매치한 패킷만 집계된다. 비율(pps/Mbps)은 CLI가 연속 두 샘플의 총계 차이로 계산한다(첫 샘플은 n/a).
     Stats {
-        /// 통계 업데이트 간격 (초)
+        /// 샘플 간격 (초, 0은 1로 취급)
         #[clap(long, default_value = "1")]
         interval: u64,
+
+        /// N개 샘플을 출력한 뒤 종료 (0 = Ctrl+C까지 무한)
+        #[clap(long, default_value = "0")]
+        count: u64,
+
+        /// 출력 형식 (text | csv)
+        #[clap(long, value_enum, default_value = "text")]
+        format: StatsFormat,
     },
 
     /// WASM 검사 모듈 관리
@@ -163,7 +248,9 @@ enum WasmCommands {
     },
 }
 
-/// 규칙 한 줄 출력 형식 (LABEL ACTION SOURCE DEST PROTOCOL)
+/// 규칙 한 줄 출력 형식 (LABEL 20, ACTION 15, SOURCE 20, DEST 20, PROTOCOL 10).
+/// 출발지 룰은 SOURCE에, 목적지 룰은 DEST에 prefix가 나온다(`ip:port`, `*:port`, `*`).
+/// DEST 폭 20은 `10.200.0.11:8080` 같은 목적지+포트 표기를 정렬하기 위함이다.
 fn format_rule_row(r: &RuleInfo) -> String {
     let src = match (&r.src_ip, &r.src_port) {
         (Some(ip), Some(port)) => format!("{}:{}", ip, port),
@@ -180,7 +267,7 @@ fn format_rule_row(r: &RuleInfo) -> String {
     };
 
     format!(
-        "{:<20} {:<15} {:<20} {:<10} {:<10}",
+        "{:<20} {:<15} {:<20} {:<20} {:<10}",
         r.label, r.action, src, dst, r.protocol
     )
 }
@@ -396,10 +483,10 @@ async fn main() -> Result<()> {
                         println!("No rules found");
                     } else {
                         println!(
-                            "{:<20} {:<15} {:<20} {:<10} {:<10}",
+                            "{:<20} {:<15} {:<20} {:<20} {:<10}",
                             "LABEL", "ACTION", "SOURCE", "DEST", "PROTOCOL"
                         );
-                        println!("{}", "-".repeat(80));
+                        println!("{}", "-".repeat(90));
 
                         for rule in &rules {
                             println!("{}", format_rule_row(rule));
@@ -417,40 +504,57 @@ async fn main() -> Result<()> {
             }
         }
 
-        Commands::Stats { interval } => {
+        Commands::Stats { interval, count, format } => {
+            use std::io::Write;
             debug!("Showing performance statistics");
 
-            println!("Collecting statistics (press Ctrl+C to exit)...");
+            let interval = (*interval).max(1);
+            let count = *count;
+            let format = *format;
+            let mut out = std::io::stdout();
 
+            match format {
+                StatsFormat::Text => writeln!(out, "{}", stats_text_banner(interval, count))?,
+                StatsFormat::Csv => writeln!(out, "{}", STATS_CSV_HEADER)?,
+            }
+            out.flush()?;
+
+            let mut prev: Option<StatsSample> = None;
+            let mut taken: u64 = 0;
             loop {
-                let request = ApiRequest::GetStats {};
-
                 let response = client
-                    .send_request(&request)
+                    .send_request(&ApiRequest::GetStats {})
                     .await
                     .context("Failed to send get stats request")?;
 
-                match response {
-                    ApiResponse::Stats { stats } => {
-                        println!(
-                            "Timestamp: {}",
-                            chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
-                        );
-                        println!("Total packets: {}", stats.total_packets);
-                        println!(
-                            "Total bytes: {} ({:.2} MB)",
-                            stats.total_bytes,
-                            stats.total_bytes as f64 / (1024.0 * 1024.0)
-                        );
-                        println!("Packets/sec: {}", stats.packets_per_sec);
-                        println!("Bandwidth: {:.2} Mbps", stats.mbps);
-                        println!("{}", "-".repeat(40));
-                    }
+                // daemon의 packets_per_sec/mbps(telemetry 주기 값)는 쓰지 않는다
+                let cur = match response {
+                    ApiResponse::Stats { stats } => StatsSample {
+                        instant: std::time::Instant::now(),
+                        timestamp_ms: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis())
+                            .unwrap_or(0),
+                        total_packets: stats.total_packets,
+                        total_bytes: stats.total_bytes,
+                    },
                     ApiResponse::Error { message } => return Err(anyhow!("{}", message)),
                     other => return Err(anyhow!("Unexpected response: {:?}", other)),
-                }
+                };
 
-                tokio::time::sleep(std::time::Duration::from_secs((*interval).max(1))).await;
+                let rates = compute_rates(prev.as_ref(), &cur);
+                match format {
+                    StatsFormat::Text => writeln!(out, "{}", format_stats_text(&cur, rates))?,
+                    StatsFormat::Csv => writeln!(out, "{}", format_stats_csv_row(&cur, rates))?,
+                }
+                out.flush()?;
+                prev = Some(cur);
+
+                taken += 1;
+                if count > 0 && taken >= count {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
             }
         }
 
@@ -534,4 +638,98 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use swift_guard_common::api::RuleStats;
+
+    #[test]
+    fn rule_row_dst_rule_alignment() {
+        let r = RuleInfo {
+            label: "protect-web2".into(),
+            action: "drop".into(),
+            src_ip: None,
+            dst_ip: Some("10.200.0.11".into()),
+            src_port: None,
+            dst_port: Some("8080".into()),
+            protocol: "tcp".into(),
+            tcp_flags: None,
+            priority: 0,
+            redirect_if: None,
+            rate_limit: 0,
+            expire: 0,
+            stats: RuleStats { packets: 0, bytes: 0, last_matched: 0 },
+        };
+        assert_eq!(
+            format_rule_row(&r).trim_end(),
+            "protect-web2         drop            *                    10.200.0.11:8080     tcp"
+        );
+    }
+
+    fn sample(at: std::time::Instant, packets: u64, bytes: u64) -> StatsSample {
+        StatsSample { instant: at, timestamp_ms: 1, total_packets: packets, total_bytes: bytes }
+    }
+
+    #[test]
+    fn stats_csv_header_is_fixed() {
+        assert_eq!(STATS_CSV_HEADER, "timestamp_ms,total_packets,total_bytes,pps,mbps");
+    }
+
+    #[test]
+    fn stats_first_row_has_empty_rates() {
+        let cur = sample(std::time::Instant::now(), 37, 3020);
+        let rates = compute_rates(None, &cur);
+        assert!(rates.is_none());
+        assert_eq!(format_stats_csv_row(&cur, rates), "1,37,3020,,");
+        assert!(format_stats_text(&cur, rates).contains("Packets/sec: n/a\nBandwidth: n/a"));
+    }
+
+    #[test]
+    fn stats_rates_over_one_second() {
+        let t0 = std::time::Instant::now();
+        let t1 = t0 + std::time::Duration::from_secs(1);
+        let prev = sample(t0, 100, 10_000);
+        let cur = sample(t1, 1100, 135_000);
+        let (pps, mbps) = compute_rates(Some(&prev), &cur).unwrap();
+        assert_eq!(pps, 1000);
+        assert!((mbps - 1.0).abs() < 1e-9);
+        assert_eq!(format_stats_csv_row(&cur, Some((pps, mbps))), "1,1100,135000,1000,1.000");
+        let text = format_stats_text(&cur, Some((pps, mbps)));
+        assert!(text.contains("\nTotal packets: 1100\n"));
+        assert!(text.contains("Packets/sec: 1000\nBandwidth: 1.00 Mbps"));
+    }
+
+    #[test]
+    fn stats_rates_none_when_totals_decrease() {
+        let t0 = std::time::Instant::now();
+        let t1 = t0 + std::time::Duration::from_secs(1);
+        assert!(compute_rates(Some(&sample(t0, 500, 9000)), &sample(t1, 10, 800)).is_none());
+    }
+
+    #[test]
+    fn stats_banner_variants() {
+        assert_eq!(stats_text_banner(1, 0), "Collecting statistics (press Ctrl+C to exit)...");
+        assert_eq!(stats_text_banner(1, 1), "Collecting 1 sample every 1s...");
+        assert_eq!(stats_text_banner(2, 3), "Collecting 3 samples every 2s...");
+    }
+
+    #[test]
+    fn stats_cli_parsing() {
+        let cli = Cli::try_parse_from(["xdp-filter", "stats", "--format", "csv", "--count", "3"])
+            .expect("parse");
+        match cli.command {
+            Commands::Stats { interval, count, format } => {
+                assert_eq!((interval, count, format), (1, 3, StatsFormat::Csv));
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+        let cli = Cli::try_parse_from(["xdp-filter", "stats"]).expect("parse");
+        assert!(matches!(
+            cli.command,
+            Commands::Stats { interval: 1, count: 0, format: StatsFormat::Text }
+        ));
+        assert!(Cli::try_parse_from(["xdp-filter", "stats", "--format", "json"]).is_err());
+    }
 }

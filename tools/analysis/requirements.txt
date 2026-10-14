@@ -1,0 +1,2 @@
+# tools/analysis/analyze_performance.py — 그래프용 (없으면 summary.md 만 생성)
+matplotlib>=3.5

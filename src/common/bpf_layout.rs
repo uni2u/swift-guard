@@ -109,6 +109,7 @@ pub fn canonical_prefix(addr_host: u32, prefix_len: u32) -> u32 {
 
 /// struct prefix_key (8B). prefix_len 은 호스트 오더, addr 는 네트워크 오더.
 /// addr_host 는 `utils::parse_ip_prefix` 가 돌려주는 호스트 정수값(MSB=첫 옥텟)이다.
+/// filter_rules(src, addr=출발지) 와 dst_rules(dst, addr=목적지) 키 모두에 이 함수를 쓴다.
 pub fn encode_prefix_key(addr_host: u32, prefix_len: u32) -> [u8; PREFIX_KEY_SIZE] {
     let mut b = [0u8; PREFIX_KEY_SIZE];
     b[0..4].copy_from_slice(&prefix_len.to_ne_bytes());
@@ -223,6 +224,24 @@ mod tests {
             encode_prefix_key(0x0A00_0001, 8),
             [0x08, 0, 0, 0, 0x0A, 0, 0, 0]
         );
+    }
+
+    /// dst_rules 키: parse_ip_prefix → encode_prefix_key 실제 경로로 목적지 주소를 인코딩
+    #[cfg(target_endian = "little")]
+    #[test]
+    fn dst_prefix_key_network_order() {
+        use crate::utils::parse_ip_prefix;
+        use std::net::Ipv4Addr;
+
+        let (a, p) = parse_ip_prefix("10.200.0.11").unwrap();
+        let k = encode_prefix_key(a, p);
+        assert_eq!(k, [0x20, 0, 0, 0, 0x0A, 0xC8, 0x00, 0x0B]);
+        assert_eq!(&k[4..8], &Ipv4Addr::new(10, 200, 0, 11).octets());
+
+        let (a, p) = parse_ip_prefix("10.200.0.77/24").unwrap();
+        let k = encode_prefix_key(a, p);
+        assert_eq!(k, [0x18, 0, 0, 0, 0x0A, 0xC8, 0x00, 0x00]);
+        assert_eq!(&k[4..8], &Ipv4Addr::new(10, 200, 0, 0).octets());
     }
 
     #[test]

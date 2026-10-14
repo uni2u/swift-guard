@@ -1,538 +1,308 @@
 #!/usr/bin/env python3
-# Swift-Guard 성능 분석 스크립트
+"""Swift-Guard Tier 3 결과 분석기.
 
-import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
-import numpy as np
-import os
-import glob
+tools/bench/basic_throughput_test.sh, rule_scaling_test.sh 가 만든 결과 디렉토리
+(docs/poc-plan.md "결과 파일" 참고)를 읽어 summary.md 와 그래프(PNG)를 만든다.
+
+사용법:
+  python3 tools/analysis/analyze_performance.py [--results-dir ./results]
+                                                [--output-dir <results-dir>/plots] [--no-plots]
+의존: 표준 라이브러리 + matplotlib(그래프용, 없으면 summary.md 만). pip install -r tools/analysis/requirements.txt
+종료 코드: 하나라도 분석했으면 0, 입력이 하나도 없으면 1.
+"""
+
 import argparse
-from pathlib import Path
+import csv
+import glob
+import os
+import re
+import sys
 
-# 스타일 설정
-sns.set(style="whitegrid")
-plt.rcParams.update({'font.size': 12})
-plt.rcParams['figure.figsize'] = (12, 8)
+THROUGHPUT_HEADER = [
+    "packet_size", "generator", "mode", "rule_action", "duration_sec", "samples", "pps", "pps_peak",
+    "gbps", "cpu_util", "cpu_softirq", "cpu_busiest", "if_rx_pps", "daemon_rss_kb",
+]
+RULE_SCALING_HEADER = [
+    "rule_count", "side", "packet_size", "generator", "mode", "rule_action", "duration_sec", "samples",
+    "pps", "pps_peak", "gbps", "cpu_util", "cpu_softirq", "cpu_busiest", "if_rx_pps", "daemon_rss_kb",
+    "rules_added", "add_rules_sec", "add_rule_us_avg",
+]
+STATS_HEADER = ["timestamp_ms", "total_packets", "total_bytes", "pps", "mbps"]
+FLOW_BANNER = "FLOW CHECK ONLY (lab generator) — not a performance result"
 
-# 인자 파싱
-parser = argparse.ArgumentParser(description='Analyze Swift-Guard performance test results')
-parser.add_argument('--results-dir', type=str, default='./results', 
-                    help='Directory containing test results (default: ./results)')
-parser.add_argument('--output-dir', type=str, default='./plots',
-                    help='Directory for output plots (default: ./plots)')
-args = parser.parse_args()
+# 색: dataviz 기본 팔레트 categorical 순서 (blue, orange, aqua, yellow, magenta, green)
+SERIES = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300"]
+INK = "#0b0b0b"
+INK2 = "#52514e"
+GRID = "#e4e3df"
+SURFACE = "#fcfcfb"
 
-# 출력 디렉토리 생성
-os.makedirs(args.output_dir, exist_ok=True)
 
-def analyze_basic_throughput():
-    """기본 처리량 테스트 결과 분석"""
-    print("Analyzing basic throughput results...")
-    
-    # 결과 데이터 로드
-    results_file = os.path.join(args.results_dir, 'throughput_results.csv')
-    if not os.path.exists(results_file):
-        print(f"Error: Results file not found at {results_file}")
-        return
-    
-    df = pd.read_csv(results_file)
-    print(f"Loaded data with {len(df)} packet size tests")
-    print(df)
-    
-    # 처리량 그래프
-    plt.figure(figsize=(15, 10))
-    
-    # PPS vs 패킷 크기
-    plt.subplot(2, 2, 1)
-    plt.plot(df['packet_size'], df['pps'] / 1e6, 'o-', linewidth=2, markersize=8)
-    plt.xlabel('Packet Size (bytes)')
-    plt.ylabel('Million Packets Per Second (Mpps)')
-    plt.title('Packet Throughput vs Packet Size')
-    plt.grid(True)
-    
-    # Gbps vs 패킷 크기
-    plt.subplot(2, 2, 2)
-    plt.plot(df['packet_size'], df['gbps'], 'o-', linewidth=2, color='orange', markersize=8)
-    plt.xlabel('Packet Size (bytes)')
-    plt.ylabel('Throughput (Gbps)')
-    plt.title('Bandwidth vs Packet Size')
-    plt.grid(True)
-    
-    # CPU 사용률 vs 패킷 크기
-    plt.subplot(2, 2, 3)
-    plt.plot(df['packet_size'], df['cpu_util'], 'o-', linewidth=2, color='green', markersize=8)
-    plt.xlabel('Packet Size (bytes)')
-    plt.ylabel('CPU Utilization (%)')
-    plt.title('CPU Usage vs Packet Size')
-    plt.grid(True)
-    
-    # PPS와 Gbps 비교 (로그 스케일)
-    plt.subplot(2, 2, 4)
-    ax1 = plt.gca()
-    ax2 = ax1.twinx()
-    
-    line1 = ax1.semilogx(df['packet_size'], df['pps'] / 1e6, 'o-', linewidth=2, color='blue', markersize=8, label='Mpps')
-    line2 = ax2.semilogx(df['packet_size'], df['gbps'], 'o-', linewidth=2, color='red', markersize=8, label='Gbps')
-    
-    ax1.set_xlabel('Packet Size (bytes) - Log Scale')
-    ax1.set_ylabel('Million Packets Per Second (Mpps)', color='blue')
-    ax2.set_ylabel('Throughput (Gbps)', color='red')
-    ax1.tick_params(axis='y', labelcolor='blue')
-    ax2.tick_params(axis='y', labelcolor='red')
-    plt.title('Performance Metrics vs Packet Size (Log Scale)')
-    
-    # 두 축에 대한 레전드 통합
-    lines = line1 + line2
-    labels = [l.get_label() for l in lines]
-    plt.legend(lines, labels, loc='upper center')
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join(args.output_dir, 'basic_throughput.png'), dpi=300)
-    plt.close()
-    
-    # 요약 통계 출력
-    print("\nPerformance Summary:")
-    print(f"Maximum packet rate: {df['pps'].max() / 1e6:.2f} Mpps (at {df.loc[df['pps'].idxmax(), 'packet_size']} bytes)")
-    print(f"Maximum bandwidth: {df['gbps'].max():.2f} Gbps (at {df.loc[df['gbps'].idxmax(), 'packet_size']} bytes)")
-    print(f"Average CPU utilization: {df['cpu_util'].mean():.2f}%")
-    
-def analyze_rule_scaling():
-    """규칙 스케일링 테스트 결과 분석"""
-    print("\nAnalyzing rule scaling results...")
-    
-    # 결과 파일 찾기
-    pattern = os.path.join(args.results_dir, 'rules_*_stats.csv')
-    rule_files = glob.glob(pattern)
-    
-    if not rule_files:
-        print(f"No rule scaling test results found matching pattern {pattern}")
-        return
-    
-    # 각 파일에서 규칙 수 추출 및 데이터 로드
-    results = []
-    for file in rule_files:
-        # 파일 이름에서, rules_1000_stats.csv -> 1000 추출
+def num(v, default=None):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def read_csv(path, header):
+    """(rows, skip_reason). header 가 다르면 rows=None."""
+    if not os.path.isfile(path):
+        return None, "skip: %s 없음" % os.path.basename(path)
+    with open(path, newline="") as f:
+        r = csv.reader(f)
         try:
-            rule_count = int(Path(file).stem.split('_')[1])
-            df = pd.read_csv(file)
-            
-            # 평균 성능 계산
-            results.append({
-                'rule_count': rule_count,
-                'avg_pps': df['packets_per_sec'].mean() if 'packets_per_sec' in df.columns else 0,
-                'avg_mbps': df['mbps'].mean() if 'mbps' in df.columns else 0,
-                'max_pps': df['packets_per_sec'].max() if 'packets_per_sec' in df.columns else 0,
-                'max_mbps': df['mbps'].max() if 'mbps' in df.columns else 0,
-            })
-        except (IndexError, ValueError) as e:
-            print(f"Error processing file {file}: {e}")
-    
-    if not results:
-        print("No valid data found in rule scaling test results")
-        return
-    
-    # 결과를 데이터프레임으로 변환 및 정렬
-    result_df = pd.DataFrame(results).sort_values('rule_count')
-    print(f"Loaded data for {len(result_df)} rule counts")
-    print(result_df)
-    
-    # 규칙 수에 따른 성능 그래프
-    plt.figure(figsize=(15, 10))
-    
-    # 평균 PPS vs 규칙 수
-    plt.subplot(2, 2, 1)
-    plt.plot(result_df['rule_count'], result_df['avg_pps'] / 1e6, 'o-', linewidth=2, markersize=8)
-    plt.xlabel('Number of Rules')
-    plt.ylabel('Average Million Packets Per Second (Mpps)')
-    plt.title('Packet Throughput vs Rule Count')
-    plt.grid(True)
-    plt.xscale('log')
-    
-    # 최대 PPS vs 규칙 수
-    plt.subplot(2, 2, 2)
-    plt.plot(result_df['rule_count'], result_df['max_pps'] / 1e6, 'o-', linewidth=2, color='orange', markersize=8)
-    plt.xlabel('Number of Rules')
-    plt.ylabel('Maximum Million Packets Per Second (Mpps)')
-    plt.title('Peak Packet Throughput vs Rule Count')
-    plt.grid(True)
-    plt.xscale('log')
-    
-    # 평균 Mbps vs 규칙 수
-    plt.subplot(2, 2, 3)
-    plt.plot(result_df['rule_count'], result_df['avg_mbps'] / 1e3, 'o-', linewidth=2, color='green', markersize=8)
-    plt.xlabel('Number of Rules')
-    plt.ylabel('Average Throughput (Gbps)')
-    plt.title('Average Bandwidth vs Rule Count')
-    plt.grid(True)
-    plt.xscale('log')
-    
-    # 정규화된 성능 vs 규칙 수
-    plt.subplot(2, 2, 4)
-    
-    # 최대값으로 정규화
-    norm_pps = result_df['avg_pps'] / result_df['avg_pps'].iloc[0] * 100
-    norm_mbps = result_df['avg_mbps'] / result_df['avg_mbps'].iloc[0] * 100
-    
-    plt.plot(result_df['rule_count'], norm_pps, 'o-', linewidth=2, color='blue', markersize=8, label='PPS')
-    plt.plot(result_df['rule_count'], norm_mbps, 'o-', linewidth=2, color='red', markersize=8, label='Mbps')
-    plt.xlabel('Number of Rules (Log Scale)')
-    plt.ylabel('Normalized Performance (%)')
-    plt.title('Scaling Efficiency vs Rule Count')
-    plt.grid(True)
-    plt.xscale('log')
-    plt.legend()
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join(args.output_dir, 'rule_scaling.png'), dpi=300)
-    plt.close()
-    
-    # 요약 통계 출력
-    print("\nRule Scaling Summary:")
-    
-    # 규칙 수 증가에 따른 성능 감소율 계산
-    if len(result_df) > 1:
-        min_rules = result_df['rule_count'].min()
-        max_rules = result_df['rule_count'].max()
-        
-        min_pps = result_df.loc[result_df['rule_count'] == min_rules, 'avg_pps'].values[0]
-        max_pps = result_df.loc[result_df['rule_count'] == max_rules, 'avg_pps'].values[0]
-        
-        pps_reduction = (1 - max_pps / min_pps) * 100
-        
-        print(f"Performance reduction from {min_rules} rules to {max_rules} rules: {pps_reduction:.2f}%")
-        print(f"Average performance per rule added: {pps_reduction / (max_rules - min_rules):.6f}% reduction per rule")
+            got = next(r)
+        except StopIteration:
+            return None, "skip: %s 비어 있음" % os.path.basename(path)
+        if got != header:
+            return None, "skip: %s 열 불일치(기대: %s)" % (os.path.basename(path), ",".join(header))
+        rows = [dict(zip(header, row)) for row in r if row]
+    if not rows:
+        return None, "skip: %s 데이터 행 없음" % os.path.basename(path)
+    return rows, None
 
-def analyze_wasm_overhead():
-    """WASM 모듈 오버헤드 테스트 결과 분석"""
-    print("\nAnalyzing WASM module overhead results...")
-    
-    # 결과 파일 찾기
-    pattern = os.path.join(args.results_dir, 'wasm_*_stats.csv')
-    wasm_files = glob.glob(pattern)
-    
-    if not wasm_files:
-        print(f"No WASM overhead test results found matching pattern {pattern}")
+
+def read_meta(path):
+    meta = {}
+    if os.path.isfile(path):
+        with open(path) as f:
+            for line in f:
+                if "=" in line:
+                    k, v = line.rstrip("\n").split("=", 1)
+                    meta[k] = v
+    return meta
+
+
+def md_table(header, rows):
+    out = ["| " + " | ".join(header) + " |", "|" + "|".join("---" for _ in header) + "|"]
+    for r in rows:
+        out.append("| " + " | ".join(str(c) for c in r) + " |")
+    return "\n".join(out)
+
+
+def mpps(pps):
+    return (num(pps, 0.0) or 0.0) / 1e6
+
+
+# ---------------------------------------------------------------- plotting
+class Plotter:
+    def __init__(self, out_dir, flow_only):
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        self.plt = plt
+        self.out_dir = out_dir
+        self.flow_only = flow_only
+        self.files = []
+        plt.rcParams.update({
+            "figure.facecolor": SURFACE, "axes.facecolor": SURFACE, "savefig.facecolor": SURFACE,
+            "axes.edgecolor": GRID, "axes.labelcolor": INK2, "axes.titlecolor": INK,
+            "xtick.color": INK2, "ytick.color": INK2, "text.color": INK,
+            "axes.grid": True, "grid.color": GRID, "grid.linewidth": 0.8,
+            "axes.spines.top": False, "axes.spines.right": False,
+            "lines.linewidth": 2, "lines.markersize": 7, "font.size": 10,
+            "legend.frameon": False,
+        })
+
+    def figure(self, ncols, title):
+        fig, axes = self.plt.subplots(1, ncols, figsize=(5.5 * ncols, 4.2), squeeze=False)
+        if self.flow_only:
+            title = "%s\n%s" % (title, FLOW_BANNER)
+        fig.suptitle(title, color="#b3261e" if self.flow_only else INK, fontsize=11)
+        return fig, axes[0]
+
+    def save(self, fig, name):
+        fig.tight_layout()
+        path = os.path.join(self.out_dir, name)
+        fig.savefig(path, dpi=120)
+        self.plt.close(fig)
+        self.files.append(name)
+        print("  wrote %s" % path)
+
+
+def plot_throughput(p, rows):
+    sizes = [int(num(r["packet_size"], 0)) for r in rows]
+    xs = list(range(len(sizes)))
+    fig, (a1, a2) = p.figure(2, "Swift-Guard XDP throughput by frame size")
+    for ax, key, label, scale in ((a1, "pps", "Mpps (matched packets)", 1e6), (a2, "gbps", "Gbps (L2 bytes, not line rate)", 1)):
+        vals = [(num(r[key], 0.0) or 0.0) / scale for r in rows]
+        ax.bar(xs, vals, width=0.6, color=SERIES[0], edgecolor=SURFACE, linewidth=2)
+        ax.set_xticks(xs)
+        ax.set_xticklabels([str(s) for s in sizes])
+        ax.set_xlabel("frame size (bytes, incl. FCS)")
+        ax.set_ylabel(label)
+        ax.set_axisbelow(True)
+        ax.grid(axis="x", visible=False)
+    p.save(fig, "throughput.png")
+
+    fig, (ax,) = p.figure(1, "CPU utilisation during measurement")
+    for i, (key, label) in enumerate((("cpu_util", "all CPUs busy %"), ("cpu_busiest", "busiest CPU %"))):
+        ax.plot(xs, [num(r[key], 0.0) for r in rows], marker="o", color=SERIES[i], label=label)
+    ax.set_xticks(xs)
+    ax.set_xticklabels([str(s) for s in sizes])
+    ax.set_xlabel("frame size (bytes, incl. FCS)")
+    ax.set_ylabel("CPU %")
+    ax.set_ylim(0, 105)
+    ax.legend()
+    p.save(fig, "throughput_cpu.png")
+
+
+def plot_timeseries(p, series):
+    fig, (ax,) = p.figure(1, "xdp-filter stats: pps per 1 s sample")
+    for i, (size, pts) in enumerate(series):
+        color = SERIES[i % len(SERIES)] if i < len(SERIES) else INK2
+        ax.plot([t for t, _ in pts], [v / 1e6 for _, v in pts], marker="o", markersize=4,
+                color=color, label="%s B" % size)
+    ax.set_xlabel("seconds since first sample")
+    ax.set_ylabel("Mpps")
+    ax.legend()
+    p.save(fig, "throughput_timeseries.png")
+
+
+def plot_rule_scaling(p, rows, base_pps):
+    counts = [int(num(r["rule_count"], 0)) for r in rows]
+    vals = [mpps(r["pps"]) for r in rows]
+    fig, (a1, a2) = p.figure(2, "Rule scaling (side=%s, %s B)" % (rows[0]["side"], rows[0]["packet_size"]))
+    a1.plot(counts, vals, marker="o", color=SERIES[0])
+    a1.set_ylabel("Mpps (matched packets)")
+    rel = [(num(r["pps"], 0.0) or 0.0) / base_pps * 100 if base_pps else 0.0 for r in rows]
+    a2.plot(counts, rel, marker="o", color=SERIES[0])
+    a2.axhline(100, color=INK2, linewidth=1, linestyle="--")
+    a2.set_ylabel("%% of first step (%d rules)" % counts[0])
+    a1.set_ylim(bottom=0)
+    a2.set_ylim(0, max(110.0, max(rel) * 1.05))
+    for ax in (a1, a2):
+        ax.set_xscale("log")
+        ax.set_xlabel("rules in map (log)")
+    p.save(fig, "rule_scaling.png")
+
+
+def plot_rule_add(p, rows):
+    pts = [(int(num(r["rule_count"], 0)), num(r["add_rule_us_avg"])) for r in rows]
+    pts = [(c, v) for c, v in pts if v is not None]
+    if not pts:
+        print("  skip: rule_add_latency.png (add_rule_us_avg 값 없음)")
         return
-    
-    # 각 파일에서 모듈 이름 추출 및 데이터 로드
-    results = []
-    for file in wasm_files:
-        # 파일 이름에서 모듈 이름 추출
+    fig, (ax,) = p.figure(1, "Rule add time per rule (incl. CLI process + TCP connect)")
+    ax.plot([c for c, _ in pts], [v for _, v in pts], marker="o", color=SERIES[1])
+    ax.set_xscale("log")
+    ax.set_xlabel("rules in map after step (log)")
+    ax.set_ylabel("µs per rule (add_rule_us_avg)")
+    ax.set_ylim(bottom=0)
+    p.save(fig, "rule_add_latency.png")
+
+
+# ---------------------------------------------------------------- main
+def load_timeseries(results_dir):
+    out = []
+    files = glob.glob(os.path.join(results_dir, "throughput", "stats_*.csv"))
+
+    def key(path):
+        m = re.search(r"stats_(\d+)\.csv$", path)
+        return int(m.group(1)) if m else 0
+
+    for path in sorted(files, key=key):
+        rows, why = read_csv(path, STATS_HEADER)
+        if rows is None:
+            print("  %s" % why)
+            continue
+        t0 = num(rows[0]["timestamp_ms"], 0.0)
+        pts = [((num(r["timestamp_ms"], 0.0) - t0) / 1000.0, num(r["pps"])) for r in rows]
+        pts = [(t, v) for t, v in pts if v is not None]
+        if pts:
+            out.append((key(path), pts))
+    return out
+
+
+def main():
+    sys.stdout.reconfigure(line_buffering=True)   # stderr 경고와 출력 순서를 맞춘다
+    ap = argparse.ArgumentParser(description="Swift-Guard Tier 3 결과 분석 (summary.md + PNG)")
+    ap.add_argument("--results-dir", default="./results", help="벤치 결과 디렉토리 (기본 ./results)")
+    ap.add_argument("--output-dir", default=None, help="출력 디렉토리 (기본 <results-dir>/plots)")
+    ap.add_argument("--no-plots", action="store_true", help="그래프를 만들지 않고 summary.md 만")
+    args = ap.parse_args()
+    out_dir = args.output_dir or os.path.join(args.results_dir, "plots")
+
+    tp_rows, tp_why = read_csv(os.path.join(args.results_dir, "throughput_results.csv"), THROUGHPUT_HEADER)
+    rs_rows, rs_why = read_csv(os.path.join(args.results_dir, "rule_scaling_results.csv"), RULE_SCALING_HEADER)
+    for why in (tp_why, rs_why):
+        if why:
+            print(why)
+    if tp_rows is None and rs_rows is None:
+        print("분석할 입력이 없다 (%s)" % args.results_dir, file=sys.stderr)
+        return 1
+
+    flow_only = any(r["generator"] == "lab" for r in (tp_rows or []) + (rs_rows or []))
+    os.makedirs(out_dir, exist_ok=True)
+
+    plotter = None
+    if args.no_plots:
+        print("--no-plots: 그래프 생략, summary.md 만 생성")
+    else:
         try:
-            module_name = Path(file).stem.split('_')[1]
-            if module_name == "none":
-                module_name = "No WASM"
-            elif module_name == "null":
-                module_name = "Null Module"
-            elif module_name.endswith(".wasm"):
-                module_name = module_name[:-5].replace("_", " ").title()
-            
-            df = pd.read_csv(file)
-            
-            # 평균 성능 계산
-            results.append({
-                'module': module_name,
-                'avg_pps': df['packets_per_sec'].mean() if 'packets_per_sec' in df.columns else 0,
-                'avg_mbps': df['mbps'].mean() if 'mbps' in df.columns else 0,
-                'avg_cpu': df['cpu_util'].mean() if 'cpu_util' in df.columns else 0,
-            })
-        except (IndexError, ValueError) as e:
-            print(f"Error processing file {file}: {e}")
-    
-    if not results:
-        print("No valid data found in WASM overhead test results")
-        return
-    
-    # 결과를 데이터프레임으로 변환
-    result_df = pd.DataFrame(results)
-    print(f"Loaded data for {len(result_df)} WASM modules")
-    print(result_df)
-    
-    # WASM 모듈에 따른 성능 그래프
-    plt.figure(figsize=(15, 10))
-    
-    # 모듈별 PPS
-    plt.subplot(2, 2, 1)
-    bars = plt.bar(result_df['module'], result_df['avg_pps'] / 1e6, color='skyblue')
-    plt.xlabel('WASM Module Type')
-    plt.ylabel('Million Packets Per Second (Mpps)')
-    plt.title('Packet Throughput vs WASM Module')
-    plt.xticks(rotation=45)
-    plt.grid(axis='y')
-    
-    # 기준(No WASM) 대비 오버헤드 표시
-    if 'No WASM' in result_df['module'].values:
-        baseline = result_df.loc[result_df['module'] == 'No WASM', 'avg_pps'].values[0]
-        for i, bar in enumerate(bars):
-            if result_df.iloc[i]['module'] != 'No WASM':
-                overhead = ((baseline - result_df.iloc[i]['avg_pps']) / baseline) * 100
-                plt.text(bar.get_x() + bar.get_width()/2., 
-                         bar.get_height() + 0.05 * (result_df['avg_pps'] / 1e6).max(),
-                         f'{overhead:.1f}%',
-                         ha='center', va='bottom', rotation=0)
-    
-    # 모듈별 Gbps
-    plt.subplot(2, 2, 2)
-    plt.bar(result_df['module'], result_df['avg_mbps'] / 1e3, color='orange')
-    plt.xlabel('WASM Module Type')
-    plt.ylabel('Throughput (Gbps)')
-    plt.title('Bandwidth vs WASM Module')
-    plt.xticks(rotation=45)
-    plt.grid(axis='y')
-    
-    # 모듈별 CPU 사용률
-    plt.subplot(2, 2, 3)
-    plt.bar(result_df['module'], result_df['avg_cpu'], color='salmon')
-    plt.xlabel('WASM Module Type')
-    plt.ylabel('CPU Utilization (%)')
-    plt.title('CPU Usage vs WASM Module')
-    plt.xticks(rotation=45)
-    plt.grid(axis='y')
-    
-    # 상대적 성능 비교
-    plt.subplot(2, 2, 4)
-    if 'No WASM' in result_df['module'].values:
-        baseline_idx = result_df[result_df['module'] == 'No WASM'].index[0]
-        baseline_pps = result_df.loc[baseline_idx, 'avg_pps']
-        baseline_cpu = result_df.loc[baseline_idx, 'avg_cpu']
-        
-        # 효율성 계산 (PPS/CPU)
-        result_df['efficiency'] = (result_df['avg_pps'] / result_df['avg_cpu']) / (baseline_pps / baseline_cpu) * 100
-        
-        plt.bar(result_df['module'], result_df['efficiency'], color='green')
-        plt.axhline(y=100, color='red', linestyle='--', label='Baseline (No WASM)')
-        plt.xlabel('WASM Module Type')
-        plt.ylabel('Relative Efficiency (%)')
-        plt.title('Performance Efficiency vs WASM Module')
-        plt.xticks(rotation=45)
-        plt.grid(axis='y')
-        plt.legend()
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join(args.output_dir, 'wasm_overhead.png'), dpi=300)
-    plt.close()
-    
-    # 요약 통계 출력
-    print("\nWASM Overhead Summary:")
-    if 'No WASM' in result_df['module'].values:
-        no_wasm = result_df.loc[result_df['module'] == 'No WASM'].iloc[0]
-        for _, row in result_df[result_df['module'] != 'No WASM'].iterrows():
-            pps_overhead = ((no_wasm['avg_pps'] - row['avg_pps']) / no_wasm['avg_pps']) * 100
-            cpu_increase = row['avg_cpu'] - no_wasm['avg_cpu']
-            
-            print(f"{row['module']} module:")
-            print(f"  - Throughput reduction: {pps_overhead:.2f}%")
-            print(f"  - CPU usage increase: {cpu_increase:.2f} percentage points")
-            print(f"  - Relative efficiency: {row.get('efficiency', 0):.2f}%")
+            plotter = Plotter(out_dir, flow_only)
+        except ImportError:
+            print("WARN: matplotlib 없음 → 그래프 생략, summary.md 만 생성 (pip install -r tools/analysis/requirements.txt)",
+                  file=sys.stderr)
 
-def create_solution_comparison():
-    """타 솔루션과의 비교 차트 생성"""
-    print("\nCreating solution comparison chart...")
-    
-    # 샘플 데이터 - 실제 테스트 결과로 대체 필요
-    solutions = ['Swift-Guard', 'Traditional FW', 'DPDK-based', 'XDP-vanilla']
-    
-    # 각 지표에 대한 값 (0-10 스케일)
-    metrics = {
-        'Throughput': [9.2, 3.5, 8.7, 7.5],
-        'Latency': [8.8, 4.2, 7.6, 8.1],  # 높을수록 좋음(낮은 지연 시간)
-        'CPU Efficiency': [8.5, 6.8, 5.9, 7.2],
-        'Memory Usage': [7.9, 8.5, 6.2, 7.8],  # 높을수록 좋음(낮은 메모리 사용)
-        'Flexibility': [9.5, 7.0, 6.5, 5.5],
-        'Security Coverage': [8.8, 8.2, 7.0, 6.5],
-    }
-    
-    # 데이터프레임 생성
-    df = pd.DataFrame(metrics, index=solutions)
-    
-    # 레이더 차트 생성
-    categories = list(metrics.keys())
-    N = len(categories)
-    
-    # 각 카테고리의 각도 계산
-    angles = [n / float(N) * 2 * np.pi for n in range(N)]
-    angles += angles[:1]  # 폐곡선을 위한 반복
-    
-    # 그래프 설정
-    fig, ax = plt.subplots(figsize=(10, 10), subplot_kw=dict(polar=True))
-    
-    # 각 솔루션에 대한 플롯
-    for i, solution in enumerate(solutions):
-        values = df.loc[solution].values.tolist()
-        values += values[:1]  # 폐곡선을 위한 반복
-        
-        ax.plot(angles, values, linewidth=2, linestyle='solid', label=solution)
-        ax.fill(angles, values, alpha=0.1)
-    
-    # 축 설정
-    plt.xticks(angles[:-1], categories)
-    ax.set_yticklabels([])
-    ax.set_rlabel_position(0)
-    plt.yticks([2, 4, 6, 8, 10], ["2", "4", "6", "8", "10"], color="grey", size=7)
-    plt.ylim(0, 10)
-    
-    # 레전드
-    plt.legend(loc='upper right', bbox_to_anchor=(0.1, 0.1))
-    plt.title('Comparison of Network Security Solutions', size=15, y=1.1)
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join(args.output_dir, 'solution_comparison.png'), dpi=300)
-    plt.close()
-    
-    print("Generated solution comparison radar chart")
+    md = ["# Swift-Guard benchmark summary", ""]
+    if flow_only:
+        md += ["> **%s**" % FLOW_BANNER, "> 수치는 veth + python 송신 한계이며 성능 결과로 쓰지 않는다.", ""]
+    md += ["- pps/gbps: `xdp-filter stats` 총계의 초당 차이. 전역 통계는 **룰에 매치한 패킷만** 센다.",
+           "- gbps 바이트 기준은 XDP가 보는 L2 프레임(FCS·프리앰블·IFG 제외) — 선로 속도 아님.",
+           "- if_rx_pps: 인터페이스 rx 카운터(드라이버마다 XDP_DROP 계수 여부가 다름 — 참고용).", ""]
 
-def generate_summary_report():
-    """결과 요약 보고서 생성"""
-    print("\nGenerating summary report...")
-    
-    # 마크다운 파일 생성
-    report_file = os.path.join(args.output_dir, 'performance_summary.md')
-    
-    with open(report_file, 'w') as f:
-        f.write("# Swift-Guard Performance Test Results\n\n")
-        f.write(f"Report generated at: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-        
-        f.write("## Basic Throughput Test\n\n")
-        
-        # 기본 처리량 테스트 결과 로드
-        throughput_file = os.path.join(args.results_dir, 'throughput_results.csv')
-        if os.path.exists(throughput_file):
-            df = pd.read_csv(throughput_file)
-            
-            f.write("### Summary\n\n")
-            f.write(f"- Maximum packet rate: {df['pps'].max() / 1e6:.2f} Mpps (at {df.loc[df['pps'].idxmax(), 'packet_size']} bytes)\n")
-            f.write(f"- Maximum bandwidth: {df['gbps'].max():.2f} Gbps (at {df.loc[df['gbps'].idxmax(), 'packet_size']} bytes)\n")
-            f.write(f"- Average CPU utilization: {df['cpu_util'].mean():.2f}%\n\n")
-            
-            f.write("### Results by Packet Size\n\n")
-            f.write("| Packet Size (bytes) | Throughput (Mpps) | Bandwidth (Gbps) | CPU Utilization (%) |\n")
-            f.write("|----------------------|-------------------|------------------|---------------------|\n")
-            
-            for _, row in df.iterrows():
-                f.write(f"| {row['packet_size']:20} | {row['pps']/1e6:17.2f} | {row['gbps']:16.2f} | {row['cpu_util']:19.2f} |\n")
-            
-            f.write("\n![Basic Throughput](basic_throughput.png)\n\n")
-        else:
-            f.write("No basic throughput test results found.\n\n")
-        
-        f.write("## Rule Scaling Test\n\n")
-        
-        # 규칙 스케일링 테스트 결과 로드
-        rule_files = glob.glob(os.path.join(args.results_dir, 'rules_*_stats.csv'))
-        if rule_files:
-            f.write("### Summary\n\n")
-            f.write("The impact of increasing filter rules on performance:\n\n")
-            
-            # 결과 처리를 위한 코드 (이전에 작성한 분석 코드 활용)
-            results = []
-            for file in rule_files:
-                try:
-                    rule_count = int(Path(file).stem.split('_')[1])
-                    df = pd.read_csv(file)
-                    results.append({
-                        'rule_count': rule_count,
-                        'avg_pps': df['packets_per_sec'].mean() if 'packets_per_sec' in df.columns else 0,
-                        'avg_mbps': df['mbps'].mean() if 'mbps' in df.columns else 0,
-                    })
-                except (IndexError, ValueError):
-                    continue
-            
-            if results:
-                result_df = pd.DataFrame(results).sort_values('rule_count')
-                
-                f.write("| Rule Count | Throughput (Mpps) | Bandwidth (Gbps) |\n")
-                f.write("|------------|-------------------|------------------|\n")
-                
-                for _, row in result_df.iterrows():
-                    f.write(f"| {row['rule_count']:10} | {row['avg_pps']/1e6:17.2f} | {row['avg_mbps']/1e3:16.2f} |\n")
-                
-                # 성능 영향 계산
-                if len(result_df) > 1:
-                    min_rules = result_df['rule_count'].min()
-                    max_rules = result_df['rule_count'].max()
-                    
-                    min_pps = result_df.loc[result_df['rule_count'] == min_rules, 'avg_pps'].values[0]
-                    max_pps = result_df.loc[result_df['rule_count'] == max_rules, 'avg_pps'].values[0]
-                    
-                    pps_reduction = (1 - max_pps / min_pps) * 100
-                    
-                    f.write(f"\nPerformance reduction from {min_rules} rules to {max_rules} rules: **{pps_reduction:.2f}%**\n\n")
-                
-                f.write("\n![Rule Scaling](rule_scaling.png)\n\n")
-        else:
-            f.write("No rule scaling test results found.\n\n")
-        
-        f.write("## WASM Module Overhead Test\n\n")
-        
-        # WASM 오버헤드 테스트 결과 로드
-        wasm_files = glob.glob(os.path.join(args.results_dir, 'wasm_*_stats.csv'))
-        if wasm_files:
-            f.write("### Summary\n\n")
-            f.write("The impact of WASM modules on performance:\n\n")
-            
-            # 결과 처리를 위한 코드 (이전에 작성한 분석 코드 활용)
-            results = []
-            for file in wasm_files:
-                try:
-                    module_name = Path(file).stem.split('_')[1]
-                    if module_name == "none":
-                        module_name = "No WASM"
-                    elif module_name == "null":
-                        module_name = "Null Module"
-                    elif module_name.endswith(".wasm"):
-                        module_name = module_name[:-5].replace("_", " ").title()
-                    
-                    df = pd.read_csv(file)
-                    results.append({
-                        'module': module_name,
-                        'avg_pps': df['packets_per_sec'].mean() if 'packets_per_sec' in df.columns else 0,
-                        'avg_mbps': df['mbps'].mean() if 'mbps' in df.columns else 0,
-                        'avg_cpu': df['cpu_util'].mean() if 'cpu_util' in df.columns else 0,
-                    })
-                except (IndexError, ValueError):
-                    continue
-            
-            if results:
-                result_df = pd.DataFrame(results)
-                
-                f.write("| WASM Module | Throughput (Mpps) | Bandwidth (Gbps) | CPU Utilization (%) |\n")
-                f.write("|-------------|-------------------|------------------|---------------------|\n")
-                
-                for _, row in result_df.iterrows():
-                    f.write(f"| {row['module']:11} | {row['avg_pps']/1e6:17.2f} | {row['avg_mbps']/1e3:16.2f} | {row['avg_cpu']:19.2f} |\n")
-                
-                # WASM 오버헤드 계산
-                if 'No WASM' in result_df['module'].values:
-                    no_wasm = result_df.loc[result_df['module'] == 'No WASM'].iloc[0]
-                    
-                    f.write("\n### WASM Module Overhead\n\n")
-                    for _, row in result_df[result_df['module'] != 'No WASM'].iterrows():
-                        pps_overhead = ((no_wasm['avg_pps'] - row['avg_pps']) / no_wasm['avg_pps']) * 100
-                        
-                        f.write(f"- **{row['module']}**: {pps_overhead:.2f}% throughput reduction\n")
-                
-                f.write("\n![WASM Overhead](wasm_overhead.png)\n\n")
-        else:
-            f.write("No WASM overhead test results found.\n\n")
-        
-        f.write("## Solution Comparison\n\n")
-        f.write("Comparison of Swift-Guard with other network security solutions:\n\n")
-        f.write("![Solution Comparison](solution_comparison.png)\n\n")
-        
-        f.write("## Conclusion\n\n")
-        f.write("Swift-Guard demonstrates high-performance packet processing capabilities with minimal overhead, even when using WebAssembly modules for advanced security inspection. The combination of XDP's wire-speed packet handling and WASM's flexibility creates a powerful framework for next-generation network security applications.\n\n")
-        
-        f.write("The performance results show that Swift-Guard can achieve throughput suitable for production environments, with scalable rule management and efficient resource utilization. Further optimizations could potentially improve these results even more in future versions.\n")
-    
-    print(f"Generated summary report: {report_file}")
+    if tp_rows is not None:
+        meta = read_meta(os.path.join(args.results_dir, "meta_throughput.txt"))
+        md += ["## Basic throughput", ""]
+        if meta:
+            md += [md_table(["key", "value"], sorted(meta.items())), ""]
+        md += [md_table(["frame B", "generator", "mode", "rule", "samples", "Mpps", "peak Mpps", "Gbps",
+                         "CPU %", "softirq %", "busiest CPU %", "if_rx Mpps", "daemon RSS kB"],
+                        [[r["packet_size"], r["generator"], r["mode"], r["rule_action"], r["samples"],
+                          "%.3f" % mpps(r["pps"]), "%.3f" % mpps(r["pps_peak"]), r["gbps"], r["cpu_util"],
+                          r["cpu_softirq"], r["cpu_busiest"], "%.3f" % mpps(r["if_rx_pps"]), r["daemon_rss_kb"]]
+                         for r in tp_rows]), ""]
+        if plotter:
+            plot_throughput(plotter, tp_rows)
+            ts = load_timeseries(args.results_dir)
+            if ts:
+                plot_timeseries(plotter, ts)
+            else:
+                print("  skip: throughput/stats_*.csv 없음 → throughput_timeseries.png 생략")
 
-# 주요 함수 실행
+    if rs_rows is not None:
+        meta = read_meta(os.path.join(args.results_dir, "meta_rule_scaling.txt"))
+        base = num(rs_rows[0]["pps"], 0.0) or 0.0
+        md += ["## Rule scaling", ""]
+        if meta:
+            md += [md_table(["key", "value"], sorted(meta.items())), ""]
+        md += [md_table(["rules", "side", "frame B", "generator", "Mpps", "vs first %", "CPU %", "busiest CPU %",
+                         "rules added", "add sec", "µs/rule (incl. CLI)"],
+                        [[r["rule_count"], r["side"], r["packet_size"], r["generator"], "%.3f" % mpps(r["pps"]),
+                          ("%.1f" % ((num(r["pps"], 0.0) or 0.0) / base * 100)) if base else "n/a",
+                          r["cpu_util"], r["cpu_busiest"], r["rules_added"], r["add_rules_sec"] or "-",
+                          r["add_rule_us_avg"] or "-"] for r in rs_rows]), ""]
+        md += ["add_rule_us_avg 는 `xdp-filter add-rule` 프로세스 생성·TCP 연결을 포함한다(순수 맵 갱신 지연 아님).", ""]
+        if plotter:
+            plot_rule_scaling(plotter, rs_rows, base)
+            plot_rule_add(plotter, rs_rows)
+
+    skipped = [w for w in (tp_why, rs_why) if w]
+    if skipped:
+        md += ["## Skipped", ""] + ["- %s" % w for w in skipped] + [""]
+    if plotter and plotter.files:
+        md += ["## Plots", ""] + ["- [%s](%s)" % (f, f) for f in plotter.files] + [""]
+
+    summary = os.path.join(out_dir, "summary.md")
+    with open(summary, "w") as f:
+        f.write("\n".join(md))
+    print("wrote %s" % summary)
+    if flow_only:
+        print(FLOW_BANNER)
+    return 0
+
+
 if __name__ == "__main__":
-    analyze_basic_throughput()
-    analyze_rule_scaling()
-    analyze_wasm_overhead()
-    create_solution_comparison()
-    generate_summary_report()
-    
-    print(f"\nAll analysis completed. Results saved to {args.output_dir}")
+    sys.exit(main())

@@ -41,6 +41,13 @@ expect() {  # expect <OK|BLOCKED> <lab 명령...>
   if [ "$got" = "$want" ]; then echo "[PASS] lab $* → $got"; PASS=$((PASS+1))
   else echo "[FAIL] lab $* → $got (기대: $want)"; FAIL=$((FAIL+1)); fi
 }
+expect_err() {  # expect_err "<설명>" "<기대 문구>" <xdp-filter 인자...> : rc≠0이고 출력에 문구가 있으면 PASS
+  local desc="$1" want="$2"; shift 2
+  local out rc; out="$("$XF" "$@" 2>&1)"; rc=$?
+  [ $VERBOSE -eq 1 ] && { echo "\$ xdp-filter $*"; echo "$out" | sed 's/^/  /'; }
+  if [ $rc -ne 0 ] && printf '%s\n' "$out" | grep -qF -- "$want"; then echo "[PASS] $desc"; PASS=$((PASS+1))
+  else echo "[FAIL] $desc (rc=$rc, 출력: $out | 기대 문구: $want)"; FAIL=$((FAIL+1)); fi
+}
 check() { if eval "$2"; then echo "[PASS] $1"; PASS=$((PASS+1)); else echo "[FAIL] $1"; FAIL=$((FAIL+1)); fi; }
 pkts() { "$XF" list-rules --stats 2>/dev/null | grep -A1 -E "^$1[[:space:]]" | grep -oE 'Packets: [0-9]+' | grep -oE '[0-9]+' | head -1; }
 
@@ -111,8 +118,8 @@ expect OK ping 10.200.0.4
 expect OK http 10.200.0.4
 P="$(pkts watch-host)"; check "watch-host 집계 ≥ 3 (실제 ${P:-0})" '[ "${P:-0}" -ge 3 ]'
 x list-rules --stats
-STATS="$(timeout 3 "$XF" stats --interval 1 2>/dev/null || true)"
-[ $VERBOSE -eq 1 ] && echo "$STATS" | head -8 | sed 's/^/  /'
+STATS="$("$XF" stats --count 2 2>/dev/null || true)"
+[ $VERBOSE -eq 1 ] && { echo "\$ xdp-filter stats --count 2"; echo "$STATS" | sed 's/^/  /'; }
 check "전역 통계 출력" 'echo "$STATS" | grep -q "Total packets"'
 x delete-rule --label watch-host
 
@@ -127,13 +134,18 @@ x delete-rule --label to-inspect
 
 # ------------------------------------------------------------ 9. 잘못된 입력
 title "9. 거부되는 입력 (에러 메시지 확인)"
-check "src-ip 없음 → 거부" '! x add-rule --protocol tcp --dst-port 80 --action drop --label bad1'
-check "dst-ip 지정 → 거부" '! x add-rule --src-ip 10.200.0.2 --dst-ip 10.200.0.1 --action drop --label bad2'
+expect_err "src-ip/dst-ip 둘 다 없음 → 거부" "src_ip or dst_ip is required" add-rule --protocol tcp --dst-port 80 --action drop --label bad1
+expect_err "src-ip와 dst-ip 함께 → 거부" "specify either src_ip or dst_ip, not both" add-rule --src-ip 10.200.0.2 --dst-ip 10.200.0.1 --action drop --label bad2
 x add-rule --src-ip 10.200.0.2 --action drop --label dup-a >/dev/null 2>&1
 check "같은 src prefix 중복 → 거부" '! x add-rule --src-ip 10.200.0.2 --protocol tcp --action pass --label dup-b'
+x add-rule --dst-ip 10.200.0.11 --action drop --label dup-c >/dev/null 2>&1
+expect_err "같은 dst prefix 중복 → 거부" "a rule for dst 10.200.0.11/32 already exists (label 'dup-c')" add-rule --dst-ip 10.200.0.11 --protocol tcp --action pass --label dup-d
+check "같은 prefix의 src+dst 동시 허용" 'x add-rule --dst-ip 10.200.0.2 --action count --label dup-a-dst'
 check "없는 인터페이스로 redirect → 거부" '! x add-rule --src-ip 10.200.0.3 --action redirect --redirect-if nope0 --label bad3'
 check "drop 룰에 --redirect-if → 거부" '! x add-rule --src-ip 10.200.0.3 --action drop --redirect-if sg-lab-insp0 --label bad4'
-check "redirect인데 --redirect-if 없음 → 거부" '! x add-rule --src-ip 10.200.0.3 --action redirect --label bad5'
+expect_err "redirect인데 --redirect-if 없음 → 거부" "Redirect action requires '--redirect-if' parameter" add-rule --src-ip 10.200.0.3 --action redirect --label bad5
+x delete-rule --label dup-a-dst
+x delete-rule --label dup-c
 x delete-rule --label dup-a
 
 # ------------------------------------------------------------ 10. WASM
@@ -149,8 +161,39 @@ else
   echo "[SKIP] http_inspector.wasm 없음 (cd wasm && ./build.sh)"
 fi
 
-# ------------------------------------------------------------ 11. 정리
-title "11. 정리 (detach, 종료)"
+# ------------------------------------------------------------ 11. 목적지 IP
+title "11. 목적지 IP 기준 차단"
+check "add-rule protect-web2" 'x add-rule --dst-ip 10.200.0.11 --protocol tcp --dst-port 8080 --action drop --label protect-web2'
+x list-rules
+check "list-rules에 10.200.0.11:8080 표시" '"$XF" list-rules | grep -E "^protect-web2[[:space:]]" | grep -qF "10.200.0.11:8080"'
+expect BLOCKED --to 10.200.0.11 http 10.200.0.2
+expect BLOCKED --to 10.200.0.11 http 10.200.0.3
+expect OK --to 10.200.0.11 ping 10.200.0.2
+expect OK --to 10.200.0.11 udp 10.200.0.2
+expect OK http 10.200.0.2
+x delete-rule --label protect-web2
+expect OK --to 10.200.0.11 http 10.200.0.2
+
+# ------------------------------------------------------------ 12. 출발지 우선
+title "12. 출발지 룰 우선 / 목적지 룰로 넘어감"
+check "add-rule block-srv2" 'x add-rule --dst-ip 10.200.0.11 --action drop --label block-srv2'
+check "add-rule admin-pass" 'x add-rule --src-ip 10.200.0.5 --action pass --label admin-pass'
+check "add-rule watch-udp4" 'x add-rule --src-ip 10.200.0.4 --protocol udp --action count --label watch-udp4'
+expect BLOCKED --to 10.200.0.11 ping 10.200.0.2
+expect OK --to 10.200.0.11 ping 10.200.0.5
+expect OK --to 10.200.0.11 udp 10.200.0.4
+expect BLOCKED --to 10.200.0.11 ping 10.200.0.4
+expect OK ping 10.200.0.4
+x list-rules --stats
+P="$(pkts admin-pass)"; check "admin-pass 집계 ≥ 3 (실제 ${P:-0})" '[ "${P:-0}" -ge 3 ]'
+P="$(pkts block-srv2)"; check "block-srv2 집계 ≥ 3 (실제 ${P:-0})" '[ "${P:-0}" -ge 3 ]'
+P="$(pkts watch-udp4)"; check "watch-udp4 집계 > 0 (실제 ${P:-0})" '[ "${P:-0}" -gt 0 ]'
+x delete-rule --label watch-udp4
+x delete-rule --label admin-pass
+x delete-rule --label block-srv2
+
+# ------------------------------------------------------------ 13. 정리
+title "13. 정리 (detach, 종료)"
 check "detach" 'x detach sg-lab0'
 check "XDP 해제 확인" '! ip -d link show dev sg-lab0 | grep -qE "xdp(generic)?[ /]|prog/xdp"'
 expect OK ping 10.200.0.2

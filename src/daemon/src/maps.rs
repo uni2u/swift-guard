@@ -1,5 +1,8 @@
 //! 맵 관리자 모듈
-//! BPF 맵(filter_rules / redirect_map / stats_map)을 관리한다.
+//! BPF 맵(filter_rules / dst_rules / redirect_map / stats_map)을 관리한다.
+//! - filter_rules: 출발지 IP prefix LPM 룰 (먼저 평가)
+//! - dst_rules: 목적지 IP prefix LPM 룰 (출발지 룰이 없거나 조건 불일치일 때 평가)
+//! - 두 룰 맵은 같은 키(prefix_key)·값(filter_rule 88B) 형식이며 redirect_map 을 공유한다.
 //!
 //! 바이트 직렬화는 전부 `swift_guard::bpf_layout` 을 사용한다(C 레이아웃이 원천).
 //! MapManager 는 XdpFilterSkel 을 소유하며 !Send 이므로 main 태스크에서만 사용한다.
@@ -12,9 +15,11 @@ use crate::bpf::XdpFilterSkel;
 
 use swift_guard::api::{RuleInfo, RuleStats};
 use swift_guard::bpf_layout::{self, FilterRuleValue};
+use swift_guard::types::MatchSide;
 use swift_guard::utils;
 
 const FILTER_RULES_MAP: &str = "filter_rules";
+const DST_RULES_MAP: &str = "dst_rules";
 const REDIRECT_MAP: &str = "redirect_map";
 const STATS_MAP: &str = "stats_map";
 const XDP_PROG: &str = "xdp_filter_func";
@@ -25,8 +30,11 @@ pub const ACTION_REDIRECT: u8 = 3;
 /// 필터 규칙 정보 (데몬 캐시)
 #[derive(Debug, Clone)]
 pub struct FilterRule {
-    /// (호스트 정수 IP, 프리픽스 길이). XDP 필터는 src IP prefix 로만 매칭하므로 필수.
+    /// 출발지 (호스트 정수 IP, 프리픽스 길이) — filter_rules 룰.
+    /// 불변식: src_ip / dst_ip 중 정확히 하나만 Some.
     pub src_ip: Option<(u32, u32)>,
+    /// 목적지 (호스트 정수 IP, 프리픽스 길이) — dst_rules 룰.
+    pub dst_ip: Option<(u32, u32)>,
     pub src_port_min: u16,
     pub src_port_max: u16,
     pub dst_port_min: u16,
@@ -53,14 +61,39 @@ fn format_prefix(ip: u32, prefix: u32) -> String {
     }
 }
 
+fn map_for(side: MatchSide) -> &'static str {
+    match side {
+        MatchSide::Src => FILTER_RULES_MAP,
+        MatchSide::Dst => DST_RULES_MAP,
+    }
+}
+
 impl FilterRule {
+    /// 룰이 들어갈 맵과 매칭 쪽, (주소, prefix 길이). 불변식 위반 시 API 와 같은 문구로 Err.
+    fn target(&self) -> Result<(&'static str, MatchSide, u32, u32)> {
+        match (self.src_ip, self.dst_ip) {
+            (Some(_), Some(_)) => Err(anyhow!("specify either src_ip or dst_ip, not both")),
+            (None, None) => Err(anyhow!("src_ip or dst_ip is required")),
+            (Some((a, p)), None) => Ok((map_for(MatchSide::Src), MatchSide::Src, a, p)),
+            (None, Some((a, p))) => Ok((map_for(MatchSide::Dst), MatchSide::Dst, a, p)),
+        }
+    }
+
+    /// 해당 side 의 prefix 값
+    fn prefix_of(&self, side: MatchSide) -> Option<(u32, u32)> {
+        match side {
+            MatchSide::Src => self.src_ip,
+            MatchSide::Dst => self.dst_ip,
+        }
+    }
+
     /// API 룰 정보로 변환
     pub fn to_rule_info(&self, stats: RuleStats) -> RuleInfo {
         RuleInfo {
             label: self.label.clone(),
             action: utils::action_num_to_name(self.action),
             src_ip: self.src_ip.map(|(ip, prefix)| format_prefix(ip, prefix)),
-            dst_ip: None, // dst_ip 매칭은 지원하지 않는다
+            dst_ip: self.dst_ip.map(|(ip, prefix)| format_prefix(ip, prefix)),
             src_port: utils::port_range_to_string(self.src_port_min, self.src_port_max),
             dst_port: utils::port_range_to_string(self.dst_port_min, self.dst_port_max),
             protocol: utils::protocol_num_to_name(self.protocol),
@@ -109,9 +142,10 @@ impl std::fmt::Debug for MapManager {
 }
 
 impl MapManager {
-    /// 3개 맵과 XDP 프로그램이 오브젝트에 있는지 검증한다.
+    /// 4개 맵과 XDP 프로그램이 오브젝트에 있는지 검증한다.
+    /// 오래된 xdp_filter.o 라면 `BPF object has no map 'dst_rules'` 로 기동이 실패한다.
     pub fn new(skel: XdpFilterSkel) -> Result<Self> {
-        for name in [FILTER_RULES_MAP, REDIRECT_MAP, STATS_MAP] {
+        for name in [FILTER_RULES_MAP, DST_RULES_MAP, REDIRECT_MAP, STATS_MAP] {
             if skel.obj.map(name).is_none() {
                 return Err(anyhow!("BPF object has no map '{}'", name));
             }
@@ -149,30 +183,36 @@ impl MapManager {
     }
 
     /// 규칙 추가.
-    /// 순서: 캐시 중복 검사 → (필요 시) redirect_map → filter_rules(NOEXIST) → 성공 시 캐시 push.
+    /// 순서: 캐시 중복 검사 → (필요 시) redirect_map → filter_rules|dst_rules(NOEXIST) → 성공 시 캐시 push.
     pub fn add_rule(&mut self, mut rule: FilterRule) -> Result<()> {
         debug!("Adding rule: {}", rule.label);
 
-        // 방어 검사: src_ip 없는 룰은 맵에 들어갈 수 없다
-        let (addr, prefix_len) = rule.src_ip.ok_or_else(|| {
-            anyhow!("src_ip is required: XDP filter matches by source IP prefix only")
-        })?;
+        // 방어 검사: src_ip / dst_ip 중 정확히 하나
+        let (map_name, side, addr, prefix_len) = rule.target()?;
         if prefix_len > 32 {
             return Err(anyhow!("invalid prefix length {}", prefix_len));
         }
         let addr = bpf_layout::canonical_prefix(addr, prefix_len);
-        rule.src_ip = Some((addr, prefix_len));
+        match side {
+            MatchSide::Src => rule.src_ip = Some((addr, prefix_len)),
+            MatchSide::Dst => rule.dst_ip = Some((addr, prefix_len)),
+        }
 
         let label = bpf_layout::encode_label(&rule.label)?;
 
-        // (1) 캐시 중복 검사
+        // (1) 캐시 중복 검사 — prefix 는 같은 side(맵) 안에서만, label 은 전체
         if let Some(existing) = self
             .rules
             .iter()
-            .find(|r| r.src_ip == Some((addr, prefix_len)))
+            .find(|r| r.prefix_of(side) == Some((addr, prefix_len)))
         {
+            let side_word = match side {
+                MatchSide::Src => "",
+                MatchSide::Dst => "dst ",
+            };
             return Err(anyhow!(
-                "a rule for {}/{} already exists (label '{}')",
+                "a rule for {}{}/{} already exists (label '{}')",
+                side_word,
                 utils::ipv4_to_string(addr),
                 prefix_len,
                 existing.label
@@ -220,9 +260,9 @@ impl MapManager {
             }
         }
 
-        // (3) filter_rules
+        // (3) filter_rules 또는 dst_rules
         let res = self
-            .map_mut(FILTER_RULES_MAP)?
+            .map_mut(map_name)?
             .update(&key, &value, MapFlags::NO_EXIST);
         if let Err(e) = res {
             if let Some(rkey) = inserted_redirect {
@@ -233,7 +273,8 @@ impl MapManager {
                 }
             }
             return Err(anyhow::Error::new(e).context(format!(
-                "Failed to update filter_rules map for {}/{}",
+                "Failed to update {} map for {}/{}",
+                map_name,
                 utils::ipv4_to_string(addr),
                 prefix_len
             )));
@@ -254,17 +295,19 @@ impl MapManager {
         };
         let rule = self.rules[index].clone();
 
-        if let Some((addr, prefix_len)) = rule.src_ip {
-            let key = bpf_layout::encode_prefix_key(addr, prefix_len);
-            match self.map_mut(FILTER_RULES_MAP)?.delete(&key) {
-                Ok(()) => {}
-                Err(e) if is_enoent(&e) => {
-                    warn!("rule '{}' was not present in filter_rules map; removing from cache", label);
-                }
-                Err(e) => {
-                    return Err(anyhow::Error::new(e)
-                        .context(format!("Failed to delete rule '{}' from filter_rules map", label)));
-                }
+        let (map_name, _, addr, prefix_len) = rule.target()?;
+        let key = bpf_layout::encode_prefix_key(addr, prefix_len);
+        match self.map_mut(map_name)?.delete(&key) {
+            Ok(()) => {}
+            Err(e) if is_enoent(&e) => {
+                warn!(
+                    "rule '{}' was not present in {} map; removing from cache",
+                    label, map_name
+                );
+            }
+            Err(e) => {
+                return Err(anyhow::Error::new(e)
+                    .context(format!("Failed to delete rule '{}' from {} map", label, map_name)));
             }
         }
 
@@ -290,18 +333,23 @@ impl MapManager {
         Ok(true)
     }
 
-    /// 규칙 목록 조회. include_stats 면 filter_rules 값의 절대 offset 64 에서 통계를 읽는다.
+    /// 규칙 목록 조회. include_stats 면 룰이 속한 맵(filter_rules|dst_rules) 값의
+    /// 절대 offset 64 에서 통계를 읽는다.
     pub fn list_rules(&self, include_stats: bool) -> Result<Vec<RuleInfo>> {
         let mut result = Vec::with_capacity(self.rules.len());
-        let map = if include_stats {
-            Some(self.map(FILTER_RULES_MAP)?)
+        let maps = if include_stats {
+            Some((self.map(FILTER_RULES_MAP)?, self.map(DST_RULES_MAP)?))
         } else {
             None
         };
 
         for rule in &self.rules {
-            let stats = match (map, rule.src_ip) {
-                (Some(map), Some((addr, prefix_len))) => {
+            let stats = match (maps, rule.target()) {
+                (Some((src_map, dst_map)), Ok((map_name, side, addr, prefix_len))) => {
+                    let map = match side {
+                        MatchSide::Src => src_map,
+                        MatchSide::Dst => dst_map,
+                    };
                     let key = bpf_layout::encode_prefix_key(addr, prefix_len);
                     let value = map
                         .lookup(&key, MapFlags::ANY)
@@ -311,7 +359,8 @@ impl MapManager {
                             let (packets, bytes, last_matched) = bpf_layout::decode_rule_stats(&v)
                                 .ok_or_else(|| {
                                     anyhow!(
-                                        "filter_rules value size {} != {}",
+                                        "{} value size {} != {}",
+                                        map_name,
                                         v.len(),
                                         bpf_layout::FILTER_RULE_SIZE
                                     )
@@ -323,7 +372,10 @@ impl MapManager {
                             }
                         }
                         None => {
-                            warn!("rule '{}' is cached but missing from filter_rules map", rule.label);
+                            warn!(
+                                "rule '{}' is cached but missing from {} map",
+                                rule.label, map_name
+                            );
                             zero_stats()
                         }
                     }
@@ -347,5 +399,62 @@ impl MapManager {
         Ok(per_cpu
             .map(|v| bpf_layout::sum_percpu_stats(&v))
             .unwrap_or((0, 0)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rule(src: Option<(u32, u32)>, dst: Option<(u32, u32)>) -> FilterRule {
+        FilterRule {
+            src_ip: src,
+            dst_ip: dst,
+            src_port_min: 0,
+            src_port_max: 65535,
+            dst_port_min: 8080,
+            dst_port_max: 8080,
+            protocol: 6,
+            tcp_flags: 0,
+            action: 2,
+            redirect_ifindex: 0,
+            redirect_ifname: None,
+            priority: 0,
+            rate_limit: 0,
+            expire: 0,
+            label: "t".to_string(),
+            creation_time: 0,
+        }
+    }
+
+    #[test]
+    fn target_selects_map_by_side() {
+        let (m, s, a, p) = rule(Some((0x0A00_0002, 32)), None).target().unwrap();
+        assert_eq!((m, s, a, p), (FILTER_RULES_MAP, MatchSide::Src, 0x0A00_0002, 32));
+        let (m, s, a, p) = rule(None, Some((0x0AC8_000B, 32))).target().unwrap();
+        assert_eq!((m, s, a, p), (DST_RULES_MAP, MatchSide::Dst, 0x0AC8_000B, 32));
+        assert_eq!(DST_RULES_MAP, "dst_rules");
+    }
+
+    #[test]
+    fn target_rejects_invariant_violation() {
+        assert_eq!(
+            rule(Some((1, 32)), Some((2, 32))).target().unwrap_err().to_string(),
+            "specify either src_ip or dst_ip, not both"
+        );
+        assert_eq!(
+            rule(None, None).target().unwrap_err().to_string(),
+            "src_ip or dst_ip is required"
+        );
+    }
+
+    #[test]
+    fn rule_info_fills_matching_side_only() {
+        let info = rule(None, Some((0x0AC8_000B, 32))).to_rule_info(zero_stats());
+        assert_eq!(info.src_ip, None);
+        assert_eq!(info.dst_ip.as_deref(), Some("10.200.0.11"));
+        let info = rule(Some((0x0AC8_0000, 24)), None).to_rule_info(zero_stats());
+        assert_eq!(info.src_ip.as_deref(), Some("10.200.0.0/24"));
+        assert_eq!(info.dst_ip, None);
     }
 }
