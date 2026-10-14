@@ -1,25 +1,32 @@
 //! 맵 관리자 모듈
-//! BPF 맵을 관리하는 기능 제공
+//! BPF 맵(filter_rules / redirect_map / stats_map)을 관리한다.
+//!
+//! 바이트 직렬화는 전부 `swift_guard::bpf_layout` 을 사용한다(C 레이아웃이 원천).
+//! MapManager 는 XdpFilterSkel 을 소유하며 !Send 이므로 main 태스크에서만 사용한다.
 
 use anyhow::{anyhow, Context, Result};
-use libbpf_rs::Map;
-use log::{debug, error, info, warn};
-use std::net::{IpAddr, Ipv4Addr};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use libbpf_rs::{Map, MapFlags};
+use log::{debug, warn};
 
 use crate::bpf::XdpFilterSkel;
-//use crate::api::{RuleInfo, RuleStats};
-//use crate::utils;
 
 use swift_guard::api::{RuleInfo, RuleStats};
+use swift_guard::bpf_layout::{self, FilterRuleValue};
 use swift_guard::utils;
-use libbpf_rs::MapFlags;
 
-/// 필터 규칙 정보
+const FILTER_RULES_MAP: &str = "filter_rules";
+const REDIRECT_MAP: &str = "redirect_map";
+const STATS_MAP: &str = "stats_map";
+const XDP_PROG: &str = "xdp_filter_func";
+
+/// redirect 액션 값 (ACTION_REDIRECT)
+pub const ACTION_REDIRECT: u8 = 3;
+
+/// 필터 규칙 정보 (데몬 캐시)
 #[derive(Debug, Clone)]
 pub struct FilterRule {
-    pub src_ip: Option<(u32, u32)>,  // (IP, 프리픽스 길이)
-    pub dst_ip: Option<(u32, u32)>,  // (IP, 프리픽스 길이)
+    /// (호스트 정수 IP, 프리픽스 길이). XDP 필터는 src IP prefix 로만 매칭하므로 필수.
+    pub src_ip: Option<(u32, u32)>,
     pub src_port_min: u16,
     pub src_port_max: u16,
     pub dst_port_min: u16,
@@ -28,11 +35,22 @@ pub struct FilterRule {
     pub tcp_flags: u8,
     pub action: u8,
     pub redirect_ifindex: u32,
+    /// if_nametoindex 로 해석한 실제 인터페이스 이름
+    pub redirect_ifname: Option<String>,
     pub priority: u32,
     pub rate_limit: u32,
     pub expire: u32,
     pub label: String,
+    #[allow(dead_code)] // 향후 expire 처리용
     pub creation_time: u64,
+}
+
+fn format_prefix(ip: u32, prefix: u32) -> String {
+    if prefix == 32 {
+        utils::ipv4_to_string(ip)
+    } else {
+        format!("{}/{}", utils::ipv4_to_string(ip), prefix)
+    }
 }
 
 impl FilterRule {
@@ -41,20 +59,8 @@ impl FilterRule {
         RuleInfo {
             label: self.label.clone(),
             action: utils::action_num_to_name(self.action),
-            src_ip: self.src_ip.map(|(ip, prefix)| {
-                if prefix == 32 {
-                    utils::ipv4_to_string(ip)
-                } else {
-                    format!("{}/{}", utils::ipv4_to_string(ip), prefix)
-                }
-            }),
-            dst_ip: self.dst_ip.map(|(ip, prefix)| {
-                if prefix == 32 {
-                    utils::ipv4_to_string(ip)
-                } else {
-                    format!("{}/{}", utils::ipv4_to_string(ip), prefix)
-                }
-            }),
+            src_ip: self.src_ip.map(|(ip, prefix)| format_prefix(ip, prefix)),
+            dst_ip: None, // dst_ip 매칭은 지원하지 않는다
             src_port: utils::port_range_to_string(self.src_port_min, self.src_port_max),
             dst_port: utils::port_range_to_string(self.dst_port_min, self.dst_port_max),
             protocol: utils::protocol_num_to_name(self.protocol),
@@ -64,8 +70,8 @@ impl FilterRule {
                 Some(utils::tcp_flags_to_string(self.tcp_flags))
             },
             priority: self.priority,
-            redirect_if: if self.action == 3 && self.redirect_ifindex != 0 {
-                Some(format!("if{}", self.redirect_ifindex))
+            redirect_if: if self.action == ACTION_REDIRECT {
+                self.redirect_ifname.clone()
             } else {
                 None
             },
@@ -76,339 +82,270 @@ impl FilterRule {
     }
 }
 
-/// 리디렉션 인터페이스 정보
-#[derive(Debug, Clone)]
-pub struct RedirectIf {
-    pub ifindex: u32,
-    pub ifname: String,
+fn zero_stats() -> RuleStats {
+    RuleStats {
+        packets: 0,
+        bytes: 0,
+        last_matched: 0,
+    }
 }
 
-/*
+fn is_enoent(e: &libbpf_rs::Error) -> bool {
+    matches!(e, libbpf_rs::Error::System(errno) if *errno == libc::ENOENT)
+}
+
 /// 맵 관리자
-#[derive(Debug)]
 pub struct MapManager {
-    /// 필터 규칙 맵 (LPM 트라이)
-    filter_rules_map: Map,
-    /// 리디렉션 맵
-    redirect_map: Map,
-    /// 통계 맵
-    stats_map: Map,
-    /// 로컬 규칙 캐시
-    rules: Vec<FilterRule>,
-}
-*/
-
-pub struct MapManager<'a> {
-    // XdpFilterSkel에 대한 참조만 유지
-//    skel: &'a XdpFilterSkel,
-    filter_rules_map: Option<&'a Map>,
-    redirect_map: Option<&'a Map>,
-    stats_map: Option<&'a Map>,
+    skel: XdpFilterSkel,
     rules: Vec<FilterRule>,
 }
 
-impl<'a> std::fmt::Debug for MapManager<'a> {
+impl std::fmt::Debug for MapManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MapManager")
             .field("rules", &self.rules)
-            // Map은 Debug할 수 없으므로 포함하지 않음
             .finish()
     }
 }
 
-impl<'a> MapManager<'a> {
-    pub fn new(skel: &'a XdpFilterSkel) -> Self {
-        Self {
-//            skel,
-            filter_rules_map: skel.maps().filter_rules(),
-            redirect_map: skel.maps().redirect_map(),
-            stats_map: skel.maps().stats_map(),
-            rules: Vec::new(),
+impl MapManager {
+    /// 3개 맵과 XDP 프로그램이 오브젝트에 있는지 검증한다.
+    pub fn new(skel: XdpFilterSkel) -> Result<Self> {
+        for name in [FILTER_RULES_MAP, REDIRECT_MAP, STATS_MAP] {
+            if skel.obj.map(name).is_none() {
+                return Err(anyhow!("BPF object has no map '{}'", name));
+            }
         }
-    }
-    
-    // 필요할 때마다 skel에서 맵을 가져오는 헬퍼 메서드
-    fn filter_rules_map(&self) -> Option<&Map> {
-//        self.skel.maps().filter_rules()
-//        let maps = &self.skel.maps();
-//        maps.filter_rules()
-        self.filter_rules_map
-    }
-    
-    fn redirect_map(&self) -> Option<&Map> {
-//        self.skel.maps().redirect_map()
-//        let maps = &self.skel.maps();
-//        maps.redirect_map()
-        self.redirect_map
-    }
-    
-    fn stats_map(&self) -> Option<&Map> {
-//        self.skel.maps().stats_map()
-//        let maps = &self.skel.maps();
-//        maps.stats_map()
-        self.stats_map
+        if skel.obj.prog(XDP_PROG).is_none() {
+            return Err(anyhow!("BPF object has no program '{}'", XDP_PROG));
+        }
+        Ok(Self {
+            skel,
+            rules: Vec::new(),
+        })
     }
 
-    /// 규칙 추가
-    pub fn add_rule(&mut self, rule: FilterRule) -> Result<()> {
+    fn map(&self, name: &str) -> Result<&Map> {
+        self.skel
+            .obj
+            .map(name)
+            .ok_or_else(|| anyhow!("BPF map '{}' not found", name))
+    }
+
+    fn map_mut(&mut self, name: &str) -> Result<&mut Map> {
+        self.skel
+            .obj
+            .map_mut(name)
+            .ok_or_else(|| anyhow!("BPF map '{}' not found", name))
+    }
+
+    /// XDP 프로그램 fd (attach 용)
+    pub fn xdp_prog_fd(&self) -> Result<i32> {
+        self.skel
+            .obj
+            .prog(XDP_PROG)
+            .map(|p| p.fd())
+            .ok_or_else(|| anyhow!("BPF program '{}' not found", XDP_PROG))
+    }
+
+    /// 규칙 추가.
+    /// 순서: 캐시 중복 검사 → (필요 시) redirect_map → filter_rules(NOEXIST) → 성공 시 캐시 push.
+    pub fn add_rule(&mut self, mut rule: FilterRule) -> Result<()> {
         debug!("Adding rule: {}", rule.label);
-        
-        // 소스 IP 규칙 추가 (있는 경우)
-        if let Some((src_ip, prefix_len)) = rule.src_ip {
-            let key = self.create_prefix_key(src_ip, prefix_len);
-            let value = self.create_filter_rule(&rule)?;
-            
-            if let Some(map) = self.filter_rules_map() {
-                map.update(&key, &value, libbpf_rs::MapFlags::ANY)
-                    .context("Failed to update filter_rules map")?;
-            } else {
-                return Err(anyhow!("Failed to update filter_rules map"));
-            }
+
+        // 방어 검사: src_ip 없는 룰은 맵에 들어갈 수 없다
+        let (addr, prefix_len) = rule.src_ip.ok_or_else(|| {
+            anyhow!("src_ip is required: XDP filter matches by source IP prefix only")
+        })?;
+        if prefix_len > 32 {
+            return Err(anyhow!("invalid prefix length {}", prefix_len));
         }
-        
-        // 리디렉션 인터페이스 설정 (필요한 경우)
-        if rule.action == 3 && rule.redirect_ifindex != 0 {
-            let key = rule.redirect_ifindex.to_le_bytes();
-            let if_redirect = self.create_if_redirect(rule.redirect_ifindex, &format!("if{}", rule.redirect_ifindex))?;
-            
-            if let Some(map) = self.redirect_map() {
-                map.update(&key, &if_redirect, libbpf_rs::MapFlags::ANY)
+        let addr = bpf_layout::canonical_prefix(addr, prefix_len);
+        rule.src_ip = Some((addr, prefix_len));
+
+        let label = bpf_layout::encode_label(&rule.label)?;
+
+        // (1) 캐시 중복 검사
+        if let Some(existing) = self
+            .rules
+            .iter()
+            .find(|r| r.src_ip == Some((addr, prefix_len)))
+        {
+            return Err(anyhow!(
+                "a rule for {}/{} already exists (label '{}')",
+                utils::ipv4_to_string(addr),
+                prefix_len,
+                existing.label
+            ));
+        }
+        if self.rules.iter().any(|r| r.label == rule.label) {
+            return Err(anyhow!("a rule with label '{}' already exists", rule.label));
+        }
+        if rule.action == ACTION_REDIRECT && rule.redirect_ifindex == 0 {
+            return Err(anyhow!("redirect action requires a valid redirect interface"));
+        }
+
+        let key = bpf_layout::encode_prefix_key(addr, prefix_len);
+        let value = bpf_layout::encode_filter_rule(&FilterRuleValue {
+            priority: rule.priority,
+            action: rule.action,
+            protocol: rule.protocol,
+            src_port_min: rule.src_port_min,
+            src_port_max: rule.src_port_max,
+            dst_port_min: rule.dst_port_min,
+            dst_port_max: rule.dst_port_max,
+            tcp_flags: rule.tcp_flags,
+            redirect_ifindex: rule.redirect_ifindex,
+            rate_limit: rule.rate_limit,
+            expire: rule.expire,
+            label,
+        });
+
+        // (2) redirect_map — 다른 룰이 이미 같은 ifindex 를 넣었으면 건드리지 않는다
+        let mut inserted_redirect: Option<[u8; 4]> = None;
+        if rule.action == ACTION_REDIRECT {
+            let ifindex = rule.redirect_ifindex;
+            let already = self
+                .rules
+                .iter()
+                .any(|r| r.action == ACTION_REDIRECT && r.redirect_ifindex == ifindex);
+            if !already {
+                let rkey = ifindex.to_ne_bytes();
+                let ifname = rule.redirect_ifname.clone().unwrap_or_default();
+                let rval = bpf_layout::encode_if_redirect(ifindex, &ifname);
+                self.map_mut(REDIRECT_MAP)?
+                    .update(&rkey, &rval, MapFlags::ANY)
                     .context("Failed to update redirect_map")?;
-            } else {
-                return Err(anyhow!("Failed to update redirect_map"));
+                inserted_redirect = Some(rkey);
             }
         }
-        
-        // 로컬 캐시 업데이트
+
+        // (3) filter_rules
+        let res = self
+            .map_mut(FILTER_RULES_MAP)?
+            .update(&key, &value, MapFlags::NO_EXIST);
+        if let Err(e) = res {
+            if let Some(rkey) = inserted_redirect {
+                if let Err(re) = self.map_mut(REDIRECT_MAP).and_then(|m| {
+                    m.delete(&rkey).context("redirect_map rollback delete failed")
+                }) {
+                    warn!("redirect_map rollback failed: {:#}", re);
+                }
+            }
+            return Err(anyhow::Error::new(e).context(format!(
+                "Failed to update filter_rules map for {}/{}",
+                utils::ipv4_to_string(addr),
+                prefix_len
+            )));
+        }
+
+        // (4) 캐시
         self.rules.push(rule);
-        
         Ok(())
     }
-    
-    /// 규칙 삭제
+
+    /// 규칙 삭제. 라벨이 없으면 Ok(false).
+    /// 맵 delete 실패(ENOENT 제외) 시 Err 이고 캐시는 유지한다.
     pub fn delete_rule(&mut self, label: &str) -> Result<bool> {
         debug!("Deleting rule: {}", label);
-        
-        let rule_index = self.rules.iter().position(|r| r.label == label);
-        
-        if let Some(index) = rule_index {
-            let rule = &self.rules[index];
-            
-            // 소스 IP 규칙 삭제 (있는 경우)
-            if let Some((src_ip, prefix_len)) = rule.src_ip {
-                let key = self.create_prefix_key(src_ip, prefix_len);
-                
-                if let Some(map) = self.filter_rules_map() {
-                    map.delete(&key)
-                        .context("Failed to delete from filter_rules map")?;
-                } else {
-                    return Err(anyhow!("Failed to get filter_rules map"));
+
+        let Some(index) = self.rules.iter().position(|r| r.label == label) else {
+            return Ok(false);
+        };
+        let rule = self.rules[index].clone();
+
+        if let Some((addr, prefix_len)) = rule.src_ip {
+            let key = bpf_layout::encode_prefix_key(addr, prefix_len);
+            match self.map_mut(FILTER_RULES_MAP)?.delete(&key) {
+                Ok(()) => {}
+                Err(e) if is_enoent(&e) => {
+                    warn!("rule '{}' was not present in filter_rules map; removing from cache", label);
+                }
+                Err(e) => {
+                    return Err(anyhow::Error::new(e)
+                        .context(format!("Failed to delete rule '{}' from filter_rules map", label)));
                 }
             }
-            
-            // 로컬 캐시 업데이트
-            self.rules.remove(index);
-            
-            Ok(true)
-        } else {
-            Ok(false)
         }
+
+        self.rules.remove(index);
+
+        // 해당 ifindex 를 참조하는 다른 룰이 없으면 redirect_map 항목도 삭제
+        if rule.action == ACTION_REDIRECT && rule.redirect_ifindex != 0 {
+            let ifindex = rule.redirect_ifindex;
+            let still_used = self
+                .rules
+                .iter()
+                .any(|r| r.action == ACTION_REDIRECT && r.redirect_ifindex == ifindex);
+            if !still_used {
+                let rkey = ifindex.to_ne_bytes();
+                match self.map_mut(REDIRECT_MAP)?.delete(&rkey) {
+                    Ok(()) => {}
+                    Err(e) if is_enoent(&e) => {}
+                    Err(e) => warn!("Failed to delete redirect_map entry for ifindex {}: {}", ifindex, e),
+                }
+            }
+        }
+
+        Ok(true)
     }
-    
-    /// 규칙 목록 조회
+
+    /// 규칙 목록 조회. include_stats 면 filter_rules 값의 절대 offset 64 에서 통계를 읽는다.
     pub fn list_rules(&self, include_stats: bool) -> Result<Vec<RuleInfo>> {
-        let mut result = Vec::new();
-        
+        let mut result = Vec::with_capacity(self.rules.len());
+        let map = if include_stats {
+            Some(self.map(FILTER_RULES_MAP)?)
+        } else {
+            None
+        };
+
         for rule in &self.rules {
-            let stats = if include_stats {
-                // 규칙 통계 조회
-                if let Some((src_ip, prefix_len)) = rule.src_ip {
-                    let key = self.create_prefix_key(src_ip, prefix_len);
-                    
-//                    if let Ok(value) = self.filter_rules_map.lookup(&key, 0) {
-                    if let Some(map) = self.filter_rules_map() {
-                        if let Ok(Some(value)) = map.lookup(&key, MapFlags::empty()) {
-                            if value.len() >= std::mem::size_of::<RuleStats>() {
-                                let stats_offset = value.len() - std::mem::size_of::<RuleStats>();
-                                let stats_bytes = &value[stats_offset..];
-                            
-                                // 통계 데이터 파싱
-                                let packets = u64::from_le_bytes([
-                                    stats_bytes[0], stats_bytes[1], stats_bytes[2], stats_bytes[3],
-                                    stats_bytes[4], stats_bytes[5], stats_bytes[6], stats_bytes[7],
-                                ]);
-                            
-                                let bytes = u64::from_le_bytes([
-                                    stats_bytes[8], stats_bytes[9], stats_bytes[10], stats_bytes[11],
-                                    stats_bytes[12], stats_bytes[13], stats_bytes[14], stats_bytes[15],
-                                ]);
-                            
-                                let last_matched = u64::from_le_bytes([
-                                    stats_bytes[16], stats_bytes[17], stats_bytes[18], stats_bytes[19],
-                                    stats_bytes[20], stats_bytes[21], stats_bytes[22], stats_bytes[23],
-                                ]);
-                            
-                                RuleStats {
-                                    packets,
-                                    bytes,
-                                    last_matched,
-                                
-                                }
-                            } else {
-                                 RuleStats {
-                                    packets: 0,
-                                    bytes: 0,
-                                    last_matched: 0,
-                                }
-                            }
-                        } else {
+            let stats = match (map, rule.src_ip) {
+                (Some(map), Some((addr, prefix_len))) => {
+                    let key = bpf_layout::encode_prefix_key(addr, prefix_len);
+                    let value = map
+                        .lookup(&key, MapFlags::ANY)
+                        .with_context(|| format!("Failed to look up rule '{}'", rule.label))?;
+                    match value {
+                        Some(v) => {
+                            let (packets, bytes, last_matched) = bpf_layout::decode_rule_stats(&v)
+                                .ok_or_else(|| {
+                                    anyhow!(
+                                        "filter_rules value size {} != {}",
+                                        v.len(),
+                                        bpf_layout::FILTER_RULE_SIZE
+                                    )
+                                })?;
                             RuleStats {
-                                packets: 0,
-                                bytes: 0,
-                                last_matched: 0,
+                                packets,
+                                bytes,
+                                last_matched,
                             }
                         }
-                    } else {
-                        RuleStats {
-                            packets: 0,
-                            bytes: 0,
-                            last_matched: 0,
+                        None => {
+                            warn!("rule '{}' is cached but missing from filter_rules map", rule.label);
+                            zero_stats()
                         }
                     }
-                } else {
-                    RuleStats {
-                        packets: 0,
-                        bytes: 0,
-                        last_matched: 0,
-                    }
                 }
-            } else {
-                RuleStats {
-                    packets: 0,
-                    bytes: 0,
-                    last_matched: 0,
-                }
+                _ => zero_stats(),
             };
-            
-            
+
             result.push(rule.to_rule_info(stats));
         }
-        
+
         Ok(result)
     }
-    
-    /// 전체 통계 조회
+
+    /// 전체 통계 (stats_map PERCPU_ARRAY key 0 의 CPU별 합산) → (packets, bytes)
     pub fn get_stats(&self) -> Result<(u64, u64)> {
-        let key = 0u32.to_le_bytes();
-        
-//        if let Ok(value) = self.stats_map.lookup(&key, 0) {
-        if let Some(map) = self.stats_map() {
-            if let Ok(Some(value)) = map.lookup(&key, MapFlags::empty()) {
-                if value.len() >= 16 {
-                    // 통계 데이터 파싱
-                    let packets = u64::from_le_bytes([
-                        value[0], value[1], value[2], value[3],
-                        value[4], value[5], value[6], value[7],
-                    ]);
-                
-                    let bytes = u64::from_le_bytes([
-                        value[8], value[9], value[10], value[11],
-                        value[12], value[13], value[14], value[15],
-                    ]);
-                
-                    Ok((packets, bytes))
-                } else {
-                    Ok((0, 0))
-                }
-            } else {
-                Ok((0, 0))
-            }
-        } else {
-            Ok((0, 0))
-        }
-    }
-    
-    /// 프리픽스 키 생성
-    fn create_prefix_key(&self, addr: u32, prefix_len: u32) -> Vec<u8> {
-        let mut key = Vec::with_capacity(8);
-        
-        // 프리픽스 길이 (u32)
-        key.extend_from_slice(&prefix_len.to_le_bytes());
-        
-        // IPv4 주소 (u32)
-        key.extend_from_slice(&addr.to_le_bytes());
-        
-        key
-    }
-    
-    /// 필터 규칙 생성
-    fn create_filter_rule(&self, rule: &FilterRule) -> Result<Vec<u8>> {
-        let mut value = Vec::new();
-        
-        // priority (u32)
-        value.extend_from_slice(&rule.priority.to_le_bytes());
-        
-        // action (u8)
-        value.push(rule.action);
-        
-        // protocol (u8)
-        value.push(rule.protocol);
-        
-        // src_port_min (u16)
-        value.extend_from_slice(&rule.src_port_min.to_le_bytes());
-        
-        // src_port_max (u16)
-        value.extend_from_slice(&rule.src_port_max.to_le_bytes());
-        
-        // dst_port_min (u16)
-        value.extend_from_slice(&rule.dst_port_min.to_le_bytes());
-        
-        // dst_port_max (u16)
-        value.extend_from_slice(&rule.dst_port_max.to_le_bytes());
-        
-        // tcp_flags (u8)
-        value.push(rule.tcp_flags);
-        
-        // redirect_ifindex (u32)
-        value.extend_from_slice(&rule.redirect_ifindex.to_le_bytes());
-        
-        // rate_limit (u32)
-        value.extend_from_slice(&rule.rate_limit.to_le_bytes());
-        
-        // expire (u32)
-        value.extend_from_slice(&rule.expire.to_le_bytes());
-        
-        // label (char[32])
-        let mut label_bytes = [0u8; 32];
-        for (i, b) in rule.label.as_bytes().iter().enumerate() {
-            if i < 31 {
-                label_bytes[i] = *b;
-            }
-        }
-        value.extend_from_slice(&label_bytes);
-        
-        // stats (구조체)
-        value.extend_from_slice(&[0u8; 24]); // packets, bytes, last_matched (u64 * 3)
-        
-        Ok(value)
-    }
-    
-    /// 리디렉션 인터페이스 생성
-    fn create_if_redirect(&self, ifindex: u32, ifname: &str) -> Result<Vec<u8>> {
-        let mut value = Vec::new();
-        
-        // ifindex (u32)
-        value.extend_from_slice(&ifindex.to_le_bytes());
-        
-        // ifname (char[16])
-        let mut ifname_bytes = [0u8; 16];
-        for (i, b) in ifname.as_bytes().iter().enumerate() {
-            if i < 15 {
-                ifname_bytes[i] = *b;
-            }
-        }
-        value.extend_from_slice(&ifname_bytes);
-        
-        Ok(value)
+        let key = 0u32.to_ne_bytes();
+        let per_cpu = self
+            .map(STATS_MAP)?
+            .lookup_percpu(&key, MapFlags::ANY)
+            .context("Failed to read stats_map")?;
+        Ok(per_cpu
+            .map(|v| bpf_layout::sum_percpu_stats(&v))
+            .unwrap_or((0, 0)))
     }
 }

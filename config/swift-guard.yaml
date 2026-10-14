@@ -43,6 +43,9 @@ interfaces:
 
 # Default filter rules
 # These rules are loaded at startup
+# NOTE: this `rules` section is currently NOT loaded by the daemon — add rules with `xdp-filter add-rule`.
+#       Rule constraints: src_ip is required, dst_ip is not supported, one rule per src prefix,
+#       redirect_if must be an existing interface name.
 rules:
   # Example: Block SSH access from external networks
   # - label: "block-external-ssh"
@@ -54,6 +57,7 @@ rules:
   
   # Example: Redirect HTTP traffic to inspection
   # - label: "inspect-http"
+  #   src_ip: "10.0.0.0/8"  # required
   #   dst_port: 80
   #   protocol: "tcp"
   #   action: "redirect"

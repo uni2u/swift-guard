@@ -5,8 +5,12 @@
 use std::mem;
 
 // 호스트 함수 선언
+// 호스트 함수 env.log — import 모듈을 명시해야 한다. 명시하지 않으면 wasm-ld가 같은 이름의
+// libm `log(f64) -> f64`로 링크해 import가 사라지고, 호출 시 `unreachable` trap이 난다.
+#[link(wasm_import_module = "env")]
 extern "C" {
-    fn log(ptr: *const u8, len: i32) -> i32;
+    #[link_name = "log"]
+    fn host_log(ptr: *const u8, len: i32) -> i32;
 }
 
 // 메모리 관리를 위한 전역 할당자
@@ -33,7 +37,7 @@ pub extern "C" fn deallocate(ptr: i32, capacity: i32) {
 // 로그 함수
 fn log_message(message: &str) {
     unsafe {
-        log(message.as_ptr(), message.len() as i32);
+        host_log(message.as_ptr(), message.len() as i32);
     }
 }
 

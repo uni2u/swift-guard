@@ -1,7 +1,7 @@
 // Swift-Guard Common Utilities
 // 공통 유틸리티 함수
 
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::Ipv4Addr;
 use anyhow::{anyhow, Result};
 
 /// 포트 범위 문자열 파싱 (예: "80" 또는 "1024-2048")
@@ -73,7 +73,8 @@ pub fn ipv4_to_string(addr: u32) -> String {
     )
 }
 
-/// IPv4 주소를 네트워크 순서(빅 엔디안) u32로 변환
+/// IPv4 주소를 호스트 정수값(MSB=첫 옥텟, 예: 192.168.1.1 → 0xC0A80101)으로 변환.
+/// 네트워크 오더 바이트가 아니다. BPF 맵 키에 넣을 때는 `to_be_bytes()`(= octets 순서)를 쓴다.
 pub fn ipv4_to_u32(addr: &Ipv4Addr) -> u32 {
     let octets = addr.octets();
     ((octets[0] as u32) << 24) |
@@ -82,7 +83,7 @@ pub fn ipv4_to_u32(addr: &Ipv4Addr) -> u32 {
     (octets[3] as u32)
 }
 
-/// u32 네트워크 순서(빅 엔디안)에서 IPv4 주소로 변환
+/// 호스트 정수값(MSB=첫 옥텟)에서 IPv4 주소로 변환
 pub fn u32_to_ipv4(addr: u32) -> Ipv4Addr {
     Ipv4Addr::new(
         ((addr >> 24) & 0xFF) as u8,

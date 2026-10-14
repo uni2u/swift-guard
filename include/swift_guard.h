@@ -2,6 +2,11 @@
 #ifndef __SWIFT_GUARD_H
 #define __SWIFT_GUARD_H
 
+/* __u8..__u64 정의. 이 헤더가 단독으로 컴파일되도록 직접 include한다.
+ * BPF 프로그램(src/bpf/xdp_filter.c)과 공유하는 유일한 구조체/상수 원천(SSOT)이다.
+ * 맵 값 레이아웃(filter_rule 88B 등)은 Rust src/common/bpf_layout.rs의 offset 상수와 짝을 이룬다. */
+#include <linux/types.h>
+
 /* 상수 정의 */
 #define MAX_FILTER_RULES   10240
 #define MAX_REDIRECT_IFS   64

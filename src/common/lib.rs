@@ -2,6 +2,7 @@
 // 이 모듈은 CLI와 데몬 간의 공유 코드를 포함합니다
 
 pub mod api;
+pub mod bpf_layout;
 pub mod types;
 pub mod utils;
 

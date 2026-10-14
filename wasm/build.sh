@@ -18,7 +18,7 @@ if ! command -v rustc &> /dev/null; then
 fi
 
 # Check if wasm32 target is installed
-if ! rustup target list | grep -q "$WASM_TARGET installed"; then
+if ! rustup target list --installed | grep -qx "$WASM_TARGET"; then
     echo "Installing wasm32 target..."
     rustup target add "$WASM_TARGET"
 fi

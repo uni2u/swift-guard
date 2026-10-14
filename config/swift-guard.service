@@ -5,8 +5,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/swift-guard-daemon
-ExecReload=/bin/kill -HUP $MAINPID
+ExecStart=/usr/local/bin/swift-guard-daemon --bpf-obj /usr/local/lib/swift-guard/xdp_filter.o
 Restart=on-failure
 RestartSec=5s
 Environment="RUST_LOG=info"
@@ -21,7 +20,7 @@ ProtectKernelTunables=true
 ProtectControlGroups=true
 ProtectKernelModules=true
 LockPersonality=true
-MemoryDenyWriteExecute=true
+# MemoryDenyWriteExecute is not set: wasmtime JIT needs W^X-violating mappings
 
 [Install]
 WantedBy=multi-user.target

@@ -16,6 +16,9 @@ members = [
     "src/daemon",
     "src/common",
 ]
+# `cargo build --release` 가 두 바이너리(xdp-filter, swift-guard-daemon)를 계속 만들도록 한다.
+# (루트 [[bin]] 중복 정의는 제거됨 — 각 바이너리는 자기 패키지에서만 빌드된다)
+default-members = [".", "src/cli", "src/daemon", "src/common"]
 
 [dependencies]
 libbpf-rs = "0.19"
@@ -41,17 +44,19 @@ serde_yaml = "0.9"
 name = "swift_guard"
 path = "src/common/lib.rs"
 
-[[bin]]
-name = "xdp-filter"
-path = "src/cli/src/main.rs"
+# 통합 테스트 (root 권한·실제 인터페이스 필요 → #[ignore])
+[[test]]
+name = "test_basic_filtering"
+path = "tests/integration/test_basic_filtering.rs"
 
-[[bin]]
-name = "swift-guard-daemon"
-path = "src/daemon/src/main.rs"
+[[test]]
+name = "test_wasm_integration"
+path = "tests/integration/test_wasm_integration.rs"
 
 [profile.release]
 lto = true
 codegen-units = 1
 opt-level = 3
 strip = true
-panic = "abort"
+# unwind: panic 시에도 daemon 의 DetachGuard(Drop)가 XDP 를 떼도록 한다 (R2-2)
+panic = "unwind"

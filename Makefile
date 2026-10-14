@@ -49,8 +49,13 @@ help:
 	@echo "  sudo make install"
 	@echo "  make clean"
 
-# Build all components
-build: build-bpf build-rust build-wasm
+# Build all components (WASM은 wasm32 타깃이 있을 때만 — 없으면 건너뜀)
+build: build-bpf build-rust
+	@if rustup target list --installed 2>/dev/null | grep -qx wasm32-unknown-unknown; then \
+		$(MAKE) build-wasm; \
+	else \
+		echo "wasm32-unknown-unknown target not installed: skipping WASM modules (optional)."; \
+	fi
 
 # Build BPF/XDP programs
 build-bpf:
@@ -65,7 +70,7 @@ build-rust:
 # Build WASM modules
 build-wasm:
 	@echo "Building WASM modules..."
-	cd $(WASMMODDIR) && ./build.sh
+	cd $(WASMMODDIR) && bash ./build.sh
 
 # Install everything
 install: install-bpf install-bins install-wasm install-conf install-service
@@ -76,26 +81,40 @@ install: install-bpf install-bins install-wasm install-conf install-service
 	@echo "  sudo systemctl enable --now swift-guard"
 	@echo ""
 	@echo "To use the CLI tool, run:"
-	@echo "  xdp-filter help"
+	@echo "  xdp-filter --help"
+
+# 설치 단계는 빌드하지 않는다: `sudo make install`이 root로 cargo/rustup을 실행하면
+# (rustup은 사용자 계정에 설치되므로) 실패한다. 먼저 일반 사용자로 `make build`.
+define require_built
+	@for f in $(1); do \
+		if [ ! -e "$$f" ]; then \
+			echo "ERROR: $$f 가 없습니다. 먼저 일반 사용자로 'make build' 를 실행하세요."; exit 1; \
+		fi; \
+	done
+endef
 
 # Install BPF objects
-install-bpf: build-bpf
+install-bpf:
+	$(call require_built,$(BPF_OBJECTS))
 	@echo "Installing BPF objects to $(LIBDIR)..."
 	install -d $(LIBDIR)
 	install -m 644 $(BPF_OBJECTS) $(LIBDIR)/
 
 # Install binaries
-install-bins: build-rust
+install-bins:
+	$(call require_built,$(BINS))
 	@echo "Installing binaries to $(BINDIR)..."
 	install -d $(BINDIR)
 	install -m 755 $(BINS) $(BINDIR)/
 
-# Install WASM modules
-install-wasm: build-wasm
-	@echo "Installing WASM modules to $(WASMDIR)..."
+# Install WASM modules (선택: 빌드된 .wasm 이 있을 때만)
+install-wasm:
 	install -d $(WASMDIR)
-	if [ -n "$(WASM_MODULES)" ]; then \
+	@if [ -n "$(WASM_MODULES)" ]; then \
+		echo "Installing WASM modules to $(WASMDIR)..."; \
 		install -m 644 $(WASM_MODULES) $(WASMDIR)/; \
+	else \
+		echo "No built WASM modules (optional: 'make build-wasm'), skipping."; \
 	fi
 
 # Install configuration
@@ -112,16 +131,21 @@ install-conf:
 # Install systemd service
 install-service:
 	@echo "Installing systemd service..."
-	install -m 644 $(SYSTEMD_SERVICE) $(SYSTEMDDIR)/swift-guard.service
-	systemctl daemon-reload
+	@if [ -d /run/systemd/system ]; then \
+		install -d $(SYSTEMDDIR); \
+		install -m 644 $(SYSTEMD_SERVICE) $(SYSTEMDDIR)/swift-guard.service; \
+		systemctl daemon-reload; \
+	else \
+		echo "systemd not running (container/WSL?): skipping service install."; \
+	fi
 
 # Uninstall everything
 uninstall:
 	@echo "Uninstalling Swift-Guard..."
-	systemctl stop swift-guard || true
-	systemctl disable swift-guard || true
+	-systemctl stop swift-guard 2>/dev/null
+	-systemctl disable swift-guard 2>/dev/null
 	rm -f $(SYSTEMDDIR)/swift-guard.service
-	systemctl daemon-reload
+	-systemctl daemon-reload 2>/dev/null
 	rm -f $(BINDIR)/xdp-filter
 	rm -f $(BINDIR)/swift-guard-daemon
 	rm -rf $(LIBDIR)

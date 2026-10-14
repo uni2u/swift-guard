@@ -61,7 +61,7 @@ all: $(BPF_OBJECTS)
 %.o: %.c
 #	$(CLANG) $(BPF_CFLAGS) -D__KERNEL__ -D__ASM_SYSREG_H -Wno-unused-value -Wno-pointer-sign -Wno-compare-distinct-pointer-types -Wno-gnu-variable-sized-type-not-at-end -Wno-address-of-packed-member -Wno-tautological-compare -Wno-unknown-warning-option -c $< -o $@
 #	@echo "BPF program $@ compiled successfully"
-	$(CLANG) $(BPF_CFLAGS) -Wno-unused-value -Wno-pointer-sign -Wno-compare-distinct-pointer-types -Wno-gnu-variable-sized-type-not-at-end -Wno-address-of-packed-member -Wno-tautological-compare -Wno-unknown-warning-option -c $< -o $@
+	$(CLANG) $(CFLAGS) $(BPF_CFLAGS) -Wno-unused-value -Wno-pointer-sign -Wno-compare-distinct-pointer-types -Wno-gnu-variable-sized-type-not-at-end -Wno-address-of-packed-member -Wno-tautological-compare -Wno-unknown-warning-option -c $< -o $@
 	@echo "BPF program $@ compiled successfully"
 
 # 설치 규칙
