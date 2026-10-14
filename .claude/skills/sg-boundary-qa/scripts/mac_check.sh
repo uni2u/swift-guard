@@ -11,7 +11,7 @@ set -uo pipefail
 
 ROOT="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
 S="$(cd "$(dirname "$0")" && pwd)"
-cd "$ROOT"
+cd "$ROOT" || exit 2
 FAIL=0
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 step() { printf '\n== %s ==\n' "$1"; }
@@ -39,7 +39,7 @@ fi
 
 step "Struct layout: header ↔ xdp_filter.c"
 STRUCTS="filter_rule prefix_key if_redirect filter_stats"
-DUP=0; for st in $STRUCTS; do grep -qE "struct[[:space:]]+$st[[:space:]]*\{" src/bpf/xdp_filter.c && DUP=1; done
+DUP=0; for st in $STRUCTS; do grep -qE "struct[[:space:]]+${st}[[:space:]]*\{" src/bpf/xdp_filter.c && DUP=1; done
 if grep -qE '#include[[:space:]]+["<](\.\./\.\./include/)?swift_guard\.h[">]' src/bpf/xdp_filter.c && [ $DUP -eq 0 ]; then
   if python3 "$S/struct_layout.py" include/swift_guard.h $STRUCTS >"$TMP/h.json" 2>"$TMP/h.err"; then
     python3 - "$TMP/h.json" <<'PY2'

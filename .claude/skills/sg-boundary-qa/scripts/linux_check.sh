@@ -3,7 +3,8 @@
 # macOS에서는 libbpf-sys가 빌드되지 않으므로 daemon 크레이트 검증은 이 스크립트로만 가능하다.
 # XDP 실제 로드/트래픽 테스트는 하지 않는다(물리 NIC/권한 필요 → 사용자 Linux 장비에서 수행).
 #
-# 사용법: linux_check.sh [bpf|cargo|test|all|e2e|examples]   (기본: all)
+# 사용법: linux_check.sh [bpf|cargo|test|all|e2e|examples|bench]   (기본: all)
+#   bench: --privileged 컨테이너에서 tools/test/bench_flow_check.sh (Tier 3 스크립트 흐름: daemon→attach→lab 트래픽→stats CSV→요약→분석 그래프→정리). 수치는 의미 없음.
 #   examples: --privileged 컨테이너에서 tools/test/examples.sh (docs/examples.md 예제 회귀 검증).
 #   e2e: --privileged 컨테이너에서 release 빌드 후 tools/test/e2e_check.sh 실행(veth+netns+generic XDP).
 #        x86_64 Docker Desktop(커널 7.x linuxkit)에서 BPF 로드/attach 동작 확인됨. 커널이 bpf()를 막으면 e2e_check가 실패로 알린다.
@@ -13,6 +14,7 @@
 set -euo pipefail
 
 MODE="${1:-all}"
+case "$MODE" in bpf|cargo|test|all|e2e|examples|bench) ;; *) echo "unknown mode: '$MODE' (bpf|cargo|test|all|e2e|examples|bench). 옵션은 별도 인자로: linux_check.sh examples -v" >&2; exit 2 ;; esac
 ROOT="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
 IMAGE="${SG_RUST_IMAGE:-rust:1.83-bookworm}"
 PLATFORM="${SG_PLATFORM:-linux/amd64}"
@@ -24,12 +26,12 @@ fi
 
 # 툴체인을 미리 설치한 로컬 이미지를 1회 빌드해 재사용한다.
 # (실행마다 apt를 돌리면 동시 실행 시 공유 apt 캐시 lock 충돌(rc=100)이 난다)
-LOCAL_IMAGE="sg-linux-check-v3:$(echo "$IMAGE" | tr ':/' '--')-$(echo "$PLATFORM" | tr '/' '-')"
+LOCAL_IMAGE="sg-linux-check-v4:$(echo "$IMAGE" | tr ':/' '--')-$(echo "$PLATFORM" | tr '/' '-')"
 if ! docker image inspect "$LOCAL_IMAGE" >/dev/null 2>&1; then
   echo "== building $LOCAL_IMAGE (one-time) =="
   docker build -q --platform "$PLATFORM" -t "$LOCAL_IMAGE" - <<EOF >/dev/null
 FROM $IMAGE
-RUN apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq clang llvm libelf-dev libbpf-dev linux-libc-dev zlib1g-dev pkg-config make iproute2 iputils-ping bpftool procps curl python3 >/dev/null && rm -rf /var/lib/apt/lists/*
+RUN apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq clang llvm libelf-dev libbpf-dev linux-libc-dev zlib1g-dev pkg-config make iproute2 iputils-ping bpftool procps curl python3 python3-matplotlib >/dev/null && rm -rf /var/lib/apt/lists/*
 EOF
 fi
 
@@ -61,8 +63,8 @@ case "$MODE" in test|all)
 esac
 EOS
 
-if [ "$MODE" = e2e ] || [ "$MODE" = examples ]; then
-  SCRIPT=tools/test/e2e_check.sh; [ "$MODE" = examples ] && SCRIPT=tools/test/examples.sh
+if [ "$MODE" = e2e ] || [ "$MODE" = examples ] || [ "$MODE" = bench ]; then
+  SCRIPT=tools/test/e2e_check.sh; [ "$MODE" = examples ] && SCRIPT=tools/test/examples.sh; [ "$MODE" = bench ] && SCRIPT=tools/test/bench_flow_check.sh
   # 저장소를 쓰기 가능하게 마운트하지 않는다: 작업 트리를 컨테이너 내부로 복사해 빌드/실행.
   docker run --rm --privileged --platform "$PLATFORM" \
     -v "$ROOT":/src:ro \

@@ -30,7 +30,7 @@ grep -E "skipping|Installation complete|No built WASM" /tmp/install.log
 step "5-1"
 xdp-filter --version || fail version; xdp-filter --help | head -4; swift-guard-daemon --help | head -3
 step "5-2 e2e"
-sudo tools/test/e2e_check.sh 2>&1 | grep -E "^\[FAIL|e2e_check:|RESULT" ; sudo tools/test/e2e_check.sh >/dev/null 2>&1 || fail "e2e_check"
+sudo tools/test/e2e_check.sh > /tmp/e2e.out 2>&1; rc=$?; grep -E "^\[FAIL|^\[SKIP|e2e_check:|RESULT" /tmp/e2e.out; [ $rc -eq 0 ] || fail "e2e_check"
 step "6 tutorial"
 sudo tools/test/lab.sh up || fail "lab up"
 sudo swift-guard-daemon --bpf-obj /usr/local/lib/swift-guard/xdp_filter.o >/tmp/d.log 2>&1 &
@@ -44,8 +44,35 @@ xdp-filter add-rule --src-ip 10.200.0.2 --action drop --label my-first-rule || f
 xdp-filter list-rules --stats
 xdp-filter delete-rule --label my-first-rule || fail del
 [ "$(sudo tools/test/lab.sh ping 10.200.0.2)" = OK ] || fail "restored"
+step "6 tutorial step 7 (dst rule)"
+xdp-filter add-rule --dst-ip 10.200.0.11 --protocol tcp --dst-port 8080 --action drop --label protect-web2 || fail "dst add"
+[ "$(sudo tools/test/lab.sh --to 10.200.0.11 http 10.200.0.2)" = BLOCKED ] || fail "dst blocked .2"
+[ "$(sudo tools/test/lab.sh --to 10.200.0.11 http 10.200.0.3)" = BLOCKED ] || fail "dst blocked .3"
+[ "$(sudo tools/test/lab.sh http 10.200.0.2)" = OK ] || fail "other server ok"
+xdp-filter delete-rule --label protect-web2 || fail "dst del"
 xdp-filter detach sg-lab0 || fail detach
-sudo pkill -INT -f swift-guard-daemon; sleep 1
+sudo kill -INT $(pidof swift-guard-daemon) || fail "kill via pidof"; sleep 1
+pidof swift-guard-daemon && fail "daemon still running"
+step "0/7-1 background run + rules.sh (10장)"
+sudo swift-guard-daemon --bpf-obj /usr/local/lib/swift-guard/xdp_filter.o > /tmp/swift-guard.log 2>&1 &
+pidof swift-guard-daemon >/dev/null || sleep 1
+sudo mkdir -p /etc/swift-guard
+sudo tee /etc/swift-guard/rules.sh >/dev/null <<'RULES'
+#!/bin/bash
+# daemon이 응답할 때까지 최대 10초 기다린 뒤 룰을 넣는다
+XF=/usr/local/bin/xdp-filter
+for i in $(seq 1 50); do $XF list-rules >/dev/null 2>&1 && break; sleep 0.2; done
+
+$XF add-rule --src-ip 203.0.113.0/24 --action drop --label block-bad-net
+$XF add-rule --dst-ip 192.0.2.80 --protocol tcp --dst-port 22 --action drop --label guard-ssh
+exit 0
+RULES
+sudo chmod +x /etc/swift-guard/rules.sh
+sudo /etc/swift-guard/rules.sh || fail "rules.sh"
+xdp-filter list-rules | tee /tmp/rules.out
+grep -q block-bad-net /tmp/rules.out && grep -q guard-ssh /tmp/rules.out || fail "rules not applied"
+sudo /etc/swift-guard/rules.sh >/dev/null 2>&1 || fail "rules.sh rerun must exit 0 even with duplicates"
+sudo kill -INT $(pidof swift-guard-daemon); sleep 1
 sudo tools/test/lab.sh down
 step "4-5 wasm + reinstall"
 rustup target add wasm32-unknown-unknown >/dev/null 2>&1 || fail "rustup target"

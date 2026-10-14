@@ -19,14 +19,16 @@ description: Swift-Guard 경계면 교차 검증 체크리스트와 스크립트
 | `mac_check.sh` | common/cli 빌드·테스트 + API drift + header↔bpf 레이아웃 + WASM 빌드 일괄 | 0 PASS / 1 FAIL |
 | `struct_layout.py <file> <struct>...` | C 구조체 offset/size JSON (macOS에서 동작) | |
 | `api_drift.py <a.rs> <b.rs>` | 두 파일의 동명 serde 타입 변형/필드 비교 | 0 일치 / 1 drift |
-| `linux_check.sh [bpf\|cargo\|test\|all]` | Docker로 BPF 컴파일 + daemon 포함 cargo check/test | 3 = docker 없음(SKIP) |
+| `linux_check.sh [bpf\|cargo\|test\|all]` | Docker로 BPF 컴파일 + daemon 포함 cargo check/test | 0 PASS / 1 FAIL / 2 알 수 없는 모드(옵션은 별도 인자: `examples -v`) / 3 docker 없음(SKIP) |
+| `linux_check.sh bench` | privileged Docker에서 `tools/test/bench_flow_check.sh` — Tier 3 스크립트 흐름(daemon 기동→attach→lab 트래픽→`stats --format csv`→요약 CSV→분석기→정리). 수치는 의미 없음. `tools/bench`, `tools/analysis`, `xdp-filter stats` 변경 시 실행 | 0 / 1 / 3 |
+| `systemd_check.sh` | systemd를 init으로 띄운 Ubuntu 24.04 컨테이너에서 README 10장(설치→enable→override `-i`+`ExecStartPost`→stop 시 detach→재시작 시 룰 재적용→uninstall)을 실행. rules.sh·override는 **README 본문에서 추출**하므로 문서와 동작이 함께 검증된다. README 10장/service/Makefile 변경 시 실행 | 0 / 1 / 3 |
 | `readme_check.sh [22.04 24.04]` | 깨끗한 Ubuntu에서 일반 사용자로 README 4~6장·WASM·예시 회귀·제거를 그대로 실행(초급자 경로). README의 설치/사용 명령이나 Makefile을 바꾸면 실행. README와 `readme_sim_inner.sh`의 단계는 함께 갱신 | 0 / 1 / 3 |
 | `linux_check.sh examples [-v]` | privileged Docker에서 `tools/test/examples.sh` — `docs/examples.md` 예시가 문서대로 동작하는지(CLI 출력·에러 문구 포함). CLI/룰 의미/에러 메시지를 바꾸면 실행하고, 출력이 바뀌면 문서도 갱신 | 0 / 1 / 3 |
 | `linux_check.sh e2e [--with-ignored]` | privileged Docker에서 `tools/test/e2e_check.sh`(Tier 2: veth+generic XDP, verifier·attach·매치·통계·SIGTERM) | 0 PASS / 1 FAIL / 3 docker 없음 |
 
 먼저 `mac_check.sh`를 실행하고, Docker가 켜져 있으면 `linux_check.sh all` → `linux_check.sh e2e` 순으로 실행한다. 검증 단계(Tier 1 빌드 / Tier 2 커널 E2E / Tier 3 성능) 정의는 `docs/linux-verification.md`.
 - macOS에서는 daemon 크레이트와 **루트 패키지 `swift-guard`**(README/Makefile의 `cargo build --release` 대상, libbpf-rs 의존)를 컴파일할 수 없다 → 체크리스트 E로 보완하고 "미검증"으로 남긴다.
-- `linux_check.sh all`은 Tier 1만 검증한다. Tier 2는 `linux_check.sh e2e`로 검증한다(x86_64 Docker Desktop 커널 7.x에서 BPF 로드·generic XDP 동작 확인됨. arm64 컨테이너나 bpf()를 막는 커널이면 e2e가 daemon 기동에서 FAIL — 그때는 "미검증"으로 보고하고 Linux VM 사용을 안내). driver 모드·성능(Tier 3)은 항상 "미검증"이다.
+- `linux_check.sh all`은 Tier 1만 검증한다. Tier 2는 `linux_check.sh e2e`로 검증한다(x86_64 Docker Desktop 커널 7.x에서 BPF 로드·generic XDP 동작 확인됨. arm64 컨테이너나 bpf()를 막는 커널이면 e2e가 daemon 기동에서 FAIL — 그때는 "미검증"으로 보고하고 Linux VM 사용을 안내). driver 모드와 성능 **수치**(Tier 3)는 항상 "미검증"이다(스크립트 흐름은 `linux_check.sh bench`로 검증).
 - 스크립트 출력이 PASS여도 스크립트 자체가 조용히 실패했을 수 있다. 의심스러우면 해당 단계를 단독 실행해 종료 코드를 확인한다.
 
 ## 체크리스트
@@ -64,6 +66,7 @@ description: Swift-Guard 경계면 교차 검증 체크리스트와 스크립트
 ### D. 문서·스크립트 ↔ CLI
 1. README, `tools/bench/*.sh`, `docs/poc-plan.md`에 나오는 `xdp-filter` 서브커맨드/옵션이 `cli/src/main.rs`의 clap 정의에 존재하는가. 이번 변경으로 CLI가 바뀌었다면 문서 갱신 여부.
 2. `config/swift-guard.yaml` 키 ↔ `daemon/src/config.rs` serde 구조체.
+4. 벤치 CSV 계약: `xdp-filter stats --format csv` 헤더 ↔ `tools/bench/*` 파싱 ↔ 요약 CSV 헤더 ↔ `tools/analysis/analyze_performance.py`가 읽는 열 ↔ 문서(poc-plan, README 13장)에 적힌 열 이름을 대조한다.
 3. README 설치 절차 재현: 빌드 의존성이나 README/Makefile이 바뀌었으면 `readme_check.sh`를 돌린다(깨끗한 Ubuntu + 일반 사용자 + README 명령 그대로). `linux_check.sh`는 자체 의존성을 설치하므로 README 누락을 잡지 못한다. 복사는 `git clone`이 아니라 작업 트리 기준으로 한다(clone은 커밋된 코드만 가져온다).
 
 ### E. 외부 라이브러리 API 계약 (daemon을 macOS에서 컴파일할 수 없으므로)
