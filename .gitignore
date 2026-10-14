@@ -1,2 +1,5 @@
 target/
 
+_workspace/
+_workspace_prev/
+.claude/settings.local.json
