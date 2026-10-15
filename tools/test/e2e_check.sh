@@ -8,7 +8,7 @@
 # 검증 항목: verifier 로드, attach/detach, drop/count/redirect 매치, CIDR(LPM 바이트 오더),
 #           목적지 룰(dst_rules: drop/count/redirect, 출발지 룰 우선, 조건 불일치 시 넘어감, 맵별 중복),
 #           룰별·전역 통계, XDP 전체/결과별 카운터(xdp_stats_map → stats --format csv의 xdp_* 열),
-#           L4 파서(IP 옵션·조각·tiny fragment·비정상 IHL: PROG_TEST_RUN 17케이스 + generic XDP live 송신),
+#           L4 파서(IP 옵션·조각·tiny fragment·비정상 IHL: PROG_TEST_RUN 20케이스 + generic XDP live 송신),
 #           입력 거부(에러 응답·문구, 미구현 옵션 priority/rate-limit/expire/pkt-len), 카운터 불변식,
 #           WASM 모듈 관리(빌드돼 있으면), SIGTERM 정리,
 #           API 접근 제어(테스트 전용 Unix 소켓 0660 root:<임시 그룹>, 비멤버 거부·멤버 허용, 감사 로그),
@@ -20,9 +20,13 @@
 #      useradd/groupadd/runuser가 없으면 접근 제어 단계만 SKIP한다.
 # 요구: Linux 커널 5.15+ (Docker Desktop/macOS 불가 — bpf() 미지원), root, iproute2, ping.
 #       Linux VM(Lima/UTM/Multipass), 클라우드 VM, Linux 호스트 모두 가능.
-#       python3·bpftool이 없으면 파서 단계(9·10)만 SKIP한다(FAIL 아님). 패킷은 tools/test/sg_pkt.py가 만든다.
+#       bpftool이 없으면 1·9단계, python3이 없으면 9·10단계를 SKIP한다(FAIL 아님). 패킷은 tools/test/sg_pkt.py가 만든다.
+# 바이너리 위치: 설치본(/usr/local/bin/xdp-filter, /usr/local/lib/swift-guard/xdp_filter.o)이 있으면 그것을,
+#   없으면 저장소 빌드본(target/release, src/bpf/xdp_filter.o)을 쓴다(examples.sh와 같은 규칙).
+#   SG_BIN_DIR, SG_BPF_OBJ 환경변수로 덮어쓸 수 있다. --build를 주면 기본값이 저장소 빌드본이 된다.
+#   검사 대상 경로는 Preflight에서 출력한다.
 # 사용법: sudo tools/test/e2e_check.sh [--build] [--with-ignored] [--keep]
-#   --build         실행 전 make -C src/bpf && cargo build --release
+#   --build         실행 전 make -C src/bpf && cargo build --release, 그 빌드본을 검사
 #   --with-ignored  마지막에 cargo test -- --ignored (root 통합 테스트) 실행
 #   --keep          실패해도 정리하지 않고 남김 (디버깅용)
 # 종료 코드: 0 = 전부 PASS, 1 = FAIL 있음, 2 = 실행 환경 부적합
@@ -32,7 +36,7 @@ BUILD=0; WITH_IGNORED=0; KEEP=0
 for a in "$@"; do
   case "$a" in
     --build) BUILD=1 ;; --with-ignored) WITH_IGNORED=1 ;; --keep) KEEP=1 ;;
-    -h|--help) sed -n '2,29p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,32p' "$0"; exit 0 ;;
     *) echo "unknown option: $a" >&2; exit 2 ;;
   esac
 done
@@ -47,9 +51,19 @@ API_GROUP=sg-e2e-api; U_IN=sg-e2e-in; U_OUT=sg-e2e-out
 TCP_API=tcp:127.0.0.1:17654
 HAVE_USERS=0
 AUX_PIDS=""
-DAEMON="$ROOT/target/release/swift-guard-daemon"
-CLI="$ROOT/target/release/xdp-filter"
-BPF_OBJ="$ROOT/src/bpf/xdp_filter.o"
+# 바이너리 선택: 환경변수 > (--build면 저장소 빌드본) > 설치본 > 저장소 빌드본
+BIN_SRC="SG_BIN_DIR"; OBJ_SRC="SG_BPF_OBJ"
+if [ -z "${SG_BIN_DIR:-}" ]; then
+  if [ $BUILD -eq 0 ] && [ -x /usr/local/bin/xdp-filter ]; then SG_BIN_DIR=/usr/local/bin; BIN_SRC=installed
+  else SG_BIN_DIR="$ROOT/target/release"; BIN_SRC="repo build"; fi
+fi
+if [ -z "${SG_BPF_OBJ:-}" ]; then
+  if [ $BUILD -eq 0 ] && [ -f /usr/local/lib/swift-guard/xdp_filter.o ]; then SG_BPF_OBJ=/usr/local/lib/swift-guard/xdp_filter.o; OBJ_SRC=installed
+  else SG_BPF_OBJ="$ROOT/src/bpf/xdp_filter.o"; OBJ_SRC="repo build"; fi
+fi
+DAEMON="$SG_BIN_DIR/swift-guard-daemon"
+CLI="$SG_BIN_DIR/xdp-filter"
+BPF_OBJ="$SG_BPF_OBJ"
 SG_PKT="$ROOT/tools/test/sg_pkt.py"
 HAVE_PY=0; HAVE_BPFTOOL=0
 TMP="$(mktemp -d /tmp/sg-e2e.XXXXXX)"
@@ -144,7 +158,9 @@ if [ $BUILD -eq 1 ]; then
   if [ -n "$SUDO_U" ]; then sudo -u "$SUDO_U" -H bash -lc "cd '$ROOT' && cargo build --release -q" || die "cargo build 실패"
   else cargo build --release -q || die "cargo build 실패"; fi
 fi
-for f in "$DAEMON" "$CLI" "$BPF_OBJ"; do [ -e "$f" ] || die "$f 없음 → --build 로 실행하거나 먼저 빌드"; done
+echo "binaries ($BIN_SRC): $CLI, $DAEMON"
+echo "bpf object ($OBJ_SRC): $BPF_OBJ"
+for f in "$DAEMON" "$CLI" "$BPF_OBJ"; do [ -e "$f" ] || die "$f 없음 → --build 로 실행하거나 먼저 빌드(또는 설치)"; done
 # 이전 실행 잔여물 제거
 ip netns del "$NS" 2>/dev/null; ip link del "$DUT" 2>/dev/null; ip link del "$RD0" 2>/dev/null
 # 테스트 전용 API 소켓 디렉토리 (0755: 비멤버도 디렉토리는 통과하고 소켓 권한에서 막혀야 한다)
@@ -528,7 +544,9 @@ kill -0 "$DAEMON_PID" 2>/dev/null && ok "daemon alive after rejected requests" |
 
 # ---------------------------------------------------------------- wasm
 step "12. WASM module management"
+# 저장소 빌드본(wasm/build.sh 결과)을 먼저, 없으면 설치본(make install)을 쓴다
 WASM="$ROOT/wasm/modules/http_inspector.wasm"
+[ -f "$WASM" ] || [ ! -f /usr/local/lib/swift-guard/wasm/http_inspector.wasm ] || WASM=/usr/local/lib/swift-guard/wasm/http_inspector.wasm
 if [ -f "$WASM" ]; then
   c wasm load --name e2e-http --file "$WASM" >/dev/null && ok "wasm load" || bad "wasm load"
   c wasm list 2>/dev/null | grep -q e2e-http && ok "wasm list shows module" || bad "wasm list"

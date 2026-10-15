@@ -13,7 +13,7 @@ Swift-Guard 검증은 세 단계(Tier)로 나뉜다. 단계마다 필요한 환�
 ## Tier 1 — 빌드·단위 테스트
 
 ```bash
-sudo apt install -y clang llvm libelf-dev libbpf-dev build-essential pkg-config linux-headers-$(uname -r)
+sudo apt install -y clang llvm libelf-dev libbpf-dev zlib1g-dev build-essential pkg-config
 make -C src/bpf                     # xdp_filter.o. .BTF 섹션이 있어야 libbpf가 맵을 연다
 cargo build --release               # xdp-filter, swift-guard-daemon
 cargo test --workspace              # 단위 테스트 (common 바이트 레이아웃, daemon 서버·WASM 등)
@@ -33,11 +33,15 @@ cargo test --workspace              # 단위 테스트 (common 바이트 레이�
 
 ### 실행
 ```bash
-sudo apt install -y iproute2 iputils-ping python3 bpftool   # python3·bpftool은 선택(없으면 파서 단계 9·10만 SKIP)
+sudo apt install -y iproute2 iputils-ping python3          # python3은 선택(없으면 파서 단계 9·10 SKIP)
+sudo apt install -y linux-tools-common linux-tools-$(uname -r)   # bpftool (선택. 없으면 1·9단계 SKIP)
+# Ubuntu에는 `bpftool` 패키지가 없다(Debian에는 있다: sudo apt install -y bpftool).
+# 실행 중인 커널용 linux-tools 패키지가 없다는 오류가 나오면(클라우드·커스텀 커널, 컨테이너) 이 줄은 건너뛰어도 된다.
 # useradd/groupadd/runuser(passwd, util-linux — Ubuntu·Debian 기본 포함)가 없으면 접근 제어 단계 3b만 SKIP
-sudo tools/test/e2e_check.sh --build                 # 빌드부터 E2E까지 한 번에
+sudo tools/test/e2e_check.sh --build                 # 빌드부터 E2E까지 한 번에 (방금 빌드한 저장소 빌드본을 검사)
 # 옵션: --with-ignored (cargo test -- --ignored 실행), --keep (실패 시 토폴로지·로그 보존)
 ```
+`--build` 없이 실행하면 설치본(`/usr/local/bin/xdp-filter`, `/usr/local/lib/swift-guard/xdp_filter.o`)이 있으면 그것을, 없으면 저장소 빌드본(`target/release/`, `src/bpf/xdp_filter.o`)을 검사한다(`examples.sh`와 같은 규칙). `SG_BIN_DIR`·`SG_BPF_OBJ` 환경변수로 덮어쓸 수 있고, 검사 대상은 Preflight 출력의 `binaries (…)`·`bpf object (…)` 줄에 나온다.
 
 ### 토폴로지
 스크립트가 만들고, 끝나면 지운다.
@@ -129,7 +133,12 @@ ls /run/swift-guard/api.sock             # 없어야 한다 (정상 종료 시 d
 - `cargo test -- --ignored`의 기존 통합 테스트(`tests/integration/`)는 `sudo`와 `target/debug/` 바이너리를 하드코딩하고 기본 소켓 `/run/swift-guard/api.sock`을 쓴다(e2e_check의 테스트 소켓이 아니다). 그래서 root 셸이나 컨테이너에서는 실패한다. 같은 범위를 `e2e_check.sh`가 더 넓게 검증한다.
 - generic 모드만 검증한다. driver 모드와 offload 모드는 NIC 드라이버가 지원해야 하므로 Tier 3에서 확인한다.
 - verifier 통과는 이 환경의 커널에서만 확인된다. L4 위치가 IHL에 따라 바뀌는 가변 오프셋 접근은 커널 버전마다 verifier 반응이 다를 수 있으므로, 운영 커널(예: 5.15, 6.8)에서 한 번 로드해 본다: `make -C src/bpf && sudo bpftool prog load src/bpf/xdp_filter.o /sys/fs/bpf/sgtest && sudo rm /sys/fs/bpf/sgtest`. BPF는 `-mcpu=v3`(JMP32·ALU32·atomics fetch/cmpxchg, 5.15에서 모두 지원)로 빌드되므로 코드 생성이 v1/v2와 다르다. Docker 컨테이너는 호스트 커널(Docker Desktop은 7.x)을 쓰므로 5.15 verifier를 대신할 수 없다.
-- **사용자 장비 절차 — Ubuntu 22.04 GA 커널(5.15) VM에서 verifier 로드.** 예: `multipass launch 22.04` 후 `uname -r`이 `5.15.*`인지(HWE 커널이 아닌지) 확인하고, 위 `bpftool prog load` 명령과 `sudo tools/test/e2e_check.sh --build`를 실행한다. 이어서 일반 사용자로 `xdp-filter list-rules`가 `permission denied` 안내로 거부되는지, `sudo usermod -aG swift-guard $USER` 후 다시 로그인하면 성공하는지 확인한다.
+- **사용자 장비 절차 — Ubuntu 22.04 GA 커널(5.15) VM에서 verifier 로드.** 예: `multipass launch 22.04` 후 `uname -r`이 `5.15.*`인지(HWE 커널이 아닌지) 확인하고, 위 `bpftool prog load` 명령과 `sudo tools/test/e2e_check.sh --build`를 실행한다. 이어서 소켓 권한을 확인한다(e2e_check는 테스트 전용 소켓을 쓰고 끝나면 daemon을 내리므로 따로 띄운다).
+  1. `make build && sudo make install` — `swift-guard` 그룹과 `/usr/local/bin/xdp-filter`를 만든다.
+  2. `sudo -v` 후 `sudo swift-guard-daemon --bpf-obj /usr/local/lib/swift-guard/xdp_filter.o > /tmp/swift-guard.log 2>&1 &`(또는 `sudo systemctl start swift-guard`) — 기본 소켓 `/run/swift-guard/api.sock`으로 띄운다.
+  3. 일반 사용자로 `xdp-filter list-rules` → `permission denied` 안내로 거부되는지 확인한다.
+  4. `sudo usermod -aG swift-guard $USER` 후 다시 로그인하고 `xdp-filter list-rules`가 성공하는지 확인한다.
+  5. `sudo kill -INT $(pidof swift-guard-daemon)`(또는 `sudo systemctl stop swift-guard`)로 정리한다.
 - daemon이 `SIGKILL`로 죽으면 XDP가 붙은 채 남는다. `sudo ip link set dev <if> xdp off`(또는 `xdpgeneric off`)로 직접 해제한다.
 
 ### 사용 예시 회귀

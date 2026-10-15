@@ -2,7 +2,7 @@
 
 설치한 뒤 동작을 확인하기 위한 예시 모음이다. 물리 NIC 없이 **가상 실습 랩**(veth + network namespace)에서 바로 따라 할 수 있다. 각 예시는 "룰 추가 → 트래픽으로 확인 → 룰 삭제" 순서로 독립적이다.
 
-> 이 문서의 모든 예시와 출력은 `sudo tools/test/examples.sh -v`로 자동 검증된다. 결과가 이 문서와 다르면 버그다.
+> 1–3절(랩·daemon 시작·연결, 정리)과 예시 1–12의 결과와 CLI 출력(통계 수치·시각 제외)은 `sudo tools/test/examples.sh -v`로 자동 검증된다. 결과가 이 문서와 다르면 버그다. 0절(설치 확인), 4절(실제 인터페이스), 5절(systemd)은 이 스크립트가 실행하지 않는다.
 
 ## 목차
 - [0. 설치 확인](#0-설치-확인)
@@ -33,7 +33,7 @@
 
 ```bash
 which xdp-filter swift-guard-daemon        # /usr/local/bin/...
-ls /usr/local/lib/swift-guard/             # xdp_filter.o (+ wasm/)
+ls /usr/local/lib/swift-guard/             # xdp_filter.o, wasm/ (모듈을 빌드했다면 그 안에 .wasm)
 xdp-filter --version
 xdp-filter --help                           # attach, detach, add-rule, delete-rule, list-rules, stats, wasm
 uname -r                                    # 5.15 이상 (Ubuntu 22.04 기본 커널)
@@ -79,7 +79,8 @@ alias xf='sudo xdp-filter'
 ## 2. daemon 시작과 XDP 연결
 
 ```bash
-sudo swift-guard-daemon --bpf-obj /usr/local/lib/swift-guard/xdp_filter.o &
+sudo -v                                  # sudo 암호를 먼저 입력 (백그라운드 daemon이 암호 프롬프트로 멈추지 않게)
+sudo swift-guard-daemon --bpf-obj /usr/local/lib/swift-guard/xdp_filter.o > /tmp/swift-guard.log 2>&1 &
 xf attach sg-lab0 --mode generic
 ```
 ```
@@ -303,8 +304,8 @@ daemon은 잘못된 룰을 받으면 에러로 응답한다. CLI 종료 코드�
 ## 예시 10. WASM 검사 모듈 관리
 
 ```bash
-(cd wasm && ./build.sh)          # 필요: rustup target add wasm32-unknown-unknown
-xf wasm load --name http-inspector --file /usr/local/lib/swift-guard/wasm/http_inspector.wasm
+(cd wasm && ./build.sh)          # 필요: rustup target add wasm32-unknown-unknown. 결과: wasm/modules/http_inspector.wasm
+xf wasm load --name http-inspector --file wasm/modules/http_inspector.wasm
 xf wasm list
 xf wasm stats --name http-inspector
 xf wasm unload --name http-inspector
@@ -326,7 +327,7 @@ Module unloaded: WASM module 'http-inspector' unloaded
 - 현재 버전은 모듈 관리(load/list/stats/unload)만 한다. XDP에서 WASM으로 패킷을 넘기는 데이터 경로는 아직 연결되지 않았으므로, `Processed packets`는 0으로 남는다.
 - 신뢰할 수 있는 모듈만 로드한다. 패킷 검사 호출에는 실행 시간 제한(기본 10ms), 모듈 메모리에는 상한(기본 32MB)이 있다. 두 값은 설정 파일의 `wasm.execution_timeout_ms`, `wasm.memory_limit_mb`로 바꿀 수 있다. `init`의 시간 제한은 1초로 고정이고, 모듈 컴파일 자체에는 시간 제한이 없다.
 - daemon을 시작할 때 모듈을 자동으로 올리려면 설정 파일에서 `wasm.auto_load: true`와 `wasm.auto_load_modules`를 쓴다. 로드에 실패해도 daemon은 에러를 로그에 남기고 계속 동작한다.
-- 저장소 빌드본은 `wasm/modules/http_inspector.wasm`에 있다.
+- `build.sh`는 저장소 안(`wasm/modules/`)에만 결과를 쓴다. 그래서 위 예시는 저장소 경로를 쓴다(저장소 루트에서 실행. 상대 경로는 CLI가 절대 경로로 바꿔 daemon에 보낸다). 설치 경로 `/usr/local/lib/swift-guard/wasm/http_inspector.wasm`은 `sudo make install`을 할 때 모듈이 빌드돼 있었던 경우에만 있다. 설치 뒤에 빌드했다면 `sudo make install`을 다시 실행한 다음 `--file /usr/local/lib/swift-guard/wasm/http_inspector.wasm`을 쓸 수 있다.
 
 ## 예시 11. 목적지(서버 IP) 기준 차단
 
@@ -402,7 +403,8 @@ lab down
 ## 4. 실제 인터페이스에 적용할 때
 
 ```bash
-sudo swift-guard-daemon --bpf-obj /usr/local/lib/swift-guard/xdp_filter.o &
+sudo -v                                  # sudo 암호를 먼저 입력
+sudo swift-guard-daemon --bpf-obj /usr/local/lib/swift-guard/xdp_filter.o > /tmp/swift-guard.log 2>&1 &
 xf attach eth0 --mode driver            # 드라이버가 지원하지 않으면 --mode generic
 xf add-rule --src-ip 203.0.113.0/24 --action drop --label block-bad-net
 ```
@@ -432,7 +434,7 @@ sudo systemctl stop swift-guard           # SIGTERM → XDP 자동 해제
 | 매칭 키 | 출발지 IP prefix(`--src-ip`) 또는 목적지 IP prefix(`--dst-ip`) 중 **정확히 하나** |
 | 평가 순서 | 출발지 룰 → (없거나 조건 불일치면) 목적지 룰 → 둘 다 아니면 통과 |
 | prefix 우선순위 | 각 맵(출발지·목적지) 안에서 가장 긴 prefix가 이긴다(/32 > /24 > /8) |
-| prefix당 룰 1개 | 출발지·목적지 맵별로 prefix당 1개. 같은 맵에 두 번째 룰을 넣으면 거부된다. label은 전체에서 유일하다. 포트별로 다른 동작이 필요하면 prefix를 나눈다 |
+| prefix당 룰 1개 | 출발지·목적지 맵별로 prefix당 1개. 같은 맵에 두 번째 룰을 넣으면 거부된다. label은 전체에서 유일하다. 같은 IP에 포트별로 다른 동작은 지금은 할 수 없다(출발지 룰과 목적지 룰을 조합해 일부만 표현할 수 있다) |
 | 세부 조건 | 이긴 룰의 프로토콜·포트·TCP 플래그가 맞을 때만 액션을 실행한다. 맞지 않으면 목적지 룰로 넘어가고, 그것도 아니면 **통과**한다. 같은 맵의 더 짧은 prefix로 되돌아가 다시 찾지 않는다 |
 | 프로토콜 | `tcp`, `udp`, `icmp`, `any`(기본값) |
 | 포트·TCP 플래그 | 포트는 `N` 또는 `N-M`. 포트나 TCP 플래그 조건이 있는 룰은 **L4 헤더를 확인할 수 있는 패킷에만** 매치한다. ICMP(포트 없음), 조각의 두 번째 이후 조각, L4가 짧은 비조각 패킷(`tot_len − IHL×4`가 TCP 20B / UDP 8B 미만)과는 매치하지 않는다. 포트 범위에 0이 들어 있어도(예: `0-1023`) 마찬가지다 |

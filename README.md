@@ -43,6 +43,7 @@ Swift-Guard는 리눅스 커널의 **XDP(eXpress Data Path)** 로 네트워크 �
 
 ```bash
 # daemon 시작 (백그라운드) / 상태 / 종료
+sudo -v                                        # sudo 암호를 먼저 입력 (백그라운드 실행 중 암호 프롬프트로 멈추지 않게)
 sudo swift-guard-daemon --bpf-obj /usr/local/lib/swift-guard/xdp_filter.o > /tmp/swift-guard.log 2>&1 &
 pidof swift-guard-daemon                       # 숫자(PID)가 나오면 실행 중
 sudo kill -INT $(pidof swift-guard-daemon)     # 종료 (붙였던 XDP 자동 해제)
@@ -180,7 +181,7 @@ $ sudo apt install -y \
 **확인**
 ```bash
 $ clang --version | head -1
-Ubuntu clang version 14.0.0-1ubuntu1.1      # 10 이상이면 OK
+Ubuntu clang version 14.0.0-1ubuntu1.1      # 14 이상이면 OK (22.04 기본값, 24.04는 18)
 $ ls /usr/include/bpf/bpf_helpers.h
 /usr/include/bpf/bpf_helpers.h
 ```
@@ -263,7 +264,7 @@ $ sudo make install
 ### 5-1. 실행 파일 확인
 ```bash
 $ xdp-filter --version
-sudo xdp-filter 0.1.0
+xdp-filter 0.1.0
 $ xdp-filter --help
 XDP Filtering Tool
 
@@ -292,12 +293,12 @@ $ sudo tools/test/e2e_check.sh
 e2e_check: PASS=96 FAIL=0 SKIP=3
 RESULT: ALL PASS
 ```
-- `RESULT: ALL PASS`가 나오면 설치와 커널 기능이 모두 정상이다.
+- `RESULT: ALL PASS`가 나오면 설치본(또는 빌드본)과 커널 기능이 모두 정상이다.
 - `SKIP`은 선택 항목이라 괜찮다. 중요한 것은 `FAIL=0`이다. 위 예(4장 절차 그대로 설치한 경우)의 SKIP 3개는 다음과 같다.
-  - `bpftool 없음` 2개: verifier 단독 검사와 패킷 파서 단위 검사(PROG_TEST_RUN)를 건너뛴다. 같은 기능은 daemon 로드와 실제 트래픽 단계에서도 확인된다. 모두 돌리려면 bpftool을 설치한다(Ubuntu는 보통 `linux-tools-$(uname -r)` 패키지에 들어 있다).
+  - `bpftool 없음` 2개: verifier 단독 검사와 패킷 파서 단위 검사(PROG_TEST_RUN)를 건너뛴다. 같은 기능은 daemon 로드와 실제 트래픽 단계에서도 확인된다. 모두 돌리려면 bpftool을 설치한다: `sudo apt install -y linux-tools-common linux-tools-$(uname -r)`(Ubuntu에는 `bpftool` 패키지가 없다). 실행 중인 커널용 패키지가 없다는 오류가 나오면(일부 클라우드·커스텀 커널, 컨테이너) 건너뛰어도 된다.
   - `http_inspector.wasm 없음` 1개: [4-5](#4-5-선택-wasm-모듈-빌드)에서 WASM 모듈을 빌드하면 실행된다.
 - `FAIL`이 있으면 출력 끝의 daemon 로그를 보고 [14. 문제 해결](#14-문제-해결-faq)을 참고한다.
-- 설치(`make install`)를 하지 않았다면 이 스크립트는 저장소의 `target/release/` 빌드본을 쓴다.
+- 검사 대상: 설치본(`/usr/local/bin/xdp-filter`, `/usr/local/lib/swift-guard/xdp_filter.o`)이 있으면 그것을, 없으면(`make install` 전) 저장소 빌드본(`target/release/`, `src/bpf/xdp_filter.o`)을 검사한다. 어느 쪽인지는 출력 앞부분의 `binaries (installed)` / `binaries (repo build)` 줄에 나온다. `--build`를 주면 저장소를 빌드해 그 빌드본을 검사하고, `SG_BIN_DIR`·`SG_BPF_OBJ` 환경변수로 경로를 직접 지정할 수도 있다(`sudo SG_BIN_DIR=… tools/test/e2e_check.sh`).
 
 ---
 
@@ -418,7 +419,7 @@ lab down
 |------|--------|------|
 | `-b, --bpf-obj <파일>` | `src/bpf/xdp_filter.o` | XDP 프로그램 경로. **설치본을 쓸 때는 `/usr/local/lib/swift-guard/xdp_filter.o`를 지정한다** |
 | `-c, --config <파일>` | `/etc/swift-guard/config.yaml` | 설정 파일. 없으면 기본값으로 실행([11장](#11-설정-파일)) |
-| `-i, --interface <이름>` | (없음) | 지정하면 시작할 때 그 인터페이스에 바로 attach. 이때는 `xdp-filter attach`를 다시 하지 않는다 |
+| `-i, --interface <이름>` | (없음) | 지정하면 시작할 때 그 인터페이스에 바로 attach. 이때는 `xdp-filter attach`를 다시 하지 않는다. 모드는 커널이 자동으로 고른다(드라이버가 지원하면 driver, 아니면 generic). 모드를 고정하려면 `-i` 없이 띄운 뒤 `xdp-filter attach <이름> --mode …`를 쓴다 |
 | `--api-addr <주소>` | `unix:/run/swift-guard/api.sock` | CLI가 접속할 주소. `unix:/절대/경로`(또는 `/절대/경로`) 또는 `tcp:127.0.0.1:<포트>`. **TCP는 루프백(127.0.0.0/8, `::1`)만** 허용하며 인증이 없다([9-5](#9-5-보안-누가-룰을-바꿀-수-있나)). 접두사 없는 `127.0.0.1:7654`는 거부된다 |
 | `--api-group <그룹>` | `swift-guard` | Unix 소켓의 그룹. 소켓은 `root:<그룹>` `0660`으로 만들어진다. 그룹이 없으면 `0600`(root 전용)으로 열고 경고한다. TCP면 무시 |
 | `-v, --verbose` | | 디버그 로그 출력 |
@@ -431,6 +432,7 @@ $ sudo swift-guard-daemon --bpf-obj /usr/local/lib/swift-guard/xdp_filter.o -i e
 ```
 **백그라운드로 실행하고 종료하기** (서비스로 운영하려면 [10장](#10-systemd-서비스로-운영하기))
 ```bash
+$ sudo -v                                     # sudo 암호를 먼저 입력 (아래 &로 띄운 sudo가 암호를 묻다 멈추지 않게)
 $ sudo swift-guard-daemon --bpf-obj /usr/local/lib/swift-guard/xdp_filter.o > /tmp/swift-guard.log 2>&1 &
 $ pidof swift-guard-daemon                    # PID가 출력되면 실행 중
 12345
@@ -574,8 +576,9 @@ timestamp_ms,total_packets,total_bytes,pps,mbps,xdp_rx_packets,xdp_rx_bytes,xdp_
 | 후속 조각 / L4가 짧은 비조각(`tot_len` 기준) | IP/프로토콜만 쓰는 룰만 매치 | 결과별 |
 | tiny fragment, TCP offset=1 조각, 비정상 IPv4 헤더, `tot_len` 불일치(프레임 잘림) | **무조건 차단** | `invalid` |
 
-> **참고 — BIG TCP:** 기본값이 아닌 BIG TCP(IPv4, Linux 6.3+)를 켠 환경에서 `generic` 모드로 붙이면, GRO로 합쳐진 대형 패킷(`tot_len=0`)이 `invalid`로 버려질 수 있다(소스 분석 기준, 실측 안 함). 기본 설정에서는 해당 없다. BIG TCP를 쓰는 환경이라면 `driver` 모드를 쓰거나 BIG TCP를 끈다.
 | IPv6, ARP, VLAN 태그 프레임, 14바이트 미만 프레임 | 검사 없이 통과 | `non_ipv4` |
+
+> **참고 — BIG TCP:** 기본값이 아닌 BIG TCP(IPv4, Linux 6.3+)를 켠 환경에서 `generic` 모드로 붙이면, GRO로 합쳐진 대형 패킷(`tot_len=0`)이 `invalid`로 버려질 수 있다(소스 분석 기준, 실측 안 함). 기본 설정에서는 해당 없다. BIG TCP를 쓰는 환경이라면 `driver` 모드를 쓰거나 BIG TCP를 끈다.
 
 ### 8-2. 자주 쓰는 룰
 ```bash
@@ -651,7 +654,8 @@ enp1s0           UP             192.168.0.10/24      ← 이 이름을 쓴다 (e
 
 ### 9-3. 연결과 해제
 ```bash
-$ sudo swift-guard-daemon --bpf-obj /usr/local/lib/swift-guard/xdp_filter.o &
+$ sudo -v                                            # sudo 암호를 먼저 입력 (백그라운드 daemon이 암호 프롬프트로 멈추지 않게)
+$ sudo swift-guard-daemon --bpf-obj /usr/local/lib/swift-guard/xdp_filter.o > /tmp/swift-guard.log 2>&1 &
 $ sudo xdp-filter attach enp1s0 --mode driver
 # driver 모드가 실패하면(드라이버 미지원):
 $ sudo xdp-filter attach enp1s0 --mode generic
@@ -719,7 +723,7 @@ $ sudo xdp-filter --api-server tcp:127.0.0.1:7654 list-rules
 
 **요청 제한**
 
-daemon은 요청 크기(1 MiB), 동시 연결 수(64), 응답 시간(10초)을 제한하지만, 이것은 오동작을 막기 위한 장치이지 접근 제어가 아니다.
+daemon은 요청 크기(1 MiB), 동시 연결 수(64), 연결마다의 요청 읽기·응답 쓰기 시간(각 10초)을 제한하지만, 이것은 오동작을 막기 위한 장치이지 접근 제어가 아니다.
 
 ---
 
@@ -819,8 +823,8 @@ http-inspector           loaded       2026-10-14 04:31:33
 $ sudo xdp-filter wasm stats --name http-inspector
 $ sudo xdp-filter wasm unload --name http-inspector
 ```
-- 모듈을 빌드하는 방법은 [4-5](#4-5-선택-wasm-모듈-빌드)에 있다.
-- **신뢰할 수 있는 모듈만 로드한다.** `init`은 1초, 패킷 검사는 기본 10ms의 실행 시간 제한이 있고 메모리는 기본 32MiB로 제한된다. 검사 시간·메모리 제한은 기본값이며 설정 파일(`wasm.execution_timeout_ms`, `wasm.memory_limit_mb`)로 바꿀 수 있다([11장](#11-설정-파일)). API로 동시에 로드할 수 있는 모듈은 2개까지다.
+- 모듈을 빌드하는 방법은 [4-5](#4-5-선택-wasm-모듈-빌드)에 있다. 위 경로(`/usr/local/lib/swift-guard/wasm/`)에는 `sudo make install` 할 때 빌드돼 있던 모듈만 복사된다. 4-6 설치 뒤에 모듈을 빌드했다면 `sudo make install`을 다시 실행하거나, 저장소 경로 `--file wasm/modules/http_inspector.wasm`을 쓴다(상대 경로는 CLI가 절대 경로로 바꿔 보낸다).
+- **신뢰할 수 있는 모듈만 로드한다.** `init`은 1초, 패킷 검사는 기본 10ms의 실행 시간 제한이 있고 메모리는 기본 32MiB로 제한된다. 검사 시간·메모리 제한은 기본값이며 설정 파일(`wasm.execution_timeout_ms`, `wasm.memory_limit_mb`)로 바꿀 수 있다([11장](#11-설정-파일)). 동시에 진행 중인 `wasm load` 요청은 2개까지다(로드된 모듈 수에는 제한이 없다).
 - daemon이 시작할 때 모듈을 자동으로 로드하려면 설정 파일의 `wasm.auto_load`와 `wasm.auto_load_modules`를 쓴다([11장](#11-설정-파일)).
 - 현재는 관리 기능만 있다. XDP에서 모듈로 패킷을 넘기는 경로는 아직 연결되지 않았다.
 
@@ -881,6 +885,7 @@ extern "C" { #[link_name = "log"] fn host_log(ptr: *const u8, len: i32) -> i32; 
 | daemon 로그: `group 'swift-guard' not found: API socket ... is root-only ...` | 그룹이 없어 소켓을 root 전용(`0600`)으로 열었다. `sudo`로는 그대로 쓸 수 있다. 그룹 사용자를 허용하려면 `sudo groupadd --system swift-guard`(또는 `sudo make install`) 후 daemon을 다시 시작한다 |
 | `attach` 실패 (driver 모드) | NIC 드라이버가 XDP를 지원하지 않는다. `--mode generic`으로 다시 시도한다 |
 | `already attached ... (use --force to replace)` | 이미 연결돼 있다. 그대로 쓰거나 `sudo xdp-filter detach <if>` 후 다시 연결한다. daemon을 `-i`로 실행했다면 attach를 할 필요가 없다 |
+| `Failed to attach XDP program to <if> (ifindex …, flags …): File exists` | 다른 프로그램이 이미 그 인터페이스에 XDP를 붙여 두었다. `ip -d link show <if>`로 확인한다. 그 프로그램을 바꿔도 되면 `--force`로 교체한다 |
 | 룰을 넣었는데 차단이 안 됨 | ① 출발지 IP가 맞는지(NAT, 프록시 뒤라면 다를 수 있다) ② 같은 IP에 더 긴 prefix 룰이 있는지 ③ 프로토콜·포트 조건이 맞는지(포트 룰은 ICMP·후속 조각에 매치하지 않는다) ④ 목적지 룰이라면 같은 패킷에 매치하는 출발지 룰이 먼저 적용되지 않았는지 ⑤ VLAN 태그 프레임이 아닌지(`xdp-filter stats`의 `non_ipv4`가 늘면 검사 없이 통과한 것) 확인한다. `sudo xdp-filter list-rules --stats`로 매치 수를 본다. [8-1](#8-1-매칭-규칙-꼭-알아야-할-것)을 참고한다 |
 | daemon: `BPF object has no map 'xdp_stats_map'` (또는 `'dst_rules'`) / `BPF map 'xdp_stats_map' value size ... (rebuild xdp_filter.o)` | 오래된 `xdp_filter.o`다. `make build && sudo make install`로 다시 빌드·설치한 뒤 daemon을 다시 실행한다. `--bpf-obj`가 새 파일을 가리키는지도 확인한다 |
 | `Error: priority is not implemented yet: ...` (`rate_limit`, `expire`도 같음) / `Error: --pkt-len is not implemented yet` | 미구현 옵션이다. 옵션을 빼거나 0으로 둔다([8-3](#8-3-거부되는-입력과-에러-메시지)). 이전 버전에서는 저장만 되고 적용되지 않았다 |
@@ -889,7 +894,7 @@ extern "C" { #[link_name = "log"] fn host_log(ptr: *const u8, len: i32) -> i32; 
 | daemon을 재시작했더니 룰이 사라짐 | 정상이다. 룰은 저장되지 않는다([10장](#10-systemd-서비스로-운영하기)) |
 | SSH가 끊겼다 | 콘솔로 접속해 `sudo systemctl stop swift-guard`를 실행하거나 [9-4](#9-4-비상시-수동-해제)의 수동 해제 명령을 쓴다 |
 | `wasm load`에서 `unreachable` | 오래된 방식으로 빌드한 모듈이다. [12-2](#12-2-직접-모듈-만들기-abi)대로 import를 선언하고 다시 빌드한다 |
-| `wasm load`에서 `too many concurrent module loads` | 로드 중인 모듈이 2개다. 잠시 후 다시 시도한다 |
+| `wasm load`에서 `too many concurrent module loads` | 동시에 진행 중인 `wasm load` 요청이 이미 2개다(로드된 모듈 수 제한이 아니다). 앞선 로드가 끝난 뒤 다시 시도한다 |
 | `tools/test/*.sh: Permission denied` | `chmod +x tools/test/*.sh`, 또는 `sudo bash tools/test/e2e_check.sh` |
 | `xdp-filter stats`의 Packets/sec가 `n/a` | 첫 샘플이라 비교할 직전 값이 없다. 정상이다(두 번째 샘플부터 나온다) |
 | `xdp-filter stats`의 `Total packets`가 0에서 늘지 않음 | `Total packets`는 **룰에 매치한 패킷만** 센다. 먼저 `XDP rx packets`를 본다. 이것이 늘면 트래픽은 XDP에 도착하고 있고 매치하는 룰이 없는 것이다(`no_match`가 늘어난다). `XDP rx packets`도 늘지 않으면 트래픽이 그 인터페이스로 들어오지 않거나 XDP가 붙어 있지 않다(`ip link show <if>`에 `xdp`/`xdpgeneric` 표시 확인) |
@@ -939,14 +944,15 @@ swift-guard/
 ├── config/                    설정 파일, systemd 서비스 파일
 ├── tools/
 │   ├── test/                  e2e_check.sh, examples.sh, lab.sh (실습 랩), bench_flow_check.sh, sg_pkt.py (파서 검증용 패킷 생성)
-│   ├── bench/                 성능 측정: basic_throughput_test.sh, rule_scaling_test.sh, pktgen_tx.sh
+│   ├── bench/                 성능 측정: basic_throughput_test.sh, rule_scaling_test.sh, pktgen_tx.sh, bench_lib.sh (공통 함수)
 │   └── analysis/              결과 분석: analyze_performance.py, requirements.txt
-├── tests/integration/         통합 테스트 (cargo test -- --ignored)
+├── tests/integration/         통합 테스트 (cargo test -- --ignored. root 셸·컨테이너에서는 실패, e2e_check.sh가 대체)
 └── docs/
     ├── examples.md            사용 예시 12종
     ├── linux-verification.md  검증 단계 가이드
     ├── poc-plan.md            PoC·벤치마크 계획
-    └── evaluation.md          평가 방법론
+    ├── evaluation.md          평가 방법론
+    └── design/xdp-wasm-datapath.md  XDP→WASM 데이터 경로 설계 비교 (결정 대기)
 ```
 
 ---

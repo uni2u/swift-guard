@@ -1,9 +1,9 @@
 # XDP → WASM 패킷 검사 데이터 경로: 설계 비교
 
 - 상태: **결정 대기** (팀·지도교수 검토용). 이 문서는 코드를 바꾸지 않는다.
-- 기준 코드: `main` HEAD `42d4eea`
+- 기준 코드: `main` HEAD `42d4eea`(초안). 1장 "현재 구조"는 HEAD `5d98195` 기준으로 갱신했다(2026-10-16).
 - 작성: sg-architect, 2026-10-14
-- 전제: 동시에 진행 중인 `_workspace/01_architect_plan.md`(L4 파싱 수정, 미구현 옵션 거부, XDP 전체 카운터)가 먼저 들어간다고 가정한다. 이 문서에서 새로 제안하는 액션 번호·맵 이름은 그 계획이 확정한 값과 겹치지 않게 구현 단계에서 맞춘다.
+- 전제: `_workspace/01_architect_plan.md`(L4 파싱 수정, 미구현 옵션 거부, XDP 전체 카운터)가 먼저 들어간다고 가정했다. **세 가지 모두 반영 완료**(커밋 `bb5179f`; 1장 참고). 이 문서에서 새로 제안하는 액션 번호·맵 이름은 그 계획이 확정한 값(`ACTION_*` 1–4, `SG_STAT_*` 0–8)과 겹치지 않게 맞춘다.
 - 표기: **[확인]** = 이 저장소 코드나 공식 문서·레지스트리에서 직접 확인함. **[확인 필요]** = 확인하지 못한 수치나 주장. **[측정 필요]** = 실험으로만 정할 수 있는 값.
 
 ---
@@ -23,18 +23,26 @@
 
 ### 1.1 XDP 프로그램 — `src/bpf/xdp_filter.c` + `include/swift_guard.h` [확인]
 
-- `xdp_filter_func` → IPv4이면 `handle_ipv4`가 처리한다. L4는 `iph + 1` 위치로 접근하므로 IP 옵션을 무시한다(01 계획에서 수정 예정).
+- `xdp_filter_func` → IPv4이면 `handle_ipv4`가 처리한다. 파서 정책(커밋 `bb5179f`):
+  - version≠4, IHL<5, IPv4 헤더 20B 미만, IHL×4가 패킷보다 긺, `tot_len < IHL×4`, `tot_len`이 실제 L3 길이보다 긺 → `XDP_DROP`(invalid). 룰 조회보다 먼저라 pass 룰로 예외 처리할 수 없다.
+  - L4는 `iph + IHL×4`에서 읽는다(IP 옵션 건너뜀). L4 길이는 프레임 끝(`data_end`, 이더넷 패딩 포함)이 아니라 `tot_len − IHL×4`로 정한다.
+  - 비조각·첫 조각: L4 길이가 TCP 20B / UDP 8B 이상이면 포트·플래그를 읽는다. 모자라면 MF=1(tiny fragment, RFC 1858) → invalid DROP, MF=0 → 포트 미확인(포트·플래그 조건 룰은 매치하지 않음).
+  - 후속 조각: TCP이고 offset=1 → invalid DROP(RFC 1858). 그 외는 포트 미확인.
+  - IPv4가 아니거나 이더넷 헤더 미만인 프레임은 검사 없이 `XDP_PASS`.
 - 먼저 출발지 LPM 맵 `filter_rules`를 `/32` 키로 1회 조회한다. 미스이거나 조건이 맞지 않으면 목적지 LPM 맵 `dst_rules`를 1회 조회한다. 매치된 룰에 `apply_rule`을 적용한다.
-- 액션은 `ACTION_PASS=1`, `ACTION_DROP=2`, `ACTION_REDIRECT=3`(`redirect_map` → `bpf_redirect`), `ACTION_COUNT=4`가 있다. 그 밖의 값은 `XDP_PASS`로 처리한다.
-- 통계는 두 가지다. 매치된 룰 값 안의 `stats`는 `__sync_fetch_and_add`로 갱신된다. LPM 맵 값에 원자 연산을 쓰는 방식이 이미 verifier를 통과하고 있다는 뜻이다. 전역 `stats_map`(PERCPU_ARRAY)은 **매치된 패킷만** 센다.
+- 액션은 `ACTION_PASS=1`, `ACTION_DROP=2`, `ACTION_REDIRECT=3`(`redirect_map` → `bpf_redirect`), `ACTION_COUNT=4`가 있다. 그 밖의 값(과 redirect 대상 없음)은 `XDP_PASS`로 처리하고 `SG_STAT_ACTION_ERR`로 센다(daemon은 1–4 밖의 action을 거부한다).
+- 통계는 세 가지다. 매치된 룰 값 안의 `stats`는 `__sync_fetch_and_add`로 갱신된다. LPM 맵 값에 원자 연산을 쓰는 방식이 이미 verifier를 통과하고 있다는 뜻이다. 전역 `stats_map`(PERCPU_ARRAY)은 **매치된 패킷만** 센다. XDP 전체 카운터 `xdp_stats_map`(PERCPU_ARRAY, 값 `struct sg_counter` 16B = packets·bytes)은 슬롯 `SG_STAT_RX=0`, `DROP=1`, `PASS=2`, `REDIRECT=3`, `COUNT=4`, `NO_MATCH=5`, `INVALID=6`, `NON_IPV4=7`, `ACTION_ERR=8`(`SG_STAT_MAX=9`)이고, 패킷마다 RX 1회 + 결과 슬롯 정확히 1회 증가한다(불변식 RX = Σ결과). Rust 쪽 슬롯 상수는 `src/common/bpf_layout.rs`의 `xdp_stat`, CLI `stats --format csv`는 이 카운터를 `xdp_*` 열로 내보낸다(헤더 17열).
+- 빌드: `src/bpf/Makefile`이 `-mcpu=v3`(JMP32·ALU32·atomics fetch/cmpxchg)로 컴파일한다(`BPF_CPU=v2`로 되돌릴 수 있음). 최소 커널은 5.15다(daemon은 미만이면 경고만 하고 계속한다).
 - `struct filter_rule`은 88B다. `rate_limit`(off 20, u32)와 `expire`(off 24, u32) 필드가 있지만 **BPF가 읽지 않는다**. daemon의 `FilterRule::creation_time`은 `#[allow(dead_code)] // 향후 expire 처리용` 상태다.
 
 ### 1.2 daemon — `src/daemon/src/{main,server,maps,bpf,wasm}.rs` [확인]
 
 - libbpf-rs 0.19.1의 `Object`/`Map`은 raw pointer를 들고 있어서 `!Send`다. 그래서 `MapManager`와 `XdpAttachManager`는 **main 태스크에서만** 쓴다. 연결 태스크는 BPF 요청을 `mpsc::channel::<BpfJob>(64)`로 accept 루프(main 태스크)에 보내고, 응답을 `oneshot`으로 받는다. 이 채널은 현재 `server.rs::serve()` 안에서 만들어진다.
 - libbpf-rs 0.19.1에는 `MapHandle`이 없다. `Map::fd() -> i32`는 있다. `RingBuffer<'a>`는 `*mut ring_buffer`를 들고 있어 `!Send`이고, `RingBufferBuilder::add(&Map, cb)`처럼 `&Map`을 요구한다. 따라서 **소비 스레드를 따로 두려면 맵 fd를 꺼내 `libbpf_sys::ring_buffer__new(fd, …)` 또는 `perf_buffer__new`를 그 스레드에서 직접 호출해야 한다.** fd는 프로세스 전역이라 스레드 간 이동에 문제가 없다. 단, fd의 수명은 main의 `Object`에 묶인다(5.3절).
-- `WasmManager`는 `Send + Sync`이고, 정적 단언으로 고정되어 있다. 안에는 `Mutex<Vec<WasmInspector>>` **하나**가 있고, 모듈마다 `Store`가 하나씩 있다. `inspect_packet(&[u8]) -> Result<bool>`가 이미 있지만 `#[allow(dead_code)]`이고 호출하는 곳이 없다. 패킷 1개를 검사할 때마다 게스트 호출이 3회(`allocate` → `inspect_packet` → `deallocate`) 일어나고, 호출마다 epoch deadline이 10ms다. 모든 모듈이 **잠금 하나 아래에서 직렬 실행**되므로, 검사 스레드를 늘려도 지금 구조로는 병렬화되지 않는다.
+- `WasmManager`는 `Send + Sync`이고, 정적 단언으로 고정되어 있다. 안에는 `Mutex<Vec<WasmInspector>>` **하나**가 있고, 모듈마다 `Store`가 하나씩 있다. `inspect_packet(&[u8]) -> Result<bool>`가 이미 있지만 `#[allow(dead_code)]`이고 호출하는 곳이 없다. 패킷 1개를 검사할 때마다 게스트 호출이 3회(`allocate` → `inspect_packet` → `deallocate`) 일어나고, 호출마다 epoch deadline이 걸린다(기본 10ms, 설정 `wasm.execution_timeout_ms` 1–10000. 모듈 메모리 상한은 `wasm.memory_limit_mb` 기본 32, `init`은 1초 고정). 모든 모듈이 **잠금 하나 아래에서 직렬 실행**되므로, 검사 스레드를 늘려도 지금 구조로는 병렬화되지 않는다.
 - WASM ABI v1은 `inspect_packet(ptr: i32, len: i32) -> i32`이고, 0이면 통과, 0이 아니면 차단이다. 입력은 이더넷 헤더부터 시작하는 원시 프레임이다. 예제 `wasm/modules/http_inspector.rs`는 0 또는 1만 반환하고, 페이로드 길이가 4096을 넘으면 의심으로 판정한다.
+- API 전송: 기본은 Unix 소켓 `unix:/run/swift-guard/api.sock`(`root:swift-guard`, `0660`, 그룹이 없으면 `0600`). 프레이밍은 u32 빅엔디안 길이 + JSON. TCP는 루프백만 옵트인(`tcp:127.0.0.1:<포트>`, 인증 없음). 변경 요청(attach/detach/add-rule/delete-rule/wasm load·unload)은 `API <Variant> from uid=… gid=… pid=…`로 info 감사 로그를 남긴다. 자원 상한: 프레임 1 MiB, 동시 연결 64, 연결별 읽기·쓰기 각 10초, 동시 진행 `wasm load` 2.
+- 입력 검증(`server.rs::validate_add_rule`): 미구현 옵션 `priority`·`rate_limit`·`expire`는 0만 허용하고 0이 아니면 Error로 거부한다(`--pkt-len`은 CLI가 거부). action은 1–4(`VALID_ACTIONS`), protocol은 1/6/17/255만 받는다.
 - 정상 종료나 panic unwind로 끝나면 `DetachGuard`가 XDP를 뗀다. 즉 **daemon이 정상적으로 내려가면 필터 자체가 사라진다**. SIGKILL로 죽었을 때만 XDP와 맵이 남는다.
 
 ### 1.3 의존성 버전 [확인: `Cargo.lock`, crates.io API 2026-10-14 조회]
@@ -75,7 +83,7 @@
 
 ## 3. 후보 방식 비교
 
-모든 방식에 공통으로 "검사 범위"를 고르는 수단이 필요하다. 이 문서는 새 LPM 룰 액션 **`ACTION_INSPECT`**(번호는 01 계획의 액션 확장 이후 첫 빈 값, 잠정 5)를 제안한다. 운영자가 "dst 10.0.0.10/32, TCP 80"처럼 룰로 검사 대상을 지정하고, 매치된 패킷만 검사 경로로 보낸다. 매치되지 않은 트래픽은 기존 경로를 그대로 탄다(R1).
+모든 방식에 공통으로 "검사 범위"를 고르는 수단이 필요하다. 이 문서는 새 LPM 룰 액션 **`ACTION_INSPECT`**(01 계획은 액션을 늘리지 않았으므로 5로 확정 가능. `server.rs` `VALID_ACTIONS` 1..=4 확장 필요)를 제안한다. 운영자가 "dst 10.0.0.10/32, TCP 80"처럼 룰로 검사 대상을 지정하고, 매치된 패킷만 검사 경로로 보낸다. 매치되지 않은 트래픽은 기존 경로를 그대로 탄다(R1).
 
 ### (a) AF_XDP (XSK) — 인라인 사용자 공간 판정
 
@@ -177,7 +185,7 @@
   - `samples`: `PERF_EVENT_ARRAY`((b)와 공유).
   - `inspect_cfg`: `ARRAY`[1]. N, snaplen, 대기 정책(pass/drop), 1:K 샘플링을 담는다. daemon이 런타임에 바꿀 수 있다.
   - 경합: 같은 플로우가 두 CPU에서 동시에 첫 패킷이 되면 `BPF_NOEXIST` 삽입 하나만 성공한다. 실패한 쪽은 다시 조회한다. `sampled`는 `__sync_fetch_and_add`(결과 미사용 → BPF_XADD, v1 ISA로 가능)로 올린다. 경합 때문에 N을 약간 넘을 수 있지만 허용한다.
-  - 플로우 키 파싱은 L4 오프셋에 의존한다. 01 계획의 **IHL 기반 L4 파싱 수정이 선행 조건**이다.
+  - 플로우 키 파싱은 L4 오프셋에 의존한다. 01 계획의 **IHL 기반 L4 파싱 수정이 선행 조건**이다 — **완료**(`bb5179f`, 1.1절).
   - verifier: 루프가 없고, 맵 조회와 헬퍼 몇 개만 쓴다. 명령어 수가 늘어나지만 한도 문제가 생길 가능성은 낮다고 본다 **[측정 필요: `bpftool prog show`의 xlated 크기]**.
 - **daemon 측 변경:** (b)와 같고, 여기에 다음이 추가된다. (1) `sg-inspect` 스레드가 `flow_verdict` fd에 `libbpf_sys::bpf_map_update_elem`을 **직접** 호출한다. 플로우 캐시는 daemon 룰 캐시에 넣지 않으므로 main을 거칠 필요가 없고, 반응 시간에서 tokio 홉이 빠진다. (2) LPM 동적 룰만 `BpfJob`으로 보낸다. (3) 만료 reaper를 둔다(main 태스크의 기존 `select!`에 interval 분기 추가).
 - **WASM ABI:** v2(4.1절)를 권장한다. 이유는 판정 종류 확장, `pkt_len`과 플로우 내 순번 전달, 판정 TTL 전달이다. v1 모듈은 그대로 쓸 수 있다(≠0 → drop).
@@ -270,7 +278,7 @@ struct sg_inspect_cfg {       /* ARRAY[1], size 16 */
 ```
 
 - **Rust 쪽:** `src/common/bpf_layout.rs`에 같은 offset 상수, encode/decode, offset·크기 테스트를 추가한다(macOS `cargo test -p swift-guard-common`으로 검증 가능).
-- **카운터:** 01 계획의 XDP 전체 카운터 구조에 `inspect_matched`, `sample_sent`, `sample_lost`, `flow_hit`, `flow_miss`, `flow_drop`, `rl_drop` 슬롯을 추가한다(PERCPU). 슬롯 배치는 01 계획의 구조를 확정한 뒤 정한다.
+- **카운터:** XDP 전체 카운터 `xdp_stats_map`(확정: `SG_STAT_RX=0` … `SG_STAT_ACTION_ERR=8`, `SG_STAT_MAX=9`, 1.1절)에 `inspect_matched`, `sample_sent`, `sample_lost`, `flow_hit`, `flow_miss`, `flow_drop`, `rl_drop` 슬롯을 `SG_STAT_*` 9번부터 이어 붙이고 `SG_STAT_MAX`를 올린다(PERCPU). 함께 바꿀 것: `bpf_layout.rs`의 `xdp_stat` 상수와 테스트, daemon의 맵 크기 검증, CLI `stats --format csv` 17열 계약(열을 추가할지, 추가하면 `tools/bench`·분석기·문서의 열 목록까지). (참고: 현재 불변식 RX = Σ결과는 결과 슬롯 1–8만 대상이다.)
 
 ### 4.3 TTL·만료 — `expire` 필드 활용
 
@@ -311,7 +319,7 @@ if (cnt > st->rl_pps)  → XDP_DROP, rl_drop++              // 비원자 재읽�
   Rust `FILTER_RULE_SIZE` 88 → 104, `off::RL_WINDOW=88`, `off::RL_COUNT=96`, `encode_filter_rule`에 0 채우기, 테스트 갱신이 필요하다. 룰을 다시 추가하면 상태가 초기화된다(stats와 같은 동작).
 - **per-source:** 비교군으로 둔다. 출발지 `/32` 동적 룰에 `rate_limit`을 넣으면 per-rule 방식이 곧 per-source가 된다. 별도 맵이 필요 없다.
 - **적용 순서:** 룰 매치 → `rate_limit > 0`이면 창 검사(초과 시 drop) → 그다음 액션(pass/count/inspect/redirect). DROP 룰의 rate_limit은 의미가 없으므로 API에서 거부한다.
-- **API:** 01 계획이 미구현 옵션(`rate_limit`, `expire` ≠ 0)을 거부하도록 바꾸면, 이 설계의 3단계에서 **거부를 해제**한다. 두 계획 사이의 순서 의존이다.
+- **API:** 미구현 옵션(`rate_limit`, `expire` ≠ 0)은 **현재 daemon이 거부한다**(01 계획 반영 완료, `server.rs::validate_add_rule`). 이 설계의 3단계에서 **거부를 해제**한다.
 
 ### 4.5 자가 적응 루프와 반응 시간 측정
 
@@ -356,7 +364,7 @@ sg-inspect 스레드 (std::thread, 1개로 시작)
 | 계약 | (b) 1단계 | (d) 2단계 | rate limit 3단계 |
 |---|---|---|---|
 | `swift_guard.h` 구조체 | `sg_sample_meta`, `sg_inspect_cfg` 추가 | `sg_flow_key`, `sg_flow_state` 추가 | `filter_rule` 88→104 |
-| 액션 상수 | `ACTION_INSPECT` (잠정 5) | — | — |
+| 액션 상수 | `ACTION_INSPECT` (5, `VALID_ACTIONS` 확장) | — | — |
 | BPF 맵 | `samples`(PERF_EVENT_ARRAY), `inspect_cfg` | `flow_verdict`(LRU_HASH) | — |
 | `bpf_layout.rs` | meta 디코드, cfg 인코드 | flow key/state 인코드·디코드 | 크기·offset 갱신 |
 | API (`common/api.rs` ↔ `cli/src/api.rs`) | `InspectConfig{mode, first_n, snaplen, …}`, `InspectStats` | `ListFlows{limit}`(선택) | `rate_limit`/`expire` 거부 해제 |
@@ -394,9 +402,9 @@ sg-inspect 스레드 (std::thread, 1개로 시작)
 ### 추천
 **(d) 플로우 하이브리드를 목표 구조로 하고, 운반 계층은 (b) perf buffer를 쓴다.** 비동기 판정에 따른 누출은 `pkts_before_verdict`와 반응 시간으로 정량화해 논문 기여(XDP 속도를 유지하면서 WASM 확장성 확보, 자가 적응 반응 시간)로 내세운다. 인라인 동기 검사 비교가 꼭 필요하면 (e) NFQUEUE를 기준선으로, (a) AF_XDP를 선택적 4단계로 둔다.
 
-### Phase 0 — 선행 (01 계획, 이 문서 범위 밖)
+### Phase 0 — 선행 (01 계획, 이 문서 범위 밖) — **완료** (`bb5179f`)
 - L4 IHL 파싱 수정, 미구현 옵션 거부, XDP 전체 카운터.
-- 검증: 01 계획의 Tier 2 절차.
+- 검증: 01 계획의 Tier 2 절차(`tools/test/e2e_check.sh` 9·10·11·13단계).
 
 ### Phase 1 — 최소 실험 가능 버전: (b) 패킷 단위 사본 + 출발지 자동 차단
 - **산출물**
@@ -475,3 +483,4 @@ sg-inspect 스레드 (std::thread, 1개로 시작)
 ## 변경 이력
 - 2026-10-14 초안 (HEAD 42d4eea 기준).
 - 2026-10-16 Q3 결정(최소 커널 5.15), 3(b)/4.4/R7/9장 정리, Phase 1 운반 계층 perf buffer 확정, Phase 1에 API Unix 소켓·접근 제어 한 줄 (HEAD fc42b65 기준).
+- 2026-10-16 사실 서술만 갱신(HEAD 5d98195 기준): 1장 현재 구조(IHL 파서·조각 정책, `xdp_stats_map`, `-mcpu=v3`·5.15, Unix 소켓 API·감사 로그·자원 상한, 미구현 옵션 거부, WASM 제한 설정), 4.2 카운터 슬롯 확정, `ACTION_INSPECT`=5, Phase 0 완료 표시. 설계 판단·비교는 바꾸지 않음.

@@ -19,7 +19,7 @@
 ## 1. 테스트 환경
 
 ### 하드웨어
-- CPU: Intel Xeon E5-2680v4급 이상 (16코어 이상 권장)
+- CPU: Intel Xeon E5-2680v4(14코어)급 이상
 - RAM: 32GB 이상
 - NIC: XDP driver 모드를 지원하는 10GbE 이상 (Intel X520/X540/X550/X710 등)
 - 송신 장비: 커널 pktgen을 돌릴 Linux 장비 1대(권장) 또는 DUT의 두 번째 NIC

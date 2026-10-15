@@ -16,7 +16,7 @@ Reference hardware (the environment assumed when setting targets; record the act
 - OS: Ubuntu 22.04 LTS
 - Kernel: Linux 5.15+ minimum (Ubuntu 22.04 GA kernel)
 - Rust: 1.78+
-- LLVM/Clang: 14+
+- LLVM/Clang: 14+ (Ubuntu 22.04 default; same minimum as README 4-1)
 - libbpf-rs 0.19.1 / libbpf-sys 1.5.0 (as pinned in `Cargo.lock`)
 
 ## Performance Evaluation
