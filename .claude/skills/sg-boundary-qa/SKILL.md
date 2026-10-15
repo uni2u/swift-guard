@@ -20,6 +20,7 @@ description: Swift-Guard 경계면 교차 검증 체크리스트와 스크립트
 | `struct_layout.py <file> <struct>...` | C 구조체 offset/size JSON (macOS에서 동작) | |
 | `api_drift.py <a.rs> <b.rs>` | 두 파일의 동명 serde 타입 변형/필드 비교 | 0 일치 / 1 drift |
 | `linux_check.sh [bpf\|cargo\|test\|all]` | Docker로 BPF 컴파일 + daemon 포함 cargo check/test | 0 PASS / 1 FAIL / 2 알 수 없는 모드(옵션은 별도 인자: `examples -v`) / 3 docker 없음(SKIP) |
+| `bpf_unit_check.sh` | privileged Docker에서 Makefile 빌드 → verifier 로드 → `bpf_prog_test_run.py`로 PROG_TEST_RUN 케이스(IHL/조각/tiny fragment/src→dst 우선/결과 카운터 불변식 RX=Σ결과). daemon 없이 가장 빠른 BPF 회귀 검사. src/bpf·include 변경 시 실행 | 0 / 1 / 3 |
 | `linux_check.sh bench` | privileged Docker에서 `tools/test/bench_flow_check.sh` — Tier 3 스크립트 흐름(daemon 기동→attach→lab 트래픽→`stats --format csv`→요약 CSV→분석기→정리). 수치는 의미 없음. `tools/bench`, `tools/analysis`, `xdp-filter stats` 변경 시 실행 | 0 / 1 / 3 |
 | `systemd_check.sh` | systemd를 init으로 띄운 Ubuntu 24.04 컨테이너에서 README 10장(설치→enable→override `-i`+`ExecStartPost`→stop 시 detach→재시작 시 룰 재적용→uninstall)을 실행. rules.sh·override는 **README 본문에서 추출**하므로 문서와 동작이 함께 검증된다. README 10장/service/Makefile 변경 시 실행 | 0 / 1 / 3 |
 | `readme_check.sh [22.04 24.04]` | 깨끗한 Ubuntu에서 일반 사용자로 README 4~6장·WASM·예시 회귀·제거를 그대로 실행(초급자 경로). README의 설치/사용 명령이나 Makefile을 바꾸면 실행. README와 `readme_sim_inner.sh`의 단계는 함께 갱신 | 0 / 1 / 3 |
@@ -41,7 +42,7 @@ description: Swift-Guard 경계면 교차 검증 체크리스트와 스크립트
 4. 테스트가 실제로 실행되는가: `cargo test -- --list`에 기대한 테스트가 나오는가(`tests/integration/`은 cargo가 자동 인식하지 않는다 — mac_check가 WARN으로 표시).
 
 ### A. BPF 맵 레이아웃 (C ↔ Rust)
-1. `struct_layout.py include/swift_guard.h filter_rule prefix_key if_redirect filter_stats` 결과와 `src/bpf/xdp_filter.c` 결과가 같은가 (mac_check가 자동 비교).
+1. `struct_layout.py include/swift_guard.h filter_rule prefix_key if_redirect filter_stats sg_counter` 결과와 `src/bpf/xdp_filter.c` 결과가 같은가 (mac_check가 자동 비교).
 2. `src/daemon/src/maps.rs`의 `create_filter_rule`이 만드는 바이트를 필드별로 누적 계산해 C offset과 대조한다. 표로 적는다:
    `필드 | C offset/size | Rust 누적 offset/size | 일치`
    총 길이가 C `sizeof`와 다르면 BLOCKER (`Map::update`가 크기 불일치로 실패).

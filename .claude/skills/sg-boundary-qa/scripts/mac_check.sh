@@ -38,7 +38,7 @@ else
 fi
 
 step "Struct layout: header ↔ xdp_filter.c"
-STRUCTS="filter_rule prefix_key if_redirect filter_stats"
+STRUCTS="filter_rule prefix_key if_redirect filter_stats sg_counter"
 DUP=0; for st in $STRUCTS; do grep -qE "struct[[:space:]]+${st}[[:space:]]*\{" src/bpf/xdp_filter.c && DUP=1; done
 if grep -qE '#include[[:space:]]+["<](\.\./\.\./include/)?swift_guard\.h[">]' src/bpf/xdp_filter.c && [ $DUP -eq 0 ]; then
   if python3 "$S/struct_layout.py" include/swift_guard.h $STRUCTS >"$TMP/h.json" 2>"$TMP/h.err"; then

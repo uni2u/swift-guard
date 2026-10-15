@@ -9,7 +9,8 @@ description: Swift-Guard XDP/eBPF 커널 프로그램(src/bpf/xdp_filter.c, incl
 - `src/bpf/xdp_filter.c`: `SEC("xdp") xdp_filter_func` → IPv4면 `handle_ipv4` → `filter_rules`(LPM trie, key=`prefix_key{prefix_len, addr}`)를 src IP로 조회 → 포트/프로토콜/TCP 플래그 매칭 → 액션.
 - 맵: `filter_rules`(LPM_TRIE, `BPF_F_NO_PREALLOC`), `redirect_map`(HASH, ifindex→`if_redirect`), `stats_map`(PERCPU_ARRAY 1개, 전역 통계).
 - **구조체·상수가 두 곳에 중복 정의됨**: `include/swift_guard.h`(`__u32` 타입)와 `xdp_filter.c` 내부(`uint32_t` 타입). xdp_filter.c는 헤더를 include하지 않는다. 한쪽만 바꾸면 조용히 어긋나므로 **항상 둘 다 수정**하거나, 계획이 허용하면 xdp_filter.c가 헤더를 include하도록 정리한다.
-- 알려진 기존 한계(변경 요청과 관련 있을 때만 손댄다): rule별 `stats`는 갱신되지 않고 전역 stats만 증가, `ACTION_COUNT` 미처리, dst_ip 매칭 없음, IP 옵션(ihl>5) 무시하고 `iph+1`로 L4 접근.
+- 파싱 규칙(2026-10-14 이후): L4 오프셋 = IHL×4(재경계검사), 조각 구분(tiny fragment·TCP off=1·비정상 헤더는 룰 평가 전 DROP, 후속 조각은 포트/플래그 룰 미매치), `l4_known=0`이어도 IP/프로토콜 전용 룰은 평가. 결과 카운터 `xdp_stats_map`(PERCPU, `SG_STAT_*`)은 `xdp_filter_func` 끝에서 패킷당 정확히 1회 증가. 남은 한계: VLAN·IPv6 미파싱(NON_IPV4로 통과), priority/rate_limit/expire 미구현(daemon이 거부).
+- 파싱·매칭을 바꾸면 `.claude/skills/sg-boundary-qa/scripts/bpf_unit_check.sh`(PROG_TEST_RUN 케이스)를 실행하고, 새 의미에 맞는 케이스를 `bpf_prog_test_run.py`에 추가한다.
 
 ## 맵 값 레이아웃 규칙
 Rust daemon은 맵 값을 **수동 바이트 직렬화**(`maps.rs::create_filter_rule`)로 만든다. 그래서 C 구조체의 자연 정렬 패딩이 곧 프로토콜이다.
