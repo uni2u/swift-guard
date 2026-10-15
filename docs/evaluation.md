@@ -22,11 +22,11 @@ Reference hardware (the environment assumed when setting targets; record the act
 ## Performance Evaluation
 ### 1. Packet Processing Performance
 Metrics:
-- **Throughput**: packets per second (pps) and Gbps of packets matched by a rule, measured from `xdp-filter stats` totals (bytes = L2 frame as seen by XDP, excluding FCS/preamble/IFG — not line rate)
+- **Throughput**: packets per second and Gbps of every frame XDP sees (`xdp_rx_pps`, `xdp_rx_gbps`), measured from the `xdp_rx_*` columns of `xdp-filter stats --format csv` (bytes = L2 frame as seen by XDP, excluding FCS/preamble/IFG — not line rate). The rule-matched rate (`pps`, `gbps`) is reported alongside
 - **Latency**: average, median, P95 and P99 processing time — *no tool yet*
 - **CPU Usage**: overall busy %, softirq %, and the busiest CPU's busy % during the measurement window (from `/proc/stat`)
 
-Note: the global statistics count **only packets that match a rule**. The benchmark scripts therefore install a rule (`bench-match`) matching the generated traffic's source address.
+Note: `xdp_rx_pps` counts **every packet XDP sees** (the RX slot of the per-CPU `xdp_stats_map`, incremented before parsing), so it does not depend on rule matching and is the primary throughput metric. `pps` counts **only packets that match a rule** (the global `stats_map` total). By default the benchmark scripts install a drop rule (`bench-match`) matching the generated traffic's source address so that the XDP_DROP path is measured; with `--rule-action none` no rule is installed, `pps` is 0 and `xdp_rx_pps` measures the XDP_PASS (kernel stack) path. Per-verdict counters (drop, pass, redirect, count, no_match, invalid, non_ipv4, action_error) are kept in the raw stats CSV. Result directories from older versions (without the `xdp_rx_*` columns) are still read by the analyzer, which then falls back to `pps` and says so in `summary.md`.
 
 #### Tools
 - Kernel pktgen via `tools/bench/pktgen_tx.sh` (on the sender), or any external generator
@@ -34,7 +34,7 @@ Note: the global statistics count **only packets that match a rule**. The benchm
 - `bpftool`: program and map inspection (`bpftool prog show`, `bpftool map show`)
 
 #### Test Scenarios
-- **Baseline**: XDP attached with one matching drop rule, per frame size — `tools/bench/basic_throughput_test.sh`
+- **Baseline**: XDP attached with one matching drop rule, per frame size — `tools/bench/basic_throughput_test.sh` (`--rule-action none` for the no-rule XDP_PASS path)
 - **XDP Filtering**: throughput vs. number of rules in the source or destination LPM map (up to 10240 per map) — `tools/bench/rule_scaling_test.sh`
 - **Full Pipeline**: combined XDP filtering and WASM inspection — *not implemented (requires XDP→WASM data path)*
 - **Scalability**: throughput under increasing offered load — run the baseline with increasing generator rate/threads (`--pktgen-threads`); no dedicated script
@@ -76,7 +76,7 @@ All available experiments are scripts in this repository:
 
 ```bash
 # Functional prerequisites (Tier 2)
-sudo tools/test/e2e_check.sh --build          # kernel E2E: verifier, attach, matching, stats, cleanup
+sudo tools/test/e2e_check.sh --build          # kernel E2E: verifier, attach, matching, stats, XDP counters, L4 parser (IP options/fragments), cleanup
 sudo tools/test/examples.sh                   # docs/examples.md regression on the virtual lab
 
 # Benchmark flow check without a NIC (numbers are meaningless)

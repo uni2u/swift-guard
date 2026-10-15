@@ -51,7 +51,25 @@ const VALID_PROTOCOLS: [u8; 4] = [1, 6, 17, 255];
 
 /// AddRule 입력 검증 (BPF 없이 테스트 가능한 순수 함수).
 /// BPF 쪽에서 무동작(default → PASS)이 되는 값이나 무시될 필드는 Success 대신 Error 로 거부한다.
-fn validate_add_rule(action: u8, protocol: u8, redirect_if: Option<&str>) -> Result<()> {
+/// 순서: priority → rate_limit → expire (미구현, 0만 허용) → action → protocol → redirect_if.
+/// 여러 필드가 걸리면 첫 번째만 보고한다. (src/dst 검사는 호출 전에 select_match_ip 가 한다)
+fn validate_add_rule(
+    action: u8,
+    protocol: u8,
+    redirect_if: Option<&str>,
+    priority: u32,
+    rate_limit: u32,
+    expire: u32,
+) -> Result<()> {
+    for (name, v) in [("priority", priority), ("rate_limit", rate_limit), ("expire", expire)] {
+        if v != 0 {
+            return Err(anyhow!(
+                "{} is not implemented yet: only 0 is accepted (got {})",
+                name,
+                v
+            ));
+        }
+    }
     if !VALID_ACTIONS.contains(&action) {
         return Err(anyhow!(
             "invalid action {} (1=pass, 2=drop, 3=redirect, 4=count)",
@@ -387,14 +405,17 @@ impl ApiServer {
         }
     }
 
-    /// 서버 실행 (bind 실패 시 Err, 이후 무한 루프). main 태스크에서 폴링된다.
-    pub async fn run(&self) -> Result<()> {
+    /// API 주소에 bind 한다. main 은 bind 성공 후에 auto_load 같은 백그라운드 작업을 시작한다.
+    pub async fn bind(&self) -> Result<TcpListener> {
         let listener = TcpListener::bind(&self.addr)
             .await
             .with_context(|| format!("Failed to bind to {}", self.addr))?;
-
         info!("API server listening on {}", self.addr);
+        Ok(listener)
+    }
 
+    /// bind 된 리스너로 서버 실행 (무한 루프). main 태스크에서 폴링된다.
+    pub async fn run(&self, listener: TcpListener) -> Result<()> {
         // MutexGuard 를 쥔 채 await 하지 않도록 BPF 요청은 동기 처리
         serve(listener, self.wasm.clone(), |request| {
             self.process_request(request).unwrap_or_else(error_response)
@@ -443,8 +464,16 @@ impl ApiServer {
                 // 룰 하나는 src_ip(filter_rules) 또는 dst_ip(dst_rules) 중 정확히 하나로 매칭한다
                 let (side, ip) = utils::select_match_ip(src_ip.as_deref(), dst_ip.as_deref())?;
 
+                // 미구현 필드(priority/rate_limit/expire)는 0만 허용,
                 // N-5/N-6: action/protocol 범위, redirect_if 와 action 의 짝
-                validate_add_rule(action, protocol, redirect_if.as_deref())?;
+                validate_add_rule(
+                    action,
+                    protocol,
+                    redirect_if.as_deref(),
+                    priority,
+                    rate_limit,
+                    expire,
+                )?;
 
                 let field = match side {
                     MatchSide::Src => "src_ip",
@@ -504,9 +533,12 @@ impl ApiServer {
             }
 
             ApiRequest::GetStats {} => {
-                // 총계는 요청 시점에 맵에서, 비율은 텔레메트리 마지막 계산값
-                let (total_packets, total_bytes) =
-                    lock(&self.map_manager, "map_manager")?.get_stats()?;
+                // 총계는 요청 시점에 맵에서(룰 매치 stats_map + XDP 전체 xdp_stats_map, 같은 잠금 안),
+                // 비율은 텔레메트리 마지막 계산값. 맵 읽기 실패는 GetStats 전체 Error.
+                let ((total_packets, total_bytes), xdp) = {
+                    let mm = lock(&self.map_manager, "map_manager")?;
+                    (mm.get_stats()?, mm.get_xdp_counters()?)
+                };
                 let (packets_per_sec, mbps) = self.telemetry.rates()?;
                 Ok(ApiResponse::Stats {
                     stats: SystemStats {
@@ -514,6 +546,7 @@ impl ApiServer {
                         total_bytes,
                         packets_per_sec,
                         mbps,
+                        xdp: Some(xdp),
                     },
                 })
             }
@@ -537,16 +570,16 @@ mod tests {
     fn accepts_valid_actions_and_protocols() {
         for action in [1u8, 2, 4] {
             for proto in VALID_PROTOCOLS {
-                assert!(validate_add_rule(action, proto, None).is_ok());
+                assert!(validate_add_rule(action, proto, None, 0, 0, 0).is_ok());
             }
         }
-        assert!(validate_add_rule(ACTION_REDIRECT, 6, Some("eth1")).is_ok());
+        assert!(validate_add_rule(ACTION_REDIRECT, 6, Some("eth1"), 0, 0, 0).is_ok());
     }
 
     #[test]
     fn rejects_invalid_action() {
         for action in [0u8, 5, 255] {
-            let e = validate_add_rule(action, 255, None).unwrap_err();
+            let e = validate_add_rule(action, 255, None, 0, 0, 0).unwrap_err();
             assert!(format!("{:#}", e).contains("invalid action"));
         }
     }
@@ -554,23 +587,51 @@ mod tests {
     #[test]
     fn rejects_invalid_protocol() {
         for proto in [0u8, 2, 7, 18, 254] {
-            let e = validate_add_rule(2, proto, None).unwrap_err();
+            let e = validate_add_rule(2, proto, None, 0, 0, 0).unwrap_err();
             assert!(format!("{:#}", e).contains("invalid protocol"));
         }
     }
 
     #[test]
     fn redirect_requires_ifname() {
-        let e = validate_add_rule(ACTION_REDIRECT, 255, None).unwrap_err();
+        let e = validate_add_rule(ACTION_REDIRECT, 255, None, 0, 0, 0).unwrap_err();
         assert!(format!("{:#}", e).contains("requires redirect_if"));
     }
 
     #[test]
     fn rejects_redirect_if_without_redirect_action() {
         for action in [1u8, 2, 4] {
-            let e = validate_add_rule(action, 255, Some("eth1")).unwrap_err();
+            let e = validate_add_rule(action, 255, Some("eth1"), 0, 0, 0).unwrap_err();
             assert!(format!("{:#}", e).contains("only allowed with the redirect action"));
         }
+    }
+
+    #[test]
+    fn rejects_unimplemented_fields_with_exact_message() {
+        let msg = |p, r, e| format!("{:#}", validate_add_rule(2, 255, None, p, r, e).unwrap_err());
+        assert_eq!(msg(5, 0, 0), "priority is not implemented yet: only 0 is accepted (got 5)");
+        assert_eq!(msg(0, 100, 0), "rate_limit is not implemented yet: only 0 is accepted (got 100)");
+        assert_eq!(msg(0, 0, 60), "expire is not implemented yet: only 0 is accepted (got 60)");
+    }
+
+    #[test]
+    fn unimplemented_fields_zero_accepted() {
+        assert!(validate_add_rule(2, 6, None, 0, 0, 0).is_ok());
+        assert!(validate_add_rule(ACTION_REDIRECT, 17, Some("eth1"), 0, 0, 0).is_ok());
+    }
+
+    #[test]
+    fn validation_order_reports_first_failure_only() {
+        let msg = |a, pr, ri: Option<&str>, p, r, e| {
+            format!("{:#}", validate_add_rule(a, pr, ri, p, r, e).unwrap_err())
+        };
+        // priority > rate_limit > expire
+        assert!(msg(2, 255, None, 1, 2, 3).starts_with("priority is not implemented"));
+        assert!(msg(2, 255, None, 0, 2, 3).starts_with("rate_limit is not implemented"));
+        // 미구현 필드가 action/protocol/redirect 보다 먼저
+        assert!(msg(9, 0, None, 0, 0, 3).starts_with("expire is not implemented"));
+        assert!(msg(ACTION_REDIRECT, 255, None, 7, 0, 0).starts_with("priority is not implemented"));
+        assert!(msg(9, 255, None, 0, 0, 0).contains("invalid action"));
     }
 
     // ---- R2-1: WASM 로드가 accept 루프 / main select! 를 막지 않는지 (BPF 불필요) ----

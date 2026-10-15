@@ -1,65 +1,45 @@
 # Swift-Guard Configuration
-# This is the main configuration file for Swift-Guard
+# Main configuration file for swift-guard-daemon (default path: /etc/swift-guard/config.yaml).
+#
+# Every key is optional; a missing key uses the default shown here.
+# Unknown keys and keys removed in newer versions are ignored with a warning in the daemon log
+# (an older config file keeps working after an upgrade). Invalid values stop the daemon at startup.
+#
+# Removed keys (ignored with a warning if still present):
+#   general.work_dir, general.pid_file   - unused; systemd manages the process
+#   telemetry.export_enabled/export_url  - telemetry export is not implemented
+#   interfaces                           - use `swift-guard-daemon -i <ifname>` (systemd override, README ch.10)
+#   rules                                - add rules with `xdp-filter add-rule`, e.g. a rules.sh run by
+#                                          ExecStartPost (README ch.10)
 
 # General settings
 general:
-  # Log level: debug, info, warn, error
+  # Log level: off, error, warn, info, debug, trace (default: info)
+  # Precedence: `-v/--verbose` (debug) > RUST_LOG environment variable (if set and non-empty)
+  #             > this value > info
   log_level: "info"
-  # Working directory for temporary files
-  work_dir: "/var/lib/swift-guard"
-  # PID file location
-  pid_file: "/var/run/swift-guard.pid"
 
 # Telemetry settings
 telemetry:
-  # Enable logging of performance statistics
+  # Periodically log rule-match statistics (default: true)
   log_stats: true
-  # Statistics collection interval in seconds
+  # Statistics collection interval in seconds (default: 10, 0 is treated as 1)
   interval: 10
-  # Enable telemetry export
-  export_enabled: false
-  # Export URL (when enabled)
-  export_url: null
 
 # WASM runtime settings
 wasm:
-  # Directory containing WASM modules
+  # Base directory for relative paths in auto_load_modules
   modules_dir: "/usr/local/lib/swift-guard/wasm"
-  # Automatically load modules at startup
+  # Load auto_load_modules in the background after the API server starts (default: false).
+  # A module that fails to load is logged as an error; the daemon keeps running.
   auto_load: false
-  # List of modules to auto-load
+  # .wasm files to load: absolute path, or relative to modules_dir.
+  # The module name is the file name without extension (http_inspector.wasm -> http_inspector).
+  # Example: ["http_inspector.wasm"]
   auto_load_modules: []
-  # Module execution timeout in milliseconds
+  # Time limit for each guest call (allocate / inspect_packet / deallocate) in milliseconds
+  # (default: 10, allowed: 1-10000). Takes effect when inspect_packet is called;
+  # the XDP data path does not call WASM yet.
   execution_timeout_ms: 10
-  # Memory limit in MB for WASM modules
+  # Linear memory limit per module in MiB (default: 32, allowed: 1-4096). Applied at load time.
   memory_limit_mb: 32
-
-# Default interfaces to attach to at startup
-interfaces:
-  # Example: Auto-attach to eth0 in driver mode
-  # - name: "eth0"
-  #   mode: "driver"  # Options: driver, generic, offload
-  #   enabled: true
-
-# Default filter rules
-# These rules are loaded at startup
-# NOTE: this `rules` section is currently NOT loaded by the daemon — add rules with `xdp-filter add-rule`.
-#       Rule constraints: src_ip is required, dst_ip is not supported, one rule per src prefix,
-#       redirect_if must be an existing interface name.
-rules:
-  # Example: Block SSH access from external networks
-  # - label: "block-external-ssh"
-  #   src_ip: "0.0.0.0/0"  # Any source IP
-  #   dst_port: 22
-  #   protocol: "tcp"
-  #   action: "drop"
-  #   priority: 100
-  
-  # Example: Redirect HTTP traffic to inspection
-  # - label: "inspect-http"
-  #   src_ip: "10.0.0.0/8"  # required
-  #   dst_port: 80
-  #   protocol: "tcp"
-  #   action: "redirect"
-  #   redirect_if: "wasm0"
-  #   priority: 50

@@ -8,7 +8,7 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use log::{error, info, warn, LevelFilter};
+use log::{error, info, warn};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -25,7 +25,7 @@ use crate::bpf::{XdpAttachManager, XdpFilterSkel};
 use crate::maps::MapManager;
 use crate::server::ApiServer;
 use crate::telemetry::TelemetryCollector;
-use crate::wasm::WasmManager;
+use crate::wasm::{WasmLimits, WasmManager};
 
 #[derive(Parser, Debug)]
 #[clap(name = "swift-guard-daemon", about = "Swift-Guard Daemon")]
@@ -78,6 +78,27 @@ async fn telemetry_loop(
     }
 }
 
+/// wasm.auto_load_modules 를 백그라운드 태스크에서 순차 로드한다(컴파일은 blocking 풀).
+/// 서버의 동시 로드 상한과는 별개이며, 순차이므로 추가로 최대 1개만 겹친다.
+fn spawn_auto_load(wasm: Arc<WasmManager>, modules_dir: &str, entries: &[String]) {
+    let jobs: Vec<_> = entries
+        .iter()
+        .map(|e| config::resolve_module_entry(modules_dir, e))
+        .collect();
+    tokio::spawn(async move {
+        for (name, path) in jobs {
+            let w = wasm.clone();
+            let (n, p) = (name.clone(), path.clone());
+            let res = tokio::task::spawn_blocking(move || w.load_module(&n, &p)).await;
+            match res {
+                Ok(Ok(())) => info!("auto-loaded WASM module '{}' from {}", name, path.display()),
+                Ok(Err(e)) => error!("failed to auto-load WASM module from {}: {:#}", path.display(), e),
+                Err(e) => error!("failed to auto-load WASM module from {}: {}", path.display(), e),
+            }
+        }
+    });
+}
+
 /// 스코프를 벗어날 때(정상 종료·`?` 에러 반환·main 태스크의 panic unwind) 붙인 XDP 를 모두 뗀다.
 /// release 프로필도 `panic = "unwind"`(루트 Cargo.toml)라 panic 시 Drop 이 실행된다.
 /// SIGKILL·abort 등 unwind 없는 종료는 정리할 수 없다 → `ip link set dev <if> xdp off` 로 수동 해제.
@@ -116,18 +137,32 @@ async fn run() -> Result<()> {
     // 1. 인수 파싱
     let args = Args::parse();
 
-    // 2. 로거 (--verbose → debug, 아니면 RUST_LOG 또는 info)
-    let mut logger =
-        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"));
-    if args.verbose {
-        logger.filter_level(LevelFilter::Debug);
-    }
+    // 2. 구성 (로거보다 먼저 읽어 general.log_level 을 적용한다. 경고는 로거 초기화 후 출력)
+    let loaded = config::load_config(&args.config);
+
+    // 3. 로거. 우선순위: -v(debug) > RUST_LOG > general.log_level > info
+    //    구성 로드가 실패해도 에러를 출력할 수 있도록 로거는 먼저 초기화한다(info).
+    let cfg_level = loaded
+        .as_ref()
+        .map(|l| l.config.general.log_level.clone())
+        .unwrap_or_else(|_| "info".to_string());
+    let rust_log = std::env::var("RUST_LOG").ok();
+    let mut logger = env_logger::Builder::new();
+    match config::resolve_log_filter(args.verbose, rust_log.as_deref(), &cfg_level) {
+        config::LogFilter::Level(level) => logger.filter_level(level),
+        config::LogFilter::Env(spec) => logger.parse_filters(&spec),
+    };
     logger.init();
 
     info!("Swift-Guard 데몬 시작 중...");
-
-    // 3. 구성
-    let cfg = config::load_config(&args.config)?;
+    let loaded = loaded?;
+    for n in &loaded.notes {
+        info!("{}", n);
+    }
+    for w in &loaded.warnings {
+        warn!("{}", w);
+    }
+    let cfg = loaded.config;
 
     // 4. BPF 오브젝트 로드
     let skel = XdpFilterSkel::builder()
@@ -160,19 +195,30 @@ async fn run() -> Result<()> {
 
     // 8~10. 텔레메트리, WASM, API 서버
     let telemetry = Arc::new(TelemetryCollector::new(&cfg));
-    let wasm = Arc::new(WasmManager::new());
+    // config.rs 가 범위(1–10000ms, 1–4096MiB)를 먼저 검증했다
+    let limits = WasmLimits {
+        inspect_timeout: Duration::from_millis(cfg.wasm.execution_timeout_ms),
+        memory_limit_bytes: cfg.wasm.memory_limit_mb as usize * 1024 * 1024,
+    };
+    let wasm = Arc::new(WasmManager::with_limits(limits));
     let server = ApiServer::new(
         &args.api_addr,
         map_manager.clone(),
         attach.clone(),
         telemetry.clone(),
-        wasm,
+        wasm.clone(),
     );
     let interval = Duration::from_secs(cfg.telemetry.interval.max(1));
+    let listener = server.bind().await?;
 
-    // 11. 실행 (SIGTERM 은 systemd stop). WASM 로드 중에도 시그널 분기는 바로 선택된다.
+    // 11. auto_load: bind 이후 백그라운드에서 순차 로드. 실패는 에러 로그 후 계속(데몬 유지).
+    if cfg.wasm.auto_load && !cfg.wasm.auto_load_modules.is_empty() {
+        spawn_auto_load(wasm, &cfg.wasm.modules_dir, &cfg.wasm.auto_load_modules);
+    }
+
+    // 12. 실행 (SIGTERM 은 systemd stop). WASM 로드 중에도 시그널 분기는 바로 선택된다.
     let result: Result<()> = tokio::select! {
-        r = server.run() => r.context("API server stopped"),
+        r = server.run(listener) => r.context("API server stopped"),
         r = telemetry_loop(&map_manager, &telemetry, interval) => r.context("telemetry loop stopped"),
         _ = sigint.recv() => {
             info!("SIGINT 수신, 종료합니다");
@@ -184,7 +230,7 @@ async fn run() -> Result<()> {
         }
     };
 
-    // 12. 종료 시 detach (netlink attach 는 프로세스 종료 후에도 남는다).
+    // 13. 종료 시 detach (netlink attach 는 프로세스 종료 후에도 남는다).
     //     정상 경로에서도 명시적으로 호출하고, guard 는 남은 것이 없으면 아무것도 하지 않는다.
     drop(_detach_guard);
 

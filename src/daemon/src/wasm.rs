@@ -11,13 +11,24 @@
 //! | guest export | `init` | `() -> ()` | 선택. load 직후 1회 |
 //! | host import | `env.log` | `(i32 ptr, i32 len) -> i32` | 0=성공, -1=잘못된 범위/UTF-8 |
 //!
-//! ## 실행 제한 (QA N-4)
+//! ## 실행 제한 (QA N-4, 계약 C7/C8)
+//! 제한값은 [`WasmLimits`]로 매니저 생성 시 주입한다(`WasmManager::with_limits`).
+//! `WasmManager::new()`는 `WasmLimits::default()`(10ms, 32MiB)를 쓴다.
+//! daemon은 설정 키를 다음처럼 매핑한다(범위 검증은 config.rs 담당):
+//! | 설정 키 | 필드 | 기본값 |
+//! |---------|------|--------|
+//! | `wasm.execution_timeout_ms` | `WasmLimits::inspect_timeout` | 10ms |
+//! | `wasm.memory_limit_mb` | `WasmLimits::memory_limit_bytes` (MiB × 1024²) | 32MiB |
+//!
 //! - 시간: `Config::epoch_interruption` + 매니저 소유 epoch ticker 스레드(`EPOCH_TICK`마다
 //!   `Engine::increment_epoch`). 게스트 호출마다 `Store::set_epoch_deadline`로 deadline을 다시 건다.
-//!   인스턴스화(start 함수)+`init`은 `INIT_TIMEOUT`, `allocate`/`inspect_packet`/`deallocate`는
-//!   각각 `INSPECT_TIMEOUT`. 초과 시 trap → Err. epoch 방식이라 실제 한도는 최대 1 tick 오차가 있다.
-//! - 메모리: `StoreLimits`로 선형 메모리 `MEMORY_LIMIT_BYTES` 상한. 초기 크기가 넘으면 인스턴스화 실패,
-//!   `memory.grow`가 넘으면 게스트에 -1 반환(trap 아님).
+//!   인스턴스화(start 함수)+`init`은 `INIT_TIMEOUT`(상수, 설정 키 없음), `allocate`/`inspect_packet`/
+//!   `deallocate`는 각각 `inspect_timeout`. 초과 시 trap → Err. epoch 방식이라 실제 한도는 최대
+//!   1 tick 오차가 있다. `inspect_packet`은 현재 데이터 경로에서 호출되지 않으므로, 시간 제한의
+//!   효과는 그 경로가 연결될 때 나타난다.
+//! - 메모리: `StoreLimits`로 모듈당 선형 메모리 `memory_limit_bytes` 상한. 로드 시 바로 적용된다.
+//!   초기 크기가 넘으면 인스턴스화 실패, `memory.grow`가 넘으면 게스트에 -1 반환(trap 아님).
+//!   한도 변경은 이후 로드되는 모듈에만 의미가 있으며, 매니저 수명 동안 한도는 고정이다.
 
 use anyhow::{anyhow, bail, Context, Result};
 use log::{debug, info, warn};
@@ -38,11 +49,30 @@ const LOG_BUFFER_CAP: usize = 64 * 1024;
 const EPOCH_TICK: Duration = Duration::from_millis(1);
 /// 인스턴스화(start 함수) + 게스트 `init` 실행 시간 상한.
 const INIT_TIMEOUT: Duration = Duration::from_secs(1);
-/// 게스트 호출 1회(`allocate`/`inspect_packet`/`deallocate` 각각) 실행 시간 상한.
-/// config `execution_timeout_ms` 기본값(10)과 같다.
-const INSPECT_TIMEOUT: Duration = Duration::from_millis(10);
-/// 모듈당 선형 메모리 상한. config `memory_limit_mb` 기본값(32)과 같다.
-const MEMORY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
+/// 기본 게스트 호출 1회(`allocate`/`inspect_packet`/`deallocate` 각각) 실행 시간 상한.
+/// config `wasm.execution_timeout_ms` 기본값(10)과 같다.
+const DEFAULT_INSPECT_TIMEOUT: Duration = Duration::from_millis(10);
+/// 기본 모듈당 선형 메모리 상한. config `wasm.memory_limit_mb` 기본값(32)과 같다.
+const DEFAULT_MEMORY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
+
+/// 게스트 실행 제한. Default = (10ms, 32MiB) — 기존 상수와 같다. (계약 C8)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WasmLimits {
+    /// `allocate`/`inspect_packet`/`deallocate` 각 호출 상한 (`wasm.execution_timeout_ms`).
+    /// 0이어도 최소 1 epoch tick(1ms)이 적용된다.
+    pub inspect_timeout: Duration,
+    /// 모듈당 선형 메모리 상한 (`wasm.memory_limit_mb`, StoreLimits).
+    pub memory_limit_bytes: usize,
+}
+
+impl Default for WasmLimits {
+    fn default() -> Self {
+        Self {
+            inspect_timeout: DEFAULT_INSPECT_TIMEOUT,
+            memory_limit_bytes: DEFAULT_MEMORY_LIMIT_BYTES,
+        }
+    }
+}
 
 /// timeout → epoch tick 수 (올림, 최소 1).
 fn ticks_for(timeout: Duration) -> u64 {
@@ -114,16 +144,16 @@ pub struct WasmModuleStatsSnapshot {
 struct WasmInspectorData {
     /// 게스트 `env.log` 메시지 누적 (상한 LOG_BUFFER_CAP)
     log_buffer: String,
-    /// 선형 메모리 상한 (MEMORY_LIMIT_BYTES)
+    /// 선형 메모리 상한 (`WasmLimits::memory_limit_bytes`)
     limits: StoreLimits,
 }
 
-impl Default for WasmInspectorData {
-    fn default() -> Self {
+impl WasmInspectorData {
+    fn new(memory_limit_bytes: usize) -> Self {
         Self {
             log_buffer: String::new(),
             limits: StoreLimitsBuilder::new()
-                .memory_size(MEMORY_LIMIT_BYTES)
+                .memory_size(memory_limit_bytes)
                 .build(),
         }
     }
@@ -143,6 +173,8 @@ struct WasmInspector {
     inspect_fn: TypedFunc<(i32, i32), i32>,
     allocate_fn: TypedFunc<i32, i32>,
     deallocate_fn: TypedFunc<(i32, i32), ()>,
+    /// 게스트 호출 1회 상한 (매니저의 `WasmLimits::inspect_timeout`)
+    inspect_timeout: Duration,
     processed_packets: u64,
     blocked_packets: u64,
     total_processing_time: Duration,
@@ -208,7 +240,8 @@ fn unix_now_secs() -> u64 {
 
 impl WasmInspector {
     /// 파일을 읽고 컴파일·인스턴스화하고 필수 export를 검증한다.
-    fn load(engine: &Engine, name: &str, path: &Path) -> Result<Self> {
+    /// `limits.memory_limit_bytes`는 Store에, `limits.inspect_timeout`은 inspector에 보관된다.
+    fn load(engine: &Engine, name: &str, path: &Path, limits: WasmLimits) -> Result<Self> {
         debug!("Loading WASM module '{}': {}", name, path.display());
 
         let wasm_bytes = std::fs::read(path)
@@ -217,7 +250,7 @@ impl WasmInspector {
         let module = Module::new(engine, &wasm_bytes)
             .with_context(|| format!("Failed to compile WASM module: {}", path.display()))?;
 
-        let mut store = Store::new(engine, WasmInspectorData::default());
+        let mut store = Store::new(engine, WasmInspectorData::new(limits.memory_limit_bytes));
         store.limiter(|data| &mut data.limits);
         store.epoch_deadline_trap();
         // start 함수와 init을 합쳐 INIT_TIMEOUT 안에 끝나야 한다.
@@ -270,6 +303,7 @@ impl WasmInspector {
             inspect_fn,
             allocate_fn,
             deallocate_fn,
+            inspect_timeout: limits.inspect_timeout,
             processed_packets: 0,
             blocked_packets: 0,
             total_processing_time: Duration::ZERO,
@@ -295,13 +329,14 @@ impl WasmInspector {
         let started = Instant::now();
         let store = &mut self.store;
 
-        let inspect_ticks = ticks_for(INSPECT_TIMEOUT);
+        let timeout = self.inspect_timeout;
+        let inspect_ticks = ticks_for(timeout);
 
         store.set_epoch_deadline(inspect_ticks);
         let ptr = self
             .allocate_fn
             .call(&mut *store, len)
-            .map_err(|e| annotate_timeout(e, "allocate", INSPECT_TIMEOUT))
+            .map_err(|e| annotate_timeout(e, "allocate", timeout))
             .context("Failed to allocate memory in WASM")?;
         if ptr <= 0 {
             bail!("WASM allocate({}) returned invalid pointer {}", len, ptr);
@@ -317,7 +352,7 @@ impl WasmInspector {
             store.set_epoch_deadline(inspect_ticks);
             inspect_fn
                 .call(&mut *store, (ptr, len))
-                .map_err(|e| annotate_timeout(e, "inspect_packet", INSPECT_TIMEOUT))
+                .map_err(|e| annotate_timeout(e, "inspect_packet", timeout))
                 .context("Failed to call inspect_packet function")
         })();
 
@@ -326,7 +361,7 @@ impl WasmInspector {
         let dealloc = self
             .deallocate_fn
             .call(&mut *store, (ptr, len))
-            .map_err(|e| annotate_timeout(e, "deallocate", INSPECT_TIMEOUT))
+            .map_err(|e| annotate_timeout(e, "deallocate", timeout))
             .context("Failed to call deallocate function");
 
         let verdict = result?;
@@ -373,6 +408,8 @@ impl WasmInspector {
 /// WASM 검사 모듈 관리자. `Arc<WasmManager>`로 공유한다 (Send + Sync, 'static).
 pub struct WasmManager {
     engine: Engine,
+    /// 생성 시 고정. 이후 로드되는 모든 모듈에 적용
+    limits: WasmLimits,
     /// 로드 순서대로 보관
     inspectors: Mutex<Vec<WasmInspector>>,
     /// epoch ticker 종료 신호. drop(=송신측 닫힘) 시 ticker가 끝난다.
@@ -384,6 +421,7 @@ pub struct WasmManager {
 impl std::fmt::Debug for WasmManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WasmManager")
+            .field("limits", &self.limits)
             .field("inspectors", &self.inspectors)
             .finish_non_exhaustive()
     }
@@ -399,8 +437,13 @@ const _: () = {
 };
 
 impl WasmManager {
-    /// 새로운 WASM 관리자 생성
+    /// 기본 제한(`WasmLimits::default()` = 10ms, 32MiB)으로 관리자 생성.
     pub fn new() -> Self {
+        Self::with_limits(WasmLimits::default())
+    }
+
+    /// 지정한 실행 제한으로 관리자 생성. 값 범위 검증은 호출자(config.rs) 책임이다.
+    pub fn with_limits(limits: WasmLimits) -> Self {
         let mut config = Config::new();
         config.epoch_interruption(true);
         let engine = Engine::new(&config).unwrap_or_else(|e| {
@@ -429,12 +472,24 @@ impl WasmManager {
             }
         };
 
+        debug!(
+            "WASM manager limits: inspect_timeout={:?}, memory_limit_bytes={}",
+            limits.inspect_timeout, limits.memory_limit_bytes
+        );
+
         Self {
             engine,
+            limits,
             inspectors: Mutex::new(Vec::new()),
             ticker_stop,
             ticker,
         }
+    }
+
+    /// 이 매니저의 실행 제한 (로그·테스트용).
+    #[allow(dead_code)]
+    pub fn limits(&self) -> WasmLimits {
+        self.limits
     }
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, Vec<WasmInspector>>> {
@@ -454,7 +509,7 @@ impl WasmManager {
             bail!("WASM module '{}' is already loaded", name);
         }
 
-        let inspector = WasmInspector::load(&self.engine, name, path)?;
+        let inspector = WasmInspector::load(&self.engine, name, path, self.limits)?;
 
         // 컴파일 중 다른 호출이 같은 이름을 넣었을 수 있으므로 재검사
         let mut inspectors = self.lock()?;
@@ -595,7 +650,7 @@ mod tests {
             (i32.const 0)))
     "#;
 
-    /// 초기 메모리 64MB (1024 pages) > MEMORY_LIMIT_BYTES.
+    /// 초기 메모리 64MB (1024 pages) > 기본 메모리 상한(32MiB).
     const BIG_MEMORY_WAT: &str = r#"
         (module
           (memory (export "memory") 1024)
@@ -791,8 +846,115 @@ mod tests {
     #[test]
     fn ticks_rounding() {
         assert_eq!(ticks_for(Duration::ZERO), 1);
-        assert_eq!(ticks_for(INSPECT_TIMEOUT), 10);
+        assert_eq!(ticks_for(DEFAULT_INSPECT_TIMEOUT), 10);
         assert_eq!(ticks_for(INIT_TIMEOUT), 1000);
         assert_eq!(ticks_for(Duration::from_micros(1500)), 2);
+    }
+
+    /// 초기 메모리 2페이지(128KiB). 상한 1MiB(16페이지) 안이다.
+    /// init에서 grow(14) → 16페이지(=1MiB, 경계 정확히) 성공, 이어서 grow(1) → 상한 초과 -1.
+    const TWO_PAGE_GROW_WAT: &str = r#"
+        (module
+          (memory (export "memory") 2)
+          (global $a (export "a") (mut i32) (i32.const 0))
+          (global $b (export "b") (mut i32) (i32.const 0))
+          (func (export "init")
+            (global.set $a (memory.grow (i32.const 14)))
+            (global.set $b (memory.grow (i32.const 1))))
+          (func (export "allocate") (param i32) (result i32) (i32.const 1024))
+          (func (export "deallocate") (param i32 i32))
+          (func (export "inspect_packet") (param i32 i32) (result i32) (i32.const 0)))
+    "#;
+
+    /// 초기 메모리 17페이지(1MiB + 64KiB) > 1MiB 상한, 기본 상한(32MiB) 안.
+    const SEVENTEEN_PAGE_WAT: &str = r#"
+        (module
+          (memory (export "memory") 17)
+          (func (export "allocate") (param i32) (result i32) (i32.const 1024))
+          (func (export "deallocate") (param i32 i32))
+          (func (export "inspect_packet") (param i32 i32) (result i32) (i32.const 0)))
+    "#;
+
+    fn global_i32(m: &WasmManager, idx: usize, name: &str) -> i32 {
+        let mut g = m.lock().unwrap();
+        let insp = &mut g[idx];
+        let inst = insp.instance;
+        inst.get_global(&mut insp.store, name)
+            .unwrap()
+            .get(&mut insp.store)
+            .i32()
+            .unwrap()
+    }
+
+    #[test]
+    fn limits_default_and_new_delegates() {
+        let d = WasmLimits::default();
+        assert_eq!(d.inspect_timeout, Duration::from_millis(10));
+        assert_eq!(d.memory_limit_bytes, 32 * 1024 * 1024);
+        assert_eq!(WasmManager::new().limits(), d);
+        assert_eq!(WasmManager::default().limits(), d);
+
+        let custom = WasmLimits {
+            inspect_timeout: Duration::from_millis(250),
+            memory_limit_bytes: 1024 * 1024,
+        };
+        assert_eq!(WasmManager::with_limits(custom).limits(), custom);
+    }
+
+    #[test]
+    fn custom_memory_limit_enforced() {
+        let m = WasmManager::with_limits(WasmLimits {
+            inspect_timeout: DEFAULT_INSPECT_TIMEOUT,
+            memory_limit_bytes: 1024 * 1024,
+        });
+
+        // 17페이지 초기 메모리: 기본 매니저는 로드되지만 1MiB 매니저는 거부
+        let p17 = write_tmp("p17", SEVENTEEN_PAGE_WAT);
+        assert!(m.load_module("p17", &p17).is_err());
+        assert!(m.list_modules().unwrap().is_empty());
+        WasmManager::new().load_module("p17", &p17).unwrap();
+
+        // 2페이지 모듈은 로드되고, 정확히 1MiB까지 grow 성공, 그 이상은 -1
+        let p2 = write_tmp("p2", TWO_PAGE_GROW_WAT);
+        m.load_module("p2", &p2).unwrap();
+        assert_eq!(global_i32(&m, 0, "a"), 2, "grow to exactly 1MiB must succeed (old size 2)");
+        assert_eq!(global_i32(&m, 0, "b"), -1, "grow beyond 1MiB must fail");
+        assert!(!m.inspect_packet(&[0x00]).unwrap());
+
+        // 같은 모듈이 기본(32MiB) 매니저에서는 두 번 다 성공
+        let d = WasmManager::new();
+        d.load_module("p2", &p2).unwrap();
+        assert_eq!(global_i32(&d, 0, "a"), 2);
+        assert_eq!(global_i32(&d, 0, "b"), 16);
+
+        let _ = std::fs::remove_file(p17);
+        let _ = std::fs::remove_file(p2);
+    }
+
+    #[test]
+    fn custom_inspect_timeout_applied() {
+        let t = Duration::from_millis(37);
+        let m = WasmManager::with_limits(WasmLimits {
+            inspect_timeout: t,
+            memory_limit_bytes: DEFAULT_MEMORY_LIMIT_BYTES,
+        });
+        assert_eq!(ticks_for(t), 37);
+
+        let p = write_tmp("loopinsp_custom", LOOP_INSPECT_WAT);
+        m.load_module("lp", &p).unwrap();
+        assert_eq!(m.lock().unwrap()[0].inspect_timeout, t);
+
+        let started = Instant::now();
+        let err = m.inspect_packet(&[0xEE]).unwrap_err();
+        let elapsed = started.elapsed();
+        let msg = format!("{:#}", err);
+        // 에러 문구에 주입한 timeout 값이 들어간다(상수 10ms가 아님)
+        assert!(msg.contains("timeout of 37ms"), "{}", msg);
+        assert!(elapsed >= Duration::from_millis(30), "took {:?}", elapsed);
+        assert!(elapsed < Duration::from_secs(2), "took {:?}", elapsed);
+        // 모듈은 계속 사용 가능하고 deallocate도 호출됨
+        assert!(!m.inspect_packet(&[0x01]).unwrap());
+        assert_eq!(global_i32(&m, 0, "deallocs"), 2);
+        let _ = std::fs::remove_file(p);
     }
 }

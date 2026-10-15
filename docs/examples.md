@@ -208,6 +208,7 @@ watch-host           count           10.200.0.4           *                    a
 ```bash
 xf stats --count 2
 ```
+출력 예(수치는 예시이며 환경에 따라 다르다):
 ```
 Collecting 2 samples every 1s...
 Timestamp: 2026-10-14 06:35:31
@@ -215,19 +216,45 @@ Total packets: 38
 Total bytes: 3086 (0.00 MB)
 Packets/sec: n/a
 Bandwidth: n/a
+XDP rx packets: 52
+XDP rx bytes: 4710 (0.00 MB)
+XDP rx packets/sec: n/a
+XDP rx bandwidth: n/a
+XDP verdicts: drop=26 pass=3 redirect=0 count=9 no_match=12 invalid=0 non_ipv4=2 action_error=0
 ----------------------------------------
 Timestamp: 2026-10-14 06:35:32
 Total packets: 38
 Total bytes: 3086 (0.00 MB)
 Packets/sec: 0
 Bandwidth: 0.00 Mbps
+XDP rx packets: 52
+XDP rx bytes: 4710 (0.00 MB)
+XDP rx packets/sec: 0
+XDP rx bandwidth: 0.00 Mbps
+XDP verdicts: drop=26 pass=3 redirect=0 count=9 no_match=12 invalid=0 non_ipv4=2 action_error=0
 ----------------------------------------
 ```
-`Packets/sec`·`Bandwidth`는 CLI가 연속한 두 샘플의 총계 차이로 계산한다. 그래서 첫 샘플은 `n/a`이고, 그 사이에 트래픽이 없으면 0이다. 스크립트에서 쓰려면 `xf stats --format csv --count 60 > stats.csv`(헤더 `timestamp_ms,total_packets,total_bytes,pps,mbps`, 첫 행의 pps·mbps는 빈 칸)를 쓴다.
+두 종류의 통계가 나온다.
+
+| 줄 | 세는 것 |
+|----|---------|
+| `Total packets` / `Total bytes` | **룰에 매치한 패킷**만. 모든 룰의 매치를 합한 값이다(drop·pass·count·redirect 모두) |
+| `XDP rx packets` / `XDP rx bytes` | **XDP가 본 전체 패킷**. 룰 매치와 무관하다 |
+| `XDP verdicts` | 전체 패킷이 어떻게 처리됐는지. `drop`·`pass`·`redirect`·`count` = 룰 액션, `no_match` = 매치한 룰이 없어 통과, `invalid` = 비정상 헤더·tiny fragment라 룰과 무관하게 차단, `non_ipv4` = IPv6·ARP·VLAN 태그 프레임이라 검사 없이 통과, `action_error` = 룰은 매치했지만 실행할 수 없어 통과(redirect 대상 인터페이스가 사라진 경우 등) |
+
+`XDP rx packets`는 `XDP verdicts`의 8개 값을 더한 것과 같다(트래픽이 흐르는 중에는 조금 어긋날 수 있다). 위 예에서 `Total packets` 38 = drop 26 + pass 3 + redirect 0 + count 9 이고, 매치하지 않은 12개는 `no_match`로만 보인다.
+
+`Packets/sec`·`Bandwidth`(룰 매치 기준)와 `XDP rx packets/sec`·`XDP rx bandwidth`(전체 기준)는 CLI가 연속한 두 샘플의 총계 차이로 계산한다. 그래서 첫 샘플은 `n/a`이고, 그 사이에 트래픽이 없으면 0이다. daemon이 이전 버전이라 XDP 카운터를 주지 않으면 XDP 줄 대신 `XDP counters: n/a (daemon does not report them)` 한 줄이 나온다.
+
+스크립트에서 쓰려면 `xf stats --format csv --count 60 > stats.csv`를 쓴다. 헤더는 17열로 고정이다.
+```
+timestamp_ms,total_packets,total_bytes,pps,mbps,xdp_rx_packets,xdp_rx_bytes,xdp_rx_pps,xdp_rx_mbps,xdp_drop_packets,xdp_pass_packets,xdp_redirect_packets,xdp_count_packets,xdp_no_match_packets,xdp_invalid_packets,xdp_non_ipv4_packets,xdp_action_error_packets
+```
+첫 행의 비율 열(`pps`, `mbps`, `xdp_rx_pps`, `xdp_rx_mbps`)은 빈 칸이다.
 ```bash
 xf delete-rule --label watch-host
 ```
-룰별 통계(`Packets`)는 그 룰에 매치한 패킷만 센다. 전체 통계(`Total packets`)는 모든 룰의 매치를 합한 값이다. **어떤 룰에도 매치하지 않은 패킷은 전체 통계에도 잡히지 않는다.** 패킷 수는 환경에 따라 다를 수 있다.
+룰별 통계(`Packets`)는 그 룰에 매치한 패킷만 센다. **어떤 룰에도 매치하지 않은 패킷은 `Total packets`에는 잡히지 않고 `XDP rx packets`와 `no_match`에만 잡힌다.** 트래픽이 XDP에 도달하는지 보려면 `XDP rx packets`를 본다.
 
 ## 예시 8. 검사 인터페이스로 리다이렉트
 
@@ -259,6 +286,12 @@ daemon은 잘못된 룰을 받으면 에러로 응답한다. CLI 종료 코드�
 | `xf add-rule --src-ip 10.200.0.3 --action redirect --redirect-if nope0 --label bad3` | `Error: unknown interface 'nope0': ENODEV: No such device` |
 | `xf add-rule --src-ip 10.200.0.3 --action drop --redirect-if sg-lab-insp0 --label bad4` | `Error: redirect_if 'sg-lab-insp0' is only allowed with the redirect action` |
 | `xf add-rule --src-ip 10.200.0.3 --action redirect --label bad5` | `Error: Redirect action requires '--redirect-if' parameter` ← CLI가 먼저 검사한다 |
+| `xf add-rule --src-ip 10.200.0.3 --action drop --priority 10 --label bad6` | `Error: priority is not implemented yet: only 0 is accepted (got 10)` |
+| `xf add-rule --src-ip 10.200.0.3 --action drop --rate-limit 1000 --label bad7` | `Error: rate_limit is not implemented yet: only 0 is accepted (got 1000)` |
+| `xf add-rule --src-ip 10.200.0.3 --action drop --expire 60 --label bad8` | `Error: expire is not implemented yet: only 0 is accepted (got 60)` |
+| `xf add-rule --src-ip 10.200.0.3 --action drop --pkt-len 64-128 --label bad9` | `Error: --pkt-len is not implemented yet` ← CLI가 요청을 보내기 전에 거부한다 |
+
+`--priority`·`--rate-limit`·`--expire`는 아직 구현되지 않았다. 기본값 0은 그대로 허용되고, 0이 아닌 값은 daemon이 거부한다(이전 버전은 저장만 하고 적용하지 않았다). `--pkt-len`은 값과 상관없이 거부된다.
 
 같은 prefix라도 출발지 룰과 목적지 룰은 따로 둘 수 있다(예: `--src-ip 10.200.0.2` 룰과 `--dst-ip 10.200.0.2` 룰을 함께 둘 수 있다). label은 전체에서 유일해야 한다.
 
@@ -286,7 +319,8 @@ Avg processing time: 0.00 us
 Module unloaded: WASM module 'http-inspector' unloaded
 ```
 - 현재 버전은 모듈 관리(load/list/stats/unload)만 한다. XDP에서 WASM으로 패킷을 넘기는 데이터 경로는 아직 연결되지 않았으므로, `Processed packets`는 0으로 남는다.
-- 신뢰할 수 있는 모듈만 로드한다. `init`과 패킷 검사에는 실행 시간 제한이 있고 메모리는 32MB로 제한되지만, 모듈 컴파일 자체에는 시간 제한이 없다.
+- 신뢰할 수 있는 모듈만 로드한다. 패킷 검사 호출에는 실행 시간 제한(기본 10ms), 모듈 메모리에는 상한(기본 32MB)이 있다. 두 값은 설정 파일의 `wasm.execution_timeout_ms`, `wasm.memory_limit_mb`로 바꿀 수 있다. `init`의 시간 제한은 1초로 고정이고, 모듈 컴파일 자체에는 시간 제한이 없다.
+- daemon을 시작할 때 모듈을 자동으로 올리려면 설정 파일에서 `wasm.auto_load: true`와 `wasm.auto_load_modules`를 쓴다. 로드에 실패해도 daemon은 에러를 로그에 남기고 계속 동작한다.
 - 저장소 빌드본은 `wasm/modules/http_inspector.wasm`에 있다.
 
 ## 예시 11. 목적지(서버 IP) 기준 차단
@@ -382,7 +416,7 @@ journalctl -u swift-guard -f              # 로그
 xf attach eth0 --mode driver              # 이후 CLI 사용법은 동일
 sudo systemctl stop swift-guard           # SIGTERM → XDP 자동 해제
 ```
-설정 파일은 `/etc/swift-guard/config.yaml`이다(예시: `config/swift-guard.yaml`).
+설정 파일은 `/etc/swift-guard/config.yaml`이다(예시: `config/swift-guard.yaml`). 로그 수준(`general.log_level`, 기본 `info`)과 WASM 모듈 자동 로드(`wasm.auto_load`)를 여기서 정한다. 로그 수준은 `-v` > `RUST_LOG` 환경변수 > `general.log_level` 순으로 적용된다. 이전 버전 설정 파일에만 있던 키(`general.work_dir`, `interfaces`, `rules` 등)는 `config key '...' is no longer supported and is ignored` 경고를 남기고 무시되므로, 업그레이드한 뒤에도 그대로 기동한다.
 
 ---
 
@@ -396,10 +430,13 @@ sudo systemctl stop swift-guard           # SIGTERM → XDP 자동 해제
 | prefix당 룰 1개 | 출발지·목적지 맵별로 prefix당 1개. 같은 맵에 두 번째 룰을 넣으면 거부된다. label은 전체에서 유일하다. 포트별로 다른 동작이 필요하면 prefix를 나눈다 |
 | 세부 조건 | 이긴 룰의 프로토콜·포트·TCP 플래그가 맞을 때만 액션을 실행한다. 맞지 않으면 목적지 룰로 넘어가고, 그것도 아니면 **통과**한다. 같은 맵의 더 짧은 prefix로 되돌아가 다시 찾지 않는다 |
 | 프로토콜 | `tcp`, `udp`, `icmp`, `any`(기본값) |
-| 포트 | `N` 또는 `N-M`. ICMP는 포트가 0이므로, 포트 조건이 있는 룰과는 매치하지 않는다 |
+| 포트·TCP 플래그 | 포트는 `N` 또는 `N-M`. 포트나 TCP 플래그 조건이 있는 룰은 **L4 헤더를 확인할 수 있는 패킷에만** 매치한다. ICMP(포트 없음), 조각의 두 번째 이후 조각, L4가 짧은 비조각 패킷(`tot_len − IHL×4`가 TCP 20B / UDP 8B 미만)과는 매치하지 않는다. 포트 범위에 0이 들어 있어도(예: `0-1023`) 마찬가지다 |
+| IP 옵션 | IPv4 헤더 길이(IHL)만큼 옵션을 건너뛰고 L4 헤더를 읽는다. 옵션이 붙어 있어도 포트 룰이 똑같이 적용된다 |
+| 조각(fragment) | 첫 조각은 L4 헤더가 온전하면 포트·플래그까지 평가한다. 두 번째 이후 조각에는 L4 헤더가 없으므로 IP·프로토콜만 쓰는 룰만 매치한다(포트 룰로 첫 조각이 막히면 재조립이 실패해 나머지도 전달되지 않는다). 조각 재조립이나 추적은 하지 않는다 |
+| 무조건 차단 | 다음 패킷은 룰과 상관없이 DROP한다(`XDP verdicts`의 `invalid`). `pass` 룰로도 예외 처리할 수 없다: tiny fragment(첫 조각인데 TCP 20B / UDP 8B 헤더가 다 들어 있지 않음), offset이 1인 TCP 조각(RFC 1858), version≠4·IHL<5·IPv4 헤더 20B 미만·IHL이 가리키는 길이가 패킷보다 긴 패킷, IP 전체 길이(`tot_len`)가 IHL×4보다 작거나 받은 프레임보다 긴(프레임이 잘린) 패킷. 정상 스택은 이런 패킷을 만들지 않고, 비정상 헤더는 커널도 버린다. L4 헤더가 온전한지는 IP 헤더의 전체 길이(`tot_len`)로 판단한다. 그래서 짧은 프레임 뒤에 붙는 이더넷 패딩(최소 60B까지 0으로 채움)은 L4 헤더로 취급하지 않는다 |
 | 액션 | `drop`, `pass`, `count`(통과하며 집계), `redirect`(`--redirect-if` 필요) |
-| 미구현 | `--priority`, `--rate-limit`, `--expire`, `--pkt-len`은 저장만 되고 아직 적용되지 않는다 |
-| 대상 트래픽 | XDP를 붙인 인터페이스로 **들어오는** IPv4 패킷. IPv6와 ARP는 그대로 통과한다 |
+| 미구현 | `--priority`, `--rate-limit`, `--expire`는 0이 아닌 값을 넣으면 거부된다(기본값 0은 허용). `--pkt-len`은 지정하면 거부된다([예시 9](#예시-9-거부되는-입력)) |
+| 대상 트래픽 | XDP를 붙인 인터페이스로 **들어오는** IPv4 패킷. IPv6, ARP, 802.1Q VLAN 태그가 붙은 프레임은 검사 없이 통과한다(`non_ipv4`로 집계). NIC의 VLAN 오프로드로 태그가 떼어진 채 들어오면 IPv4로 검사된다 |
 
 ## 문제 해결
 
@@ -409,6 +446,9 @@ sudo systemctl stop swift-guard           # SIGTERM → XDP 자동 해제
 | `BPF object load failed` / `BTF is required` | `xdp_filter.o`를 `make -C src/bpf`로 다시 빌드한다(`-g`가 빠지면 BTF가 없다). 커널 5.10 이상인지 확인한다 |
 | attach 실패 (driver) | `--mode generic`으로 재시도한다. 드라이버 지원 여부는 `ethtool -i eth0`로 확인한다 |
 | `already attached` | 이미 붙어 있다. `xf detach <if>` 후 다시 붙이거나 `--force`를 쓴다 |
+| `Total packets`가 0에서 늘지 않음 | `Total packets`는 룰에 매치한 패킷만 센다. `XDP rx packets`가 늘면 트래픽은 XDP에 도달하고 있고 룰이 매치하지 않는 것이다(`no_match`가 함께 는다). `XDP rx packets`도 그대로면 트래픽이 이 인터페이스로 들어오지 않는다 |
+| `BPF object has no map 'xdp_stats_map'` | 이전 버전 `xdp_filter.o`로 daemon을 띄웠다. `make -C src/bpf`로 다시 빌드하고 다시 설치한다 |
+| `... is not implemented yet` | `--priority`·`--rate-limit`·`--expire`에 0이 아닌 값, 또는 `--pkt-len`을 썼다. 해당 옵션을 빼고 다시 실행한다([예시 9](#예시-9-거부되는-입력)) |
 | 룰을 넣었는데 매치가 안 됨 | [룰 매칭 규칙](#룰-매칭-규칙-요약)을 본다(같은 IP에 더 긴 prefix 룰이 있는지, 프로토콜·포트 조건, 목적지 룰이라면 같은 패킷에 매치하는 출발지 룰이 먼저 적용되지 않았는지). `xf list-rules --stats`로 매치 수를 확인한다 |
 | WASM `unreachable` trap | 오래된 모듈 빌드다. 호스트 함수는 `#[link(wasm_import_module = "env")]`로 선언해야 한다(`wasm/modules/http_inspector.rs` 참고) |
 

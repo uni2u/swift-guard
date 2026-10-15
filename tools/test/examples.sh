@@ -121,6 +121,8 @@ x list-rules --stats
 STATS="$("$XF" stats --count 2 2>/dev/null || true)"
 [ $VERBOSE -eq 1 ] && { echo "\$ xdp-filter stats --count 2"; echo "$STATS" | sed 's/^/  /'; }
 check "전역 통계 출력" 'echo "$STATS" | grep -q "Total packets"'
+check "XDP 전체 카운터 출력" 'echo "$STATS" | grep -q "^XDP rx packets: [0-9]"'
+check "XDP 결과별 카운터 출력" 'echo "$STATS" | grep -q "^XDP verdicts: drop=[0-9]* .*no_match=[0-9]* invalid=[0-9]* non_ipv4=[0-9]*"'
 x delete-rule --label watch-host
 
 # ------------------------------------------------------------ 8. redirect
@@ -144,6 +146,11 @@ check "같은 prefix의 src+dst 동시 허용" 'x add-rule --dst-ip 10.200.0.2 -
 check "없는 인터페이스로 redirect → 거부" '! x add-rule --src-ip 10.200.0.3 --action redirect --redirect-if nope0 --label bad3'
 check "drop 룰에 --redirect-if → 거부" '! x add-rule --src-ip 10.200.0.3 --action drop --redirect-if sg-lab-insp0 --label bad4'
 expect_err "redirect인데 --redirect-if 없음 → 거부" "Redirect action requires '--redirect-if' parameter" add-rule --src-ip 10.200.0.3 --action redirect --label bad5
+expect_err "--priority 0 이외 → 거부 (미구현)" "Error: priority is not implemented yet: only 0 is accepted (got 10)" add-rule --src-ip 10.200.0.3 --action drop --priority 10 --label bad6
+expect_err "--rate-limit 0 이외 → 거부 (미구현)" "Error: rate_limit is not implemented yet: only 0 is accepted (got 1000)" add-rule --src-ip 10.200.0.3 --action drop --rate-limit 1000 --label bad7
+expect_err "--expire 0 이외 → 거부 (미구현)" "Error: expire is not implemented yet: only 0 is accepted (got 60)" add-rule --src-ip 10.200.0.3 --action drop --expire 60 --label bad8
+expect_err "--pkt-len 지정 → 거부 (미구현)" "Error: --pkt-len is not implemented yet" add-rule --src-ip 10.200.0.3 --action drop --pkt-len 64-128 --label bad9
+check "미구현 옵션 거부 후 룰이 남지 않음" '! "$XF" list-rules 2>/dev/null | grep -qE "^bad[6-9][[:space:]]"'
 x delete-rule --label dup-a-dst
 x delete-rule --label dup-c
 x delete-rule --label dup-a

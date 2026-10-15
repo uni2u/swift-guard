@@ -1,8 +1,10 @@
 //! 맵 관리자 모듈
-//! BPF 맵(filter_rules / dst_rules / redirect_map / stats_map)을 관리한다.
+//! BPF 맵(filter_rules / dst_rules / redirect_map / stats_map / xdp_stats_map)을 관리한다.
 //! - filter_rules: 출발지 IP prefix LPM 룰 (먼저 평가)
 //! - dst_rules: 목적지 IP prefix LPM 룰 (출발지 룰이 없거나 조건 불일치일 때 평가)
 //! - 두 룰 맵은 같은 키(prefix_key)·값(filter_rule 88B) 형식이며 redirect_map 을 공유한다.
+//! - stats_map: 룰에 매치한 패킷만 센다 (PERCPU_ARRAY 1칸, filter_stats 24B).
+//! - xdp_stats_map: XDP 가 본 전체 패킷(SG_STAT_RX)과 결과별 슬롯(PERCPU_ARRAY 9칸, sg_counter 16B).
 //!
 //! 바이트 직렬화는 전부 `swift_guard::bpf_layout` 을 사용한다(C 레이아웃이 원천).
 //! MapManager 는 XdpFilterSkel 을 소유하며 !Send 이므로 main 태스크에서만 사용한다.
@@ -13,7 +15,7 @@ use log::{debug, warn};
 
 use crate::bpf::XdpFilterSkel;
 
-use swift_guard::api::{RuleInfo, RuleStats};
+use swift_guard::api::{RuleInfo, RuleStats, XdpCounters};
 use swift_guard::bpf_layout::{self, FilterRuleValue};
 use swift_guard::types::MatchSide;
 use swift_guard::utils;
@@ -22,6 +24,7 @@ const FILTER_RULES_MAP: &str = "filter_rules";
 const DST_RULES_MAP: &str = "dst_rules";
 const REDIRECT_MAP: &str = "redirect_map";
 const STATS_MAP: &str = "stats_map";
+const XDP_STATS_MAP: &str = "xdp_stats_map";
 const XDP_PROG: &str = "xdp_filter_func";
 
 /// redirect 액션 값 (ACTION_REDIRECT)
@@ -142,12 +145,23 @@ impl std::fmt::Debug for MapManager {
 }
 
 impl MapManager {
-    /// 4개 맵과 XDP 프로그램이 오브젝트에 있는지 검증한다.
-    /// 오래된 xdp_filter.o 라면 `BPF object has no map 'dst_rules'` 로 기동이 실패한다.
+    /// 5개 맵과 XDP 프로그램이 오브젝트에 있는지 검증한다.
+    /// 오래된 xdp_filter.o 라면 `BPF object has no map 'xdp_stats_map'` 등으로 기동이 실패한다.
     pub fn new(skel: XdpFilterSkel) -> Result<Self> {
-        for name in [FILTER_RULES_MAP, DST_RULES_MAP, REDIRECT_MAP, STATS_MAP] {
+        for name in [FILTER_RULES_MAP, DST_RULES_MAP, REDIRECT_MAP, STATS_MAP, XDP_STATS_MAP] {
             if skel.obj.map(name).is_none() {
                 return Err(anyhow!("BPF object has no map '{}'", name));
+            }
+        }
+        if let Some(m) = skel.obj.map(XDP_STATS_MAP) {
+            let n = m.value_size() as usize;
+            if n != bpf_layout::SG_COUNTER_SIZE {
+                return Err(anyhow!(
+                    "BPF map '{}' value size {} != {} (rebuild xdp_filter.o)",
+                    XDP_STATS_MAP,
+                    n,
+                    bpf_layout::SG_COUNTER_SIZE
+                ));
             }
         }
         if skel.obj.prog(XDP_PROG).is_none() {
@@ -399,6 +413,24 @@ impl MapManager {
         Ok(per_cpu
             .map(|v| bpf_layout::sum_percpu_stats(&v))
             .unwrap_or((0, 0)))
+    }
+
+    /// XDP 전체·결과별 카운터 (xdp_stats_map 키 0..MAX 를 각각 CPU별 합산).
+    /// 슬롯 조회 결과가 None 이면 0 으로 둔다. 슬롯별로 따로 읽으므로 트래픽 중에는 합이 약간 어긋날 수 있다.
+    pub fn get_xdp_counters(&self) -> Result<XdpCounters> {
+        let map = self.map(XDP_STATS_MAP)?;
+        let mut slots = Vec::with_capacity(bpf_layout::xdp_stat::MAX as usize);
+        for idx in 0..bpf_layout::xdp_stat::MAX {
+            let per_cpu = map
+                .lookup_percpu(&idx.to_ne_bytes(), MapFlags::ANY)
+                .with_context(|| format!("Failed to read xdp_stats_map slot {}", idx))?;
+            slots.push(
+                per_cpu
+                    .map(|v| bpf_layout::sum_percpu_counters(&v))
+                    .unwrap_or((0, 0)),
+            );
+        }
+        Ok(bpf_layout::xdp_counters_from_slots(&slots))
     }
 }
 

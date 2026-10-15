@@ -2,21 +2,30 @@
 # shellcheck disable=SC2034  # 변수 다수는 source 하는 스크립트가 사용한다
 # tools/bench 공통 함수. basic_throughput_test.sh / rule_scaling_test.sh 가 source 한다(단독 실행 X).
 #
-# 제공: 공통 옵션 파싱(bench_common_opt / bench_finalize_opts), daemon 탐지·기동, attach, 매치 룰,
-#       measure_once(측정 1회 → MEASURE_RESULT), meta 파일, cleanup(trap EXIT INT TERM).
+# 제공: 공통 옵션 파싱(bench_common_opt / bench_finalize_opts), daemon 탐지·기동, stats CSV 계약 확인,
+#       attach, 매치 룰, measure_once(측정 1회 → MEASURE_RESULT + MEASURE_XDP_RESULT), meta 파일,
+#       cleanup(trap EXIT INT TERM).
 # 전제: 호출 스크립트가 `set -euo pipefail` 이고 BENCH_NAME, BENCH_DEFAULT_DURATION 을 먼저 정한다.
 #
 # 측정 원리 (docs/poc-plan.md "측정 전 공통 사항"):
-#   xdp-filter stats 의 총계는 **룰에 매치한 패킷만** 센다(BPF stats_map 은 apply_rule 안에서만 증가).
-#   그래서 트래픽 출발지(--src-ip)에 매치하는 룰(label bench-match)을 넣고 측정한다.
-#   if_rx_pps(인터페이스 rx 카운터)는 룰과 무관한 참고값이다.
+#   `xdp-filter stats --format csv` 한 행에는 두 종류의 카운터가 있다(17열, STATS_CSV_HEADER).
+#   - xdp_rx_*  (8·9열 → xdp_rx_pps/xdp_rx_gbps): BPF xdp_stats_map 의 RX 슬롯. XDP가 본 **모든 프레임**을
+#     파싱 전에 센다. 룰 매치와 무관하므로 **XDP 처리량의 1차 지표**다.
+#   - total_*   (4·5열 → pps/gbps): BPF stats_map. **룰에 매치한 패킷만** 센다(apply_rule 안에서만 증가).
+#     매치 룰(label bench-match)의 액션 경로(drop/count)를 거친 패킷 수다.
+#   매치 룰은 측정 시나리오를 정한다: drop(기본) = XDP_DROP 경로, count = 룰 매치 후 XDP_PASS,
+#   none = 룰 없음(no_match → XDP_PASS, 커널 스택까지 감). 어느 경우든 xdp_rx_pps 로 처리량을 잰다.
+#   if_rx_pps(인터페이스 rx 카운터)는 드라이버가 센 참고값이다(XDP_DROP 계수 방식은 드라이버마다 다르다).
 
 BENCH_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$BENCH_LIB_DIR/../.." && pwd)"
 LAB="$ROOT/tools/test/lab.sh"
 PKTGEN_TX="$BENCH_LIB_DIR/pktgen_tx.sh"
-STATS_CSV_HEADER="timestamp_ms,total_packets,total_bytes,pps,mbps"
+# xdp-filter stats --format csv 헤더 (CLI STATS_CSV_HEADER 와 같은 고정 계약, 17열)
+STATS_CSV_HEADER="timestamp_ms,total_packets,total_bytes,pps,mbps,xdp_rx_packets,xdp_rx_bytes,xdp_rx_pps,xdp_rx_mbps,xdp_drop_packets,xdp_pass_packets,xdp_redirect_packets,xdp_count_packets,xdp_no_match_packets,xdp_invalid_packets,xdp_non_ipv4_packets,xdp_action_error_packets"
 MEASURE_FIELDS="samples,pps,pps_peak,gbps,cpu_util,cpu_softirq,cpu_busiest,if_rx_pps,daemon_rss_kb"
+# 요약 CSV 맨 끝에 붙는 열 (MEASURE_XDP_RESULT 의 순서)
+XDP_MEASURE_FIELDS="xdp_rx_pps,xdp_rx_pps_peak,xdp_rx_gbps"
 MAX_RULES_PER_MAP=10240
 LAB_IF=sg-lab0; LAB_SRC=10.200.0.2; LAB_DST=10.200.0.1
 
@@ -30,7 +39,7 @@ NO_PROMPT=0; WARMUP=2
 DAEMON_PID=""; DAEMON_STARTED=0; DAEMON_REUSED=0; ATTACHED=0; LAB_STARTED=0
 STATS_PID=""; GEN_PID=""; PKTGEN_ACTIVE=0; CLEANED=0
 RULES_CREATED=()
-MEASURE_RESULT=""
+MEASURE_RESULT=""; MEASURE_XDP_RESULT=""
 
 log()  { echo "[$BENCH_NAME] $*"; }
 warn() { echo "[$BENCH_NAME] WARN: $*" >&2; }
@@ -50,7 +59,10 @@ BENCH_COMMON_USAGE='공통 옵션:
   --dst-ip <ip>             트래픽 목적지 IP (lab 10.200.0.1, 그 외 --interface 의 첫 IPv4, 없으면 198.18.0.1)
   --rule-action drop|count|none
                             트래픽에 매치하는 룰(label bench-match)의 액션 (기본 drop).
-                            none 이면 룰 없음 → xdp 통계 0, if_rx_pps 만 의미 있음
+                            처리량(xdp_rx_pps)은 어느 값이든 룰과 무관하게 측정된다. 액션은 경로를 정한다:
+                              drop  XDP_DROP 경로 (대표 지표)
+                              count 룰 매치 후 XDP_PASS
+                              none  룰 없음 → no_match 로 XDP_PASS (커널 스택 경로). pps/gbps(룰 매치)는 0
   --output-dir <dir>        결과 디렉토리 (기본 ./results)
   --api-server <addr>       daemon API 주소 (기본 127.0.0.1:7654)
   --bpf-obj <path>          daemon 기동 시 BPF 오브젝트 (기본 src/bpf/xdp_filter.o, 없으면 /usr/local/lib/swift-guard/xdp_filter.o)
@@ -210,6 +222,18 @@ bench_start_daemon() {
   log "daemon 기동 (pid $DAEMON_PID, $API, log $OUT_DIR/daemon.log)"
 }
 
+# stats CSV 계약 확인 (측정 전에 한 번). 헤더가 다르면 xdp_rx_* 요약이 불가능하므로 중단한다.
+bench_check_stats_csv() {
+  local out hdr row rx
+  out="$(xf stats --format csv --count 1 2>&1)" || die "xdp-filter stats --format csv 실패: $(echo "$out" | tail -1)"
+  hdr="$(echo "$out" | head -1)"; row="$(echo "$out" | sed -n 2p)"
+  [ "$hdr" = "$STATS_CSV_HEADER" ] \
+    || die "xdp-filter stats CSV 헤더가 계약(17열)과 다르다 → xdp-filter 재빌드 필요 (cargo build --release). 받은 헤더: $hdr"
+  rx="$(echo "$row" | cut -d, -f6)"
+  [ -n "$rx" ] \
+    || die "daemon이 XDP 카운터를 주지 않는다(xdp_rx_packets 빈 칸) → swift-guard-daemon·xdp_filter.o 재빌드 후 재기동"
+}
+
 bench_attach() {
   if [ "$NO_ATTACH" -eq 1 ]; then log "--no-attach: $IFACE 에 이미 붙어 있다고 가정"; return; fi
   # 재사용 daemon이 붙여 둔 XDP를 --force 로 교체하면 정리 단계 detach 가 운영 필터를 떼어낸다 → 거부
@@ -242,7 +266,7 @@ bench_add_rule() {
 # bench_add_match_rule src|dst : 트래픽(출발지 또는 목적지)에 매치하는 룰 bench-match
 bench_add_match_rule() {
   local side="${1:-src}"
-  [ "$RULE_ACTION" = none ] && { warn "--rule-action none: 매치 룰 없음 → xdp 통계(pps/gbps)는 0, if_rx_pps 만 의미 있음"; return; }
+  [ "$RULE_ACTION" = none ] && { log "--rule-action none: 매치 룰 없음 → no_match(XDP_PASS) 경로. 처리량은 xdp_rx_pps, pps/gbps(룰 매치)는 0"; return; }
   # 재사용 daemon에 같은 label 이 이미 있으면 지우지 않고 중단한다 (사용자 룰일 수 있다)
   if [ "$DAEMON_REUSED" -eq 1 ] && xf list-rules 2>/dev/null | awk 'NR>2 { print $1 }' | grep -qx bench-match; then
     die "재사용 daemon에 label 'bench-match' 룰이 이미 있다 (이전 실행 잔여물이면 xdp-filter delete-rule --label bench-match 후 다시 실행)"
@@ -311,18 +335,24 @@ cpu_delta() {
        END { if (tot>0) printf "%.1f,%.1f,%.1f", 100*tb/tot, 100*ts/tot, 100*best; else printf "0.0,0.0,0.0" }' "$1" "$2"
 }
 
-# summarize_stats <raw_csv> → "samples,pps,pps_peak,gbps" (C1 CSV → C4 요약 규칙)
-summarize_stats() {
-  awk -F, 'NR==1 { next }
+# summarize_rate <raw_csv> <pps열> <mbps열> → "samples,pps,pps_peak,gbps"
+#   samples = 데이터 행 수. pps = 빈 칸이 아니고 0보다 큰 샘플의 평균(3개 이상이면 처음·끝 제외),
+#   pps_peak = 최대값, gbps = 같은 샘플의 mbps 평균 / 1000.
+summarize_rate() {
+  awk -F, -v pc="$2" -v mc="$3" 'NR==1 { next }
            NF>=5 { n++
-                   if ($4 != "") { if ($4+0 > peak) peak=$4+0
-                                   if ($4+0 > 0) { k++; P[k]=$4+0; M[k]=$5+0 } } }
+                   if ($pc != "") { if ($pc+0 > peak) peak=$pc+0
+                                    if ($pc+0 > 0) { k++; P[k]=$pc+0; M[k]=$mc+0 } } }
            END { s=1; e=k; if (k>=3) { s=2; e=k-1 }
                  sp=0; sm=0; c=0
                  for (i=s;i<=e;i++) { sp+=P[i]; sm+=M[i]; c++ }
                  if (c>0) printf "%d,%d,%d,%.4f", n, int(sp/c+0.5), peak, sm/c/1000
                  else printf "%d,0,%d,0.0000", n+0, peak+0 }' "$1"
 }
+# summarize_stats <raw_csv> → "samples,pps,pps_peak,gbps" (4·5열: 룰 매치 기준)
+summarize_stats() { summarize_rate "$1" 4 5; }
+# summarize_xdp_stats <raw_csv> → "xdp_rx_pps,xdp_rx_pps_peak,xdp_rx_gbps" (8·9열: XDP 전체 기준)
+summarize_xdp_stats() { summarize_rate "$1" 8 9 | cut -d, -f2-; }
 
 daemon_rss_kb() {
   [ -n "$DAEMON_PID" ] && [ -r "/proc/$DAEMON_PID/status" ] || { echo ""; return; }
@@ -360,7 +390,8 @@ gen_run() {
   esac
 }
 
-# measure_once <size> <raw_csv> <gen_log> → MEASURE_RESULT="$MEASURE_FIELDS" 순서의 값
+# measure_once <size> <raw_csv> <gen_log>
+#   → MEASURE_RESULT="$MEASURE_FIELDS" 순서의 값, MEASURE_XDP_RESULT="$XDP_MEASURE_FIELDS" 순서의 값
 measure_once() {
   local size="$1" raw="$2" glog="$3" cA cB rA rB tA tB cpu st if_rx
   cA="$(mktemp)"; cB="$(mktemp)"
@@ -381,16 +412,20 @@ measure_once() {
     die "xdp-filter stats 가 비정상 종료 (rc=$stats_rc: $(head -c 300 "$raw.err")) — 이 측정은 기록하지 않음"
   fi
   [ -s "$raw.err" ] || rm -f "$raw.err"
-  [ "$(head -1 "$raw" 2>/dev/null)" = "$STATS_CSV_HEADER" ] || warn "$raw 헤더가 계약과 다르다"
+  [ "$(head -1 "$raw" 2>/dev/null)" = "$STATS_CSV_HEADER" ] \
+    || die "$raw 헤더가 계약(17열)과 다르다 → xdp-filter 재빌드 필요 — 이 측정은 기록하지 않음"
   st="$(summarize_stats "$raw")"
   [ "${st%%,*}" -gt 0 ] || die "$raw 에 데이터 행이 없다 — 이 측정은 기록하지 않음"
   cpu="$(cpu_delta "$cA" "$cB")"
   if_rx="$(awk -v a="$rA" -v b="$rB" -v t0="$tA" -v t1="$tB" 'BEGIN { d=t1-t0; if (d>0) printf "%d", (b-a)/d+0.5; else print 0 }')"
   rm -f "$cA" "$cB"
   MEASURE_RESULT="$st,$cpu,$if_rx,$(daemon_rss_kb)"
-  local pps; pps="$(echo "$st" | cut -d, -f2)"
-  if [ "$pps" = 0 ] && [ "$RULE_ACTION" != none ]; then
-    warn "xdp 통계가 증가하지 않았다 — 룰이 트래픽에 매치하지 않음? --src-ip $SRC_IP 확인 (if_rx_pps=$if_rx)"
+  MEASURE_XDP_RESULT="$(summarize_xdp_stats "$raw")"
+  local pps xrx; pps="$(echo "$st" | cut -d, -f2)"; xrx="${MEASURE_XDP_RESULT%%,*}"
+  if [ "$xrx" = 0 ]; then
+    warn "xdp_rx_pps=0 — 트래픽이 XDP에 도달하지 않음 (--interface $IFACE, 송신 경로·dst MAC 확인, if_rx_pps=$if_rx)"
+  elif [ "$pps" = 0 ] && [ "$RULE_ACTION" != none ]; then
+    warn "pps(룰 매치)=0 — bench-match 룰이 트래픽에 매치하지 않음 (--src-ip $SRC_IP / --dst-ip $DST_IP 확인, xdp_rx_pps=$xrx)"
   fi
 }
 

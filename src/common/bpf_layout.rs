@@ -1,9 +1,11 @@
 // Swift-Guard BPF 맵 바이트 레이아웃
 // include/swift_guard.h 의 C 구조체를 명시적 offset으로 직렬화/역직렬화한다.
-// C 레이아웃이 원천이다: filter_rule=88, prefix_key=8, if_redirect=20, filter_stats=24.
+// C 레이아웃이 원천이다: filter_rule=88, prefix_key=8, if_redirect=20, filter_stats=24, sg_counter=16.
 // 순수 Rust(의존성 추가 없음)라 macOS에서도 `cargo test -p swift-guard-common`으로 검증된다.
 
 use anyhow::{anyhow, Result};
+
+use crate::api::XdpCounters;
 
 /// sizeof(struct filter_rule) (align 8)
 pub const FILTER_RULE_SIZE: usize = 88;
@@ -13,6 +15,24 @@ pub const PREFIX_KEY_SIZE: usize = 8;
 pub const IF_REDIRECT_SIZE: usize = 20;
 /// sizeof(struct filter_stats)
 pub const FILTER_STATS_SIZE: usize = 24;
+
+/// sizeof(struct sg_counter) — xdp_stats_map 값 (packets@0, bytes@8, align 8, 패딩 없음)
+pub const SG_COUNTER_SIZE: usize = 16;
+
+/// xdp_stats_map 슬롯 인덱스 (swift_guard.h SG_STAT_*)
+pub mod xdp_stat {
+    pub const RX: u32 = 0;
+    pub const DROP: u32 = 1;
+    pub const PASS: u32 = 2;
+    pub const REDIRECT: u32 = 3;
+    pub const COUNT: u32 = 4;
+    pub const NO_MATCH: u32 = 5;
+    pub const INVALID: u32 = 6;
+    pub const NON_IPV4: u32 = 7;
+    pub const ACTION_ERR: u32 = 8;
+    /// max_entries
+    pub const MAX: u32 = 9;
+}
 
 /// label 필드 크기 (char[32], NUL 포함)
 pub const LABEL_SIZE: usize = 32;
@@ -160,6 +180,42 @@ pub fn sum_percpu_stats(per_cpu: &[Vec<u8>]) -> (u64, u64) {
         })
 }
 
+/// struct sg_counter (16B) 디코딩 → (packets, bytes). 16B 미만이면 None.
+pub fn decode_counter(buf: &[u8]) -> Option<(u64, u64)> {
+    if buf.len() < SG_COUNTER_SIZE {
+        return None;
+    }
+    Some((read_u64(buf, 0), read_u64(buf, 8)))
+}
+
+/// PERCPU 조회 결과(CPU당 sg_counter)를 합산 → (packets, bytes). 짧은 값은 건너뛴다.
+pub fn sum_percpu_counters(per_cpu: &[Vec<u8>]) -> (u64, u64) {
+    per_cpu
+        .iter()
+        .filter_map(|v| decode_counter(v))
+        .fold((0u64, 0u64), |(p, b), (cp, cb)| {
+            (p.wrapping_add(cp), b.wrapping_add(cb))
+        })
+}
+
+/// 슬롯별 (packets, bytes) 합산값(인덱스 = xdp_stat::*) → API 카운터.
+/// slots.len() < MAX 이면 없는 슬롯은 0 이다.
+pub fn xdp_counters_from_slots(slots: &[(u64, u64)]) -> XdpCounters {
+    let pk = |i: u32| slots.get(i as usize).map(|s| s.0).unwrap_or(0);
+    XdpCounters {
+        rx_packets: pk(xdp_stat::RX),
+        rx_bytes: slots.get(xdp_stat::RX as usize).map(|s| s.1).unwrap_or(0),
+        drop_packets: pk(xdp_stat::DROP),
+        pass_packets: pk(xdp_stat::PASS),
+        redirect_packets: pk(xdp_stat::REDIRECT),
+        count_packets: pk(xdp_stat::COUNT),
+        no_match_packets: pk(xdp_stat::NO_MATCH),
+        invalid_packets: pk(xdp_stat::INVALID),
+        non_ipv4_packets: pk(xdp_stat::NON_IPV4),
+        action_error_packets: pk(xdp_stat::ACTION_ERR),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -297,5 +353,67 @@ mod tests {
         assert_eq!(sum_percpu_stats(&[mk(10, 1000), mk(5, 500)]), (15, 1500));
         assert_eq!(sum_percpu_stats(&[]), (0, 0));
         assert_eq!(sum_percpu_stats(&[mk(u64::MAX, 0), mk(2, 0)]), (1, 0));
+    }
+
+    fn counter(p: u64, b: u64) -> Vec<u8> {
+        let mut v = vec![0u8; SG_COUNTER_SIZE];
+        v[0..8].copy_from_slice(&p.to_ne_bytes());
+        v[8..16].copy_from_slice(&b.to_ne_bytes());
+        v
+    }
+
+    #[test]
+    fn sg_counter_decode() {
+        assert_eq!(SG_COUNTER_SIZE, 16);
+        assert_eq!(decode_counter(&counter(7, 686)), Some((7, 686)));
+        assert_eq!(decode_counter(&counter(7, 686)[..15]), None);
+        assert_eq!(decode_counter(&[]), None);
+    }
+
+    #[cfg(target_endian = "little")]
+    #[test]
+    fn sg_counter_offsets_le() {
+        let mut v = [0u8; 16];
+        v[0] = 0x01; // packets@0
+        v[8] = 0x02; // bytes@8
+        assert_eq!(decode_counter(&v), Some((1, 2)));
+    }
+
+    #[test]
+    fn percpu_counter_sum_wrapping() {
+        assert_eq!(sum_percpu_counters(&[counter(10, 1000), counter(5, 500)]), (15, 1500));
+        assert_eq!(sum_percpu_counters(&[]), (0, 0));
+        assert_eq!(sum_percpu_counters(&[counter(u64::MAX, 1), counter(2, 0)]), (1, 1));
+        // 짧은 값은 무시
+        assert_eq!(sum_percpu_counters(&[counter(3, 30), vec![1u8; 8]]), (3, 30));
+    }
+
+    #[test]
+    fn xdp_stat_indices_match_header() {
+        use xdp_stat::*;
+        assert_eq!(
+            [RX, DROP, PASS, REDIRECT, COUNT, NO_MATCH, INVALID, NON_IPV4, ACTION_ERR, MAX],
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+        );
+    }
+
+    #[test]
+    fn slots_to_xdp_counters() {
+        let slots: Vec<(u64, u64)> = (0..xdp_stat::MAX as u64).map(|i| (100 + i, 1000 + i)).collect();
+        let c = xdp_counters_from_slots(&slots);
+        assert_eq!(c.rx_packets, 100);
+        assert_eq!(c.rx_bytes, 1000);
+        assert_eq!(c.drop_packets, 101);
+        assert_eq!(c.pass_packets, 102);
+        assert_eq!(c.redirect_packets, 103);
+        assert_eq!(c.count_packets, 104);
+        assert_eq!(c.no_match_packets, 105);
+        assert_eq!(c.invalid_packets, 106);
+        assert_eq!(c.non_ipv4_packets, 107);
+        assert_eq!(c.action_error_packets, 108);
+        // 슬롯 부족 → 없는 슬롯 0
+        let c = xdp_counters_from_slots(&[(9, 90), (4, 40)]);
+        assert_eq!((c.rx_packets, c.rx_bytes, c.drop_packets, c.pass_packets), (9, 90, 4, 0));
+        assert_eq!(xdp_counters_from_slots(&[]), XdpCounters::default());
     }
 }

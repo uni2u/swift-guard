@@ -1,21 +1,22 @@
 #!/usr/bin/env bash
-# Swift-Guard 기본 처리량 측정 (Tier 3) — 프레임 크기별 XDP 처리 pps/Gbps, CPU 사용률
+# Swift-Guard 기본 처리량 측정 (Tier 3) — 프레임 크기별 XDP 처리 pps/Gbps(xdp_rx_pps), CPU 사용률
 #
 # 사용법: sudo tools/bench/basic_throughput_test.sh [옵션]
 #   예) 송신 장비 + DUT : sudo tools/bench/basic_throughput_test.sh --interface enp1s0 --generator external
 #       단일 호스트     : sudo tools/bench/basic_throughput_test.sh --interface enp1s0 --generator pktgen --tx-dev enp2s0
 #       흐름 검증       : sudo tools/bench/basic_throughput_test.sh --generator lab --duration 5   (NIC 불필요, 수치 의미 없음)
 #
-# 절차: daemon 기동(또는 재사용) → attach → 매치 룰(bench-match) → 크기마다
+# 절차: daemon 기동(또는 재사용) → stats CSV 계약 확인 → attach → 매치 룰(bench-match) → 크기마다
 #       xdp-filter stats --format csv 수집 + 트래픽 + /proc/stat·rx 카운터 → 요약 → 정리(trap).
-# 주의: 전역 통계는 룰에 매치한 패킷만 센다 → --rule-action none 이면 pps/gbps 는 0 (if_rx_pps 만 의미).
-#       pps/gbps 의 바이트 기준은 XDP가 보는 L2 프레임(FCS·프리앰블·IFG 제외) → 선로 속도가 아니다.
+# 지표: xdp_rx_pps/xdp_rx_pps_peak/xdp_rx_gbps = XDP가 본 전체 프레임 (처리량 1차 지표, 룰과 무관).
+#       pps/pps_peak/gbps = 룰에 매치한 패킷만 → --rule-action none 이면 0 (xdp_rx_pps 는 그대로 측정됨).
+#       바이트 기준은 XDP가 보는 L2 프레임(FCS·프리앰블·IFG 제외) → 선로 속도가 아니다.
 #
 # 결과 (--output-dir, 기본 ./results):
 #   meta_throughput.txt, throughput_results.csv,
 #   throughput/stats_<size>.csv (xdp-filter stats CSV 원본), throughput/generator_<size>.log, daemon.log
 # 요약 헤더: packet_size,generator,mode,rule_action,duration_sec,samples,pps,pps_peak,gbps,
-#            cpu_util,cpu_softirq,cpu_busiest,if_rx_pps,daemon_rss_kb
+#            cpu_util,cpu_softirq,cpu_busiest,if_rx_pps,daemon_rss_kb,xdp_rx_pps,xdp_rx_pps_peak,xdp_rx_gbps
 # 분석: python3 tools/analysis/analyze_performance.py --results-dir <output-dir>
 set -euo pipefail
 
@@ -25,10 +26,10 @@ BENCH_DEFAULT_DURATION=60
 . "$(cd "$(dirname "$0")" && pwd)/bench_lib.sh"
 
 PACKET_SIZES=64,128,256,512,1024,1518
-HEADER="packet_size,generator,mode,rule_action,duration_sec,$MEASURE_FIELDS"
+HEADER="packet_size,generator,mode,rule_action,duration_sec,$MEASURE_FIELDS,$XDP_MEASURE_FIELDS"
 
 usage() {
-  sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
   echo
   echo "basic_throughput 전용:"
   echo "  --packet-sizes 64,128,...  FCS 포함 L2 프레임 크기 목록 (기본 $PACKET_SIZES)"
@@ -57,6 +58,7 @@ log "interface=$IFACE mode=$MODE generator=$GENERATOR rule_action=$RULE_ACTION d
 log "src=$SRC_IP dst=$DST_IP output=$OUT_DIR"
 
 bench_start_daemon
+bench_check_stats_csv
 bench_attach
 bench_add_match_rule src
 bench_write_meta "$OUT_DIR/meta_throughput.txt" "packet_sizes=$PACKET_SIZES"
@@ -65,8 +67,9 @@ echo "$HEADER" >"$SUMMARY"
 for size in "${SIZES[@]}"; do
   log "--- ${size}B: ${DURATION}s 측정 ---"
   measure_once "$size" "$OUT_DIR/throughput/stats_$size.csv" "$OUT_DIR/throughput/generator_$size.log"
-  echo "$size,$GENERATOR,$MODE,$RULE_ACTION,$DURATION,$MEASURE_RESULT" >>"$SUMMARY"
+  echo "$size,$GENERATOR,$MODE,$RULE_ACTION,$DURATION,$MEASURE_RESULT,$MEASURE_XDP_RESULT" >>"$SUMMARY"
   log "${size}B → $MEASURE_FIELDS = $MEASURE_RESULT"
+  log "${size}B → $XDP_MEASURE_FIELDS = $MEASURE_XDP_RESULT"
 done
 
 echo

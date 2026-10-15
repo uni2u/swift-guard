@@ -8,7 +8,6 @@ Type=simple
 ExecStart=/usr/local/bin/swift-guard-daemon --bpf-obj /usr/local/lib/swift-guard/xdp_filter.o
 Restart=on-failure
 RestartSec=5s
-Environment="RUST_LOG=info"
 
 # Security settings
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_SYS_RESOURCE

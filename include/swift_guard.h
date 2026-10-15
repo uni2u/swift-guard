@@ -63,4 +63,26 @@ struct if_redirect {
     char ifname[16];         /* 인터페이스 이름 */
 };
 
+/* xdp_stats_map(PERCPU_ARRAY, key = __u32 슬롯 인덱스, value = struct sg_counter,
+ * max_entries = SG_STAT_MAX) 슬롯 인덱스.
+ * 패킷 1개는 SG_STAT_RX 1회 + 결과 슬롯(1..8) 중 정확히 1회 증가한다.
+ * Rust 짝: src/common/bpf_layout.rs 의 xdp_stat::* (값이 같아야 한다). */
+#define SG_STAT_RX          0  /* XDP 진입 전체 (모든 프레임, 파싱 전) */
+#define SG_STAT_DROP        1  /* 룰 action=drop 으로 XDP_DROP */
+#define SG_STAT_PASS        2  /* 룰 action=pass 로 XDP_PASS */
+#define SG_STAT_REDIRECT    3  /* 룰 action=redirect, bpf_redirect 반환 (전송 성공 보장 아님) */
+#define SG_STAT_COUNT       4  /* 룰 action=count 로 XDP_PASS */
+#define SG_STAT_NO_MATCH    5  /* 정상 IPv4, 매치 룰 없음 → XDP_PASS */
+#define SG_STAT_INVALID     6  /* 파서 정책으로 XDP_DROP (비정상 IPv4 헤더, tiny fragment, TCP off=1 조각) */
+#define SG_STAT_NON_IPV4    7  /* 이더넷 헤더 미만 또는 EtherType≠IPv4(IPv6/ARP/VLAN 등) → 검사 없이 XDP_PASS */
+#define SG_STAT_ACTION_ERR  8  /* 룰은 매치했지만 실행 불가(redirect 대상 없음, 알 수 없는 action) → XDP_PASS */
+#define SG_STAT_MAX         9
+
+/* xdp_stats_map 값. 16B, align 8, 패딩 없음. 호스트 엔디안.
+ * Rust 짝: bpf_layout::SG_COUNTER_SIZE (= 16), decode_counter. */
+struct sg_counter {
+    __u64 packets;
+    __u64 bytes;    /* data_end - data (XDP가 본 L2 프레임 길이, FCS 제외) */
+};
+
 #endif /* __SWIFT_GUARD_H */

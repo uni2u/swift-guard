@@ -1,22 +1,24 @@
 #!/usr/bin/env bash
-# Swift-Guard 룰 스케일링 측정 (Tier 3) — 맵의 룰 수에 따른 XDP 처리 pps 변화, 룰 추가 시간
+# Swift-Guard 룰 스케일링 측정 (Tier 3) — 맵의 룰 수에 따른 XDP 처리 pps(xdp_rx_pps) 변화, 룰 추가 시간
 #
 # 사용법: sudo tools/bench/rule_scaling_test.sh [옵션]
 #   예) sudo tools/bench/rule_scaling_test.sh --interface enp1s0 --generator external --duration 30
 #       sudo tools/bench/rule_scaling_test.sh --generator lab --rule-counts 1,10,100 --duration 3   (흐름 검증)
 #
-# 절차: daemon·attach·매치 룰(bench-match) 준비 → 단계마다 filler 룰을 누적 추가(벽시계 시간 측정)
+# 절차: daemon·stats CSV 계약 확인·attach·매치 룰(bench-match) 준비 → 단계마다 filler 룰을 누적 추가(벽시계 시간 측정)
 #       → 측정(basic_throughput 과 같은 방법) → 다음 단계 → 정리(trap).
 #   filler = 198.19.<i/256>.<i%256>/32, label bench-fill-<i>, action pass (트래픽과 매치하지 않음).
 #   rule_count = 해당 단계의 bench 룰 총수(매치 룰 포함; --rule-action none 이면 filler 만).
 #   룰 조회는 패킷당 /32 LPM 1회(src 맵), src 미스면 dst 맵 1회 추가. prefix당 룰 1개, 맵당 최대 10240.
 #   --side dst : 매치 룰과 filler 를 목적지 맵에 넣는다(모든 패킷이 src 미스 후 dst 조회).
 #   add_rule_us_avg 는 CLI 프로세스 생성·TCP 연결을 포함한 값이다(순수 맵 갱신 지연이 아님).
+#   처리량 1차 지표는 xdp_rx_pps(룰과 무관). pps/gbps 는 룰 매치 기준(--rule-action none 이면 0).
 #
 # 결과 (--output-dir, 기본 ./results):
 #   meta_rule_scaling.txt, rule_scaling_results.csv, rule_scaling/stats_<count>.csv, rule_scaling/generator_<count>.log
 # 요약 헤더: rule_count,side,packet_size,generator,mode,rule_action,duration_sec,samples,pps,pps_peak,gbps,
-#            cpu_util,cpu_softirq,cpu_busiest,if_rx_pps,daemon_rss_kb,rules_added,add_rules_sec,add_rule_us_avg
+#            cpu_util,cpu_softirq,cpu_busiest,if_rx_pps,daemon_rss_kb,rules_added,add_rules_sec,add_rule_us_avg,
+#            xdp_rx_pps,xdp_rx_pps_peak,xdp_rx_gbps
 set -euo pipefail
 
 BENCH_NAME=rule_scaling
@@ -27,10 +29,10 @@ BENCH_DEFAULT_DURATION=30
 RULE_COUNTS=1,10,100,1000,5000,10000
 SIDE=src
 PACKET_SIZE=64
-HEADER="rule_count,side,packet_size,generator,mode,rule_action,duration_sec,$MEASURE_FIELDS,rules_added,add_rules_sec,add_rule_us_avg"
+HEADER="rule_count,side,packet_size,generator,mode,rule_action,duration_sec,$MEASURE_FIELDS,rules_added,add_rules_sec,add_rule_us_avg,$XDP_MEASURE_FIELDS"
 
 usage() {
-  sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'
   echo
   echo "rule_scaling 전용:"
   echo "  --rule-counts 1,10,...     오름차순, 각 ≤ $MAX_RULES_PER_MAP. 누적 추가 (기본 $RULE_COUNTS)"
@@ -75,6 +77,7 @@ log "interface=$IFACE mode=$MODE generator=$GENERATOR side=$SIDE rule_action=$RU
 log "src=$SRC_IP dst=$DST_IP output=$OUT_DIR"
 
 bench_start_daemon
+bench_check_stats_csv
 bench_attach
 bench_add_match_rule "$SIDE"
 bench_write_meta "$OUT_DIR/meta_rule_scaling.txt" "side=$SIDE" "packet_size=$PACKET_SIZE" "rule_counts=$RULE_COUNTS"
@@ -104,8 +107,9 @@ for count in "${COUNTS[@]}"; do
   fi
   measure_once "$PACKET_SIZE" "$OUT_DIR/rule_scaling/stats_$count.csv" "$OUT_DIR/rule_scaling/generator_$count.log"
   # rules_added=0 이면 add_rules_sec, add_rule_us_avg 는 빈 칸
-  echo "$count,$SIDE,$PACKET_SIZE,$GENERATOR,$MODE,$RULE_ACTION,$DURATION,$MEASURE_RESULT,$added,$add_sec,$add_us" >>"$SUMMARY"
+  echo "$count,$SIDE,$PACKET_SIZE,$GENERATOR,$MODE,$RULE_ACTION,$DURATION,$MEASURE_RESULT,$added,$add_sec,$add_us,$MEASURE_XDP_RESULT" >>"$SUMMARY"
   log "룰 ${count}개 → $MEASURE_FIELDS = $MEASURE_RESULT"
+  log "룰 ${count}개 → $XDP_MEASURE_FIELDS = $MEASURE_XDP_RESULT"
 done
 
 echo

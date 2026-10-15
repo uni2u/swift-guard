@@ -9,6 +9,10 @@ tools/bench/basic_throughput_test.sh, rule_scaling_test.sh 가 만든 결과 디
                                                 [--output-dir <results-dir>/plots] [--no-plots]
 의존: 표준 라이브러리 + matplotlib(그래프용, 없으면 summary.md 만). pip install -r tools/analysis/requirements.txt
 종료 코드: 하나라도 분석했으면 0, 입력이 하나도 없으면 1.
+
+신·구 결과를 모두 읽는다. 현재 요약 CSV는 맨 끝에 xdp_rx_pps,xdp_rx_pps_peak,xdp_rx_gbps 3열이 있고,
+stats CSV는 17열(xdp_* 포함)이다. 이전 버전 결과(그 열이 없음)는 처리량 지표로 pps(룰 매치 기준)를 쓰고,
+summary.md 와 그래프에 어느 지표를 썼는지 표시한다.
 """
 
 import argparse
@@ -18,16 +22,28 @@ import os
 import re
 import sys
 
-THROUGHPUT_HEADER = [
+XDP_SUMMARY_COLS = ["xdp_rx_pps", "xdp_rx_pps_peak", "xdp_rx_gbps"]
+THROUGHPUT_HEADER_V1 = [
     "packet_size", "generator", "mode", "rule_action", "duration_sec", "samples", "pps", "pps_peak",
     "gbps", "cpu_util", "cpu_softirq", "cpu_busiest", "if_rx_pps", "daemon_rss_kb",
 ]
-RULE_SCALING_HEADER = [
+THROUGHPUT_HEADER = THROUGHPUT_HEADER_V1 + XDP_SUMMARY_COLS
+RULE_SCALING_HEADER_V1 = [
     "rule_count", "side", "packet_size", "generator", "mode", "rule_action", "duration_sec", "samples",
     "pps", "pps_peak", "gbps", "cpu_util", "cpu_softirq", "cpu_busiest", "if_rx_pps", "daemon_rss_kb",
     "rules_added", "add_rules_sec", "add_rule_us_avg",
 ]
-STATS_HEADER = ["timestamp_ms", "total_packets", "total_bytes", "pps", "mbps"]
+RULE_SCALING_HEADER = RULE_SCALING_HEADER_V1 + XDP_SUMMARY_COLS
+STATS_HEADER_V1 = ["timestamp_ms", "total_packets", "total_bytes", "pps", "mbps"]
+STATS_HEADER = STATS_HEADER_V1 + [
+    "xdp_rx_packets", "xdp_rx_bytes", "xdp_rx_pps", "xdp_rx_mbps", "xdp_drop_packets", "xdp_pass_packets",
+    "xdp_redirect_packets", "xdp_count_packets", "xdp_no_match_packets", "xdp_invalid_packets",
+    "xdp_non_ipv4_packets", "xdp_action_error_packets",
+]
+# 허용 헤더: 현재 → 이전 순서
+THROUGHPUT_HEADERS = [THROUGHPUT_HEADER, THROUGHPUT_HEADER_V1]
+RULE_SCALING_HEADERS = [RULE_SCALING_HEADER, RULE_SCALING_HEADER_V1]
+STATS_HEADERS = [STATS_HEADER, STATS_HEADER_V1]
 FLOW_BANNER = "FLOW CHECK ONLY (lab generator) — not a performance result"
 
 # 색: dataviz 기본 팔레트 categorical 순서 (blue, orange, aqua, yellow, magenta, green)
@@ -45,8 +61,11 @@ def num(v, default=None):
         return default
 
 
-def read_csv(path, header):
-    """(rows, skip_reason). header 가 다르면 rows=None."""
+def read_csv(path, headers):
+    """(rows, skip_reason). headers = 허용 헤더 목록(첫 번째가 현재 형식).
+    파일 헤더가 그중 하나와 같으면 rows 의 각 dict 는 현재 형식(headers[0])의 모든 열을 갖고,
+    파일에 없는 열은 None 이다. 어느 것과도 다르면 rows=None."""
+    full = headers[0]
     if not os.path.isfile(path):
         return None, "skip: %s 없음" % os.path.basename(path)
     with open(path, newline="") as f:
@@ -55,12 +74,40 @@ def read_csv(path, header):
             got = next(r)
         except StopIteration:
             return None, "skip: %s 비어 있음" % os.path.basename(path)
-        if got != header:
-            return None, "skip: %s 열 불일치(기대: %s)" % (os.path.basename(path), ",".join(header))
-        rows = [dict(zip(header, row)) for row in r if row]
+        if got not in headers:
+            return None, "skip: %s 열 불일치(기대: %s)" % (os.path.basename(path), ",".join(full))
+        rows = []
+        for row in r:
+            if not row:
+                continue
+            d = dict.fromkeys(full)
+            d.update(zip(got, row))
+            rows.append(d)
     if not rows:
         return None, "skip: %s 데이터 행 없음" % os.path.basename(path)
     return rows, None
+
+
+def has_values(rows, col):
+    """모든 행에 col 값(빈 칸 아님)이 있는가."""
+    return all(r.get(col) not in (None, "") for r in rows)
+
+
+class Metric:
+    """처리량 지표 선택. xdp_rx_pps 열이 있으면(현재 형식) 그것, 없으면 pps(이전 형식, 룰 매치 기준)."""
+
+    def __init__(self, rows):
+        self.xdp = has_values(rows, "xdp_rx_pps")
+        if self.xdp:
+            self.pps, self.peak, self.gbps = "xdp_rx_pps", "xdp_rx_pps_peak", "xdp_rx_gbps"
+            self.desc = "xdp_rx_pps (XDP가 본 전체 프레임, 룰 매치와 무관)"
+            self.axis = "Mpps (xdp_rx_pps: all frames XDP saw)"
+            self.gaxis = "Gbps (xdp_rx_gbps, L2 bytes, not line rate)"
+        else:
+            self.pps, self.peak, self.gbps = "pps", "pps_peak", "gbps"
+            self.desc = "pps (이전 형식 결과: xdp_rx_* 열 없음 → 룰 매치 패킷 기준)"
+            self.axis = "Mpps (pps: rule-matched packets, legacy result)"
+            self.gaxis = "Gbps (gbps: rule-matched, L2 bytes)"
 
 
 def read_meta(path):
@@ -121,11 +168,11 @@ class Plotter:
         print("  wrote %s" % path)
 
 
-def plot_throughput(p, rows):
+def plot_throughput(p, rows, metric):
     sizes = [int(num(r["packet_size"], 0)) for r in rows]
     xs = list(range(len(sizes)))
     fig, (a1, a2) = p.figure(2, "Swift-Guard XDP throughput by frame size")
-    for ax, key, label, scale in ((a1, "pps", "Mpps (matched packets)", 1e6), (a2, "gbps", "Gbps (L2 bytes, not line rate)", 1)):
+    for ax, key, label, scale in ((a1, metric.pps, metric.axis, 1e6), (a2, metric.gbps, metric.gaxis, 1)):
         vals = [(num(r[key], 0.0) or 0.0) / scale for r in rows]
         ax.bar(xs, vals, width=0.6, color=SERIES[0], edgecolor=SURFACE, linewidth=2)
         ax.set_xticks(xs)
@@ -148,25 +195,25 @@ def plot_throughput(p, rows):
     p.save(fig, "throughput_cpu.png")
 
 
-def plot_timeseries(p, series):
-    fig, (ax,) = p.figure(1, "xdp-filter stats: pps per 1 s sample")
+def plot_timeseries(p, series, col):
+    fig, (ax,) = p.figure(1, "xdp-filter stats: %s per 1 s sample" % col)
     for i, (size, pts) in enumerate(series):
         color = SERIES[i % len(SERIES)] if i < len(SERIES) else INK2
         ax.plot([t for t, _ in pts], [v / 1e6 for _, v in pts], marker="o", markersize=4,
                 color=color, label="%s B" % size)
     ax.set_xlabel("seconds since first sample")
-    ax.set_ylabel("Mpps")
+    ax.set_ylabel("Mpps (%s)" % col)
     ax.legend()
     p.save(fig, "throughput_timeseries.png")
 
 
-def plot_rule_scaling(p, rows, base_pps):
+def plot_rule_scaling(p, rows, base_pps, metric):
     counts = [int(num(r["rule_count"], 0)) for r in rows]
-    vals = [mpps(r["pps"]) for r in rows]
+    vals = [mpps(r[metric.pps]) for r in rows]
     fig, (a1, a2) = p.figure(2, "Rule scaling (side=%s, %s B)" % (rows[0]["side"], rows[0]["packet_size"]))
     a1.plot(counts, vals, marker="o", color=SERIES[0])
-    a1.set_ylabel("Mpps (matched packets)")
-    rel = [(num(r["pps"], 0.0) or 0.0) / base_pps * 100 if base_pps else 0.0 for r in rows]
+    a1.set_ylabel(metric.axis)
+    rel = [(num(r[metric.pps], 0.0) or 0.0) / base_pps * 100 if base_pps else 0.0 for r in rows]
     a2.plot(counts, rel, marker="o", color=SERIES[0])
     a2.axhline(100, color=INK2, linewidth=1, linestyle="--")
     a2.set_ylabel("%% of first step (%d rules)" % counts[0])
@@ -195,6 +242,7 @@ def plot_rule_add(p, rows):
 
 # ---------------------------------------------------------------- main
 def load_timeseries(results_dir):
+    """[(size, [(t, pps)])], 사용한 열 이름. 모든 파일에 xdp_rx_pps 값이 있으면 그 열, 아니면 pps."""
     out = []
     files = glob.glob(os.path.join(results_dir, "throughput", "stats_*.csv"))
 
@@ -202,17 +250,23 @@ def load_timeseries(results_dir):
         m = re.search(r"stats_(\d+)\.csv$", path)
         return int(m.group(1)) if m else 0
 
+    loaded = []
     for path in sorted(files, key=key):
-        rows, why = read_csv(path, STATS_HEADER)
+        rows, why = read_csv(path, STATS_HEADERS)
         if rows is None:
             print("  %s" % why)
             continue
+        loaded.append((key(path), rows))
+    # 첫 행의 비율 열은 빈 칸이므로 데이터 행 중 하나라도 값이 있으면 그 열을 쓴다
+    col = "xdp_rx_pps" if loaded and all(
+        any(r.get("xdp_rx_pps") not in (None, "") for r in rows) for _, rows in loaded) else "pps"
+    for size, rows in loaded:
         t0 = num(rows[0]["timestamp_ms"], 0.0)
-        pts = [((num(r["timestamp_ms"], 0.0) - t0) / 1000.0, num(r["pps"])) for r in rows]
+        pts = [((num(r["timestamp_ms"], 0.0) - t0) / 1000.0, num(r[col])) for r in rows]
         pts = [(t, v) for t, v in pts if v is not None]
         if pts:
-            out.append((key(path), pts))
-    return out
+            out.append((size, pts))
+    return out, col
 
 
 def main():
@@ -224,8 +278,8 @@ def main():
     args = ap.parse_args()
     out_dir = args.output_dir or os.path.join(args.results_dir, "plots")
 
-    tp_rows, tp_why = read_csv(os.path.join(args.results_dir, "throughput_results.csv"), THROUGHPUT_HEADER)
-    rs_rows, rs_why = read_csv(os.path.join(args.results_dir, "rule_scaling_results.csv"), RULE_SCALING_HEADER)
+    tp_rows, tp_why = read_csv(os.path.join(args.results_dir, "throughput_results.csv"), THROUGHPUT_HEADERS)
+    rs_rows, rs_why = read_csv(os.path.join(args.results_dir, "rule_scaling_results.csv"), RULE_SCALING_HEADERS)
     for why in (tp_why, rs_why):
         if why:
             print(why)
@@ -249,44 +303,53 @@ def main():
     md = ["# Swift-Guard benchmark summary", ""]
     if flow_only:
         md += ["> **%s**" % FLOW_BANNER, "> 수치는 veth + python 송신 한계이며 성능 결과로 쓰지 않는다.", ""]
-    md += ["- pps/gbps: `xdp-filter stats` 총계의 초당 차이. 전역 통계는 **룰에 매치한 패킷만** 센다.",
+    md += ["- xdp_rx_pps/xdp_rx_gbps: XDP가 본 **전체 프레임**(xdp_stats_map RX 슬롯)의 초당 차이. 룰 매치와 무관한 "
+           "**처리량 1차 지표**다.",
+           "- pps/gbps: `xdp-filter stats` 총계(total_packets)의 초당 차이. **룰에 매치한 패킷만** 센다"
+           "(--rule-action none 이면 0).",
            "- gbps 바이트 기준은 XDP가 보는 L2 프레임(FCS·프리앰블·IFG 제외) — 선로 속도 아님.",
-           "- if_rx_pps: 인터페이스 rx 카운터(드라이버마다 XDP_DROP 계수 여부가 다름 — 참고용).", ""]
+           "- if_rx_pps: 인터페이스 rx 카운터(드라이버가 센 값. XDP_DROP 계수 여부가 드라이버마다 다름 — 참고용).",
+           "- 이전 버전 결과(xdp_rx_* 열 없음)는 처리량 지표로 pps를 쓰고 섹션마다 표시한다.", ""]
 
     if tp_rows is not None:
         meta = read_meta(os.path.join(args.results_dir, "meta_throughput.txt"))
+        metric = Metric(tp_rows)
         md += ["## Basic throughput", ""]
         if meta:
             md += [md_table(["key", "value"], sorted(meta.items())), ""]
+        md += ["처리량 지표: **%s**" % metric.desc, ""]
         md += [md_table(["frame B", "generator", "mode", "rule", "samples", "Mpps", "peak Mpps", "Gbps",
-                         "CPU %", "softirq %", "busiest CPU %", "if_rx Mpps", "daemon RSS kB"],
+                         "matched Mpps (pps)", "CPU %", "softirq %", "busiest CPU %", "if_rx Mpps", "daemon RSS kB"],
                         [[r["packet_size"], r["generator"], r["mode"], r["rule_action"], r["samples"],
-                          "%.3f" % mpps(r["pps"]), "%.3f" % mpps(r["pps_peak"]), r["gbps"], r["cpu_util"],
-                          r["cpu_softirq"], r["cpu_busiest"], "%.3f" % mpps(r["if_rx_pps"]), r["daemon_rss_kb"]]
+                          "%.3f" % mpps(r[metric.pps]), "%.3f" % mpps(r[metric.peak]), r[metric.gbps],
+                          "%.3f" % mpps(r["pps"]), r["cpu_util"], r["cpu_softirq"], r["cpu_busiest"],
+                          "%.3f" % mpps(r["if_rx_pps"]), r["daemon_rss_kb"]]
                          for r in tp_rows]), ""]
         if plotter:
-            plot_throughput(plotter, tp_rows)
-            ts = load_timeseries(args.results_dir)
+            plot_throughput(plotter, tp_rows, metric)
+            ts, ts_col = load_timeseries(args.results_dir)
             if ts:
-                plot_timeseries(plotter, ts)
+                plot_timeseries(plotter, ts, ts_col)
             else:
                 print("  skip: throughput/stats_*.csv 없음 → throughput_timeseries.png 생략")
 
     if rs_rows is not None:
         meta = read_meta(os.path.join(args.results_dir, "meta_rule_scaling.txt"))
-        base = num(rs_rows[0]["pps"], 0.0) or 0.0
+        metric = Metric(rs_rows)
+        base = num(rs_rows[0][metric.pps], 0.0) or 0.0
         md += ["## Rule scaling", ""]
         if meta:
             md += [md_table(["key", "value"], sorted(meta.items())), ""]
+        md += ["처리량 지표: **%s**" % metric.desc, ""]
         md += [md_table(["rules", "side", "frame B", "generator", "Mpps", "vs first %", "CPU %", "busiest CPU %",
                          "rules added", "add sec", "µs/rule (incl. CLI)"],
-                        [[r["rule_count"], r["side"], r["packet_size"], r["generator"], "%.3f" % mpps(r["pps"]),
-                          ("%.1f" % ((num(r["pps"], 0.0) or 0.0) / base * 100)) if base else "n/a",
+                        [[r["rule_count"], r["side"], r["packet_size"], r["generator"], "%.3f" % mpps(r[metric.pps]),
+                          ("%.1f" % ((num(r[metric.pps], 0.0) or 0.0) / base * 100)) if base else "n/a",
                           r["cpu_util"], r["cpu_busiest"], r["rules_added"], r["add_rules_sec"] or "-",
                           r["add_rule_us_avg"] or "-"] for r in rs_rows]), ""]
         md += ["add_rule_us_avg 는 `xdp-filter add-rule` 프로세스 생성·TCP 연결을 포함한다(순수 맵 갱신 지연 아님).", ""]
         if plotter:
-            plot_rule_scaling(plotter, rs_rows, base)
+            plot_rule_scaling(plotter, rs_rows, base, metric)
             plot_rule_add(plotter, rs_rows)
 
     skipped = [w for w in (tp_why, rs_why) if w]
