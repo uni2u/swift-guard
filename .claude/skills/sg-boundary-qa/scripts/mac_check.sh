@@ -76,6 +76,9 @@ for f in tests/integration/*.rs; do
   else res WARN "$(basename "$f" .rs) is not a cargo test target → 'cargo test -- --ignored' runs 0 of these"; fi
 done
 
+step "Docs links (README, docs/**)"
+python3 "$S/docs_links_check.py" && res PASS "docs links" || res FAIL "docs links"
+
 step "WASM modules compile"
 if rustup target list --installed 2>/dev/null | grep -qx wasm32-unknown-unknown; then
   for m in wasm/modules/*.rs; do

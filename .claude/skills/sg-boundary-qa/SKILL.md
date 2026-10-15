@@ -16,7 +16,7 @@ description: Swift-Guard 경계면 교차 검증 체크리스트와 스크립트
 ## 스크립트 (`.claude/skills/sg-boundary-qa/scripts/` — 저장소 루트 기준 경로)
 | 스크립트 | 용도 | 종료 코드 |
 |---------|------|----------|
-| `mac_check.sh` | common/cli 빌드·테스트 + API drift + header↔bpf 레이아웃 + WASM 빌드 일괄 | 0 PASS / 1 FAIL |
+| `mac_check.sh` | common/cli 빌드·테스트 + API drift + header↔bpf 레이아웃 + 문서 링크(`docs_links_check.py`) + WASM 빌드 일괄 | 0 PASS / 1 FAIL |
 | `struct_layout.py <file> <struct>...` | C 구조체 offset/size JSON (macOS에서 동작) | |
 | `api_drift.py <a.rs> <b.rs>` | 두 파일의 동명 serde 타입 변형/필드 비교 | 0 일치 / 1 drift |
 | `linux_check.sh [bpf\|cargo\|test\|all]` | Docker로 BPF 컴파일 + daemon 포함 cargo check/test | 0 PASS / 1 FAIL / 2 알 수 없는 모드(옵션은 별도 인자: `examples -v`) / 3 docker 없음(SKIP) |
@@ -25,7 +25,7 @@ description: Swift-Guard 경계면 교차 검증 체크리스트와 스크립트
 | `systemd_check.sh` | (소켓 0660 root:swift-guard·비멤버 거부·멤버 허용·stop 시 소켓 삭제 포함) systemd를 init으로 띄운 Ubuntu 24.04 컨테이너에서 README 10장(설치→enable→override `-i`+`ExecStartPost`→stop 시 detach→재시작 시 룰 재적용→uninstall)을 실행. rules.sh·override는 **README 본문에서 추출**하므로 문서와 동작이 함께 검증된다. README 10장/service/Makefile 변경 시 실행 | 0 / 1 / 3 |
 | `readme_check.sh [22.04 24.04]` | (그룹 생성·소켓 권한·비멤버 거부/멤버 허용 포함) 깨끗한 Ubuntu에서 일반 사용자로 README 4~6장·WASM·예시 회귀·제거를 그대로 실행(초급자 경로). README의 설치/사용 명령이나 Makefile을 바꾸면 실행. README와 `readme_sim_inner.sh`의 단계는 함께 갱신 | 0 / 1 / 3 |
 | `linux_check.sh examples [-v]` | privileged Docker에서 `tools/test/examples.sh` — `docs/examples.md` 예시가 문서대로 동작하는지(CLI 출력·에러 문구 포함). CLI/룰 의미/에러 메시지를 바꾸면 실행하고, 출력이 바뀌면 문서도 갱신 | 0 / 1 / 3 |
-| `linux_check.sh e2e [--with-ignored]` | privileged Docker에서 `tools/test/e2e_check.sh`(Tier 2: veth+generic XDP, verifier·attach·매치·통계·SIGTERM) | 0 PASS / 1 FAIL / 3 docker 없음 |
+| `linux_check.sh e2e [--with-ignored]` | (e2e_check.sh는 설치본이 있으면 설치본, 없으면 저장소 빌드본을 검사하고 Preflight에 어느 쪽인지 출력 — `SG_BIN_DIR`/`SG_BPF_OBJ`로 덮어쓰기) privileged Docker에서 `tools/test/e2e_check.sh`(Tier 2: veth+generic XDP, verifier·attach·매치·통계·SIGTERM) | 0 PASS / 1 FAIL / 3 docker 없음 |
 
 먼저 `mac_check.sh`를 실행하고, Docker가 켜져 있으면 `linux_check.sh all` → `linux_check.sh e2e` 순으로 실행한다. 검증 단계(Tier 1 빌드 / Tier 2 커널 E2E / Tier 3 성능) 정의는 `docs/linux-verification.md`.
 - macOS에서는 daemon 크레이트와 **루트 패키지 `swift-guard`**(README/Makefile의 `cargo build --release` 대상, libbpf-rs 의존)를 컴파일할 수 없다 → 체크리스트 E로 보완하고 "미검증"으로 남긴다.

@@ -32,8 +32,10 @@ step "5-1"
 xdp-filter --version || fail version; xdp-filter --help | head -4; swift-guard-daemon --help | head -3
 step "5-2 e2e"
 sudo tools/test/e2e_check.sh > /tmp/e2e.out 2>&1; rc=$?; grep -E "^\[FAIL|^\[SKIP|e2e_check:|RESULT" /tmp/e2e.out; [ $rc -eq 0 ] || fail "e2e_check"
+grep -q "binaries (installed" /tmp/e2e.out || { grep -i "binaries" /tmp/e2e.out; fail "e2e must test installed binaries after make install"; }
 step "6 tutorial"
 sudo tools/test/lab.sh up || fail "lab up"
+sudo -v
 sudo swift-guard-daemon --bpf-obj /usr/local/lib/swift-guard/xdp_filter.o >/tmp/d.log 2>&1 &
 for i in $(seq 50); do sudo xdp-filter list-rules >/dev/null 2>&1 && break; sleep 0.2; done
 step "9-5 access control (Unix socket)"
