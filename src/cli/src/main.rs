@@ -10,14 +10,20 @@ mod api;
 
 use api::ApiClient;
 use swift_guard_common::api::{ApiRequest, ApiResponse, RuleInfo, WasmModuleInfo, XdpCounters};
+use swift_guard_common::endpoint::{ApiEndpoint, DEFAULT_API_ENDPOINT};
 use swift_guard_common::utils::parse_port_range;
+
+/// clap value_parser: 주소 문법은 common::endpoint 가 원천이다 (루프백 검사 포함)
+fn parse_endpoint(s: &str) -> Result<ApiEndpoint, String> {
+    s.parse::<ApiEndpoint>().map_err(|e| format!("{:#}", e))
+}
 
 #[derive(Parser, Debug)]
 #[clap(name = "xdp-filter", about = "XDP Filtering Tool", version)]
 struct Cli {
-    /// API 서버 주소
-    #[clap(long, default_value = "127.0.0.1:7654")]
-    api_server: String,
+    /// daemon API address: unix:/path or tcp:<loopback-ip>:<port>
+    #[clap(long, value_name = "ENDPOINT", default_value = DEFAULT_API_ENDPOINT, value_parser = parse_endpoint)]
+    api_server: ApiEndpoint,
 
     /// 상세 로깅
     #[clap(short, long)]
@@ -450,7 +456,7 @@ async fn main() -> Result<()> {
     logger.init();
 
     // API 클라이언트 생성
-    let client = ApiClient::new(&cli.api_server).context("Failed to create API client")?;
+    let client = ApiClient::new(cli.api_server.clone());
 
     // 명령 실행
     match &cli.command {
@@ -948,5 +954,34 @@ mod tests {
             Commands::Stats { interval: 1, count: 0, format: StatsFormat::Text }
         ));
         assert!(Cli::try_parse_from(["xdp-filter", "stats", "--format", "json"]).is_err());
+    }
+
+    #[test]
+    fn api_server_default_is_unix_socket() {
+        let cli = Cli::try_parse_from(["xdp-filter", "list-rules"]).expect("parse");
+        assert_eq!(cli.api_server, ApiEndpoint::Unix("/run/swift-guard/api.sock".into()));
+        assert_eq!(cli.api_server.to_string(), DEFAULT_API_ENDPOINT);
+    }
+
+    #[test]
+    fn api_server_accepts_unix_and_loopback_tcp() {
+        let cli = Cli::try_parse_from(["xdp-filter", "--api-server", "tcp:127.0.0.1:7654", "list-rules"])
+            .expect("parse");
+        assert_eq!(cli.api_server, ApiEndpoint::Tcp("127.0.0.1:7654".parse().unwrap()));
+        let cli = Cli::try_parse_from(["xdp-filter", "--api-server", "/tmp/x.sock", "list-rules"])
+            .expect("parse");
+        assert_eq!(cli.api_server, ApiEndpoint::Unix("/tmp/x.sock".into()));
+    }
+
+    #[test]
+    fn api_server_rejects_schemeless_and_non_loopback() {
+        let e = Cli::try_parse_from(["xdp-filter", "--api-server", "127.0.0.1:7654", "list-rules"])
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("add a scheme: tcp:127.0.0.1:7654"), "{}", e);
+        let e = Cli::try_parse_from(["xdp-filter", "--api-server", "tcp:0.0.0.0:7654", "list-rules"])
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("refusing non-loopback TCP API address"), "{}", e);
     }
 }

@@ -69,7 +69,7 @@
 | R10 | 실험 설계 적합성 | poc-plan 2.3(WASM 오버헤드), 3.1(TPR/FPR/F1, 반응 시간, 차단율) 측정 가능성 |
 | R11 | 장애 시 동작 | daemon 다운·멈춤·과부하 시 fail-open인가 fail-closed인가, 그것을 고를 수 있는가 |
 
-**목표 환경 가정** [확인: `docs/poc-plan.md`, `docs/evaluation.md`]: Ubuntu 22.04(커널 5.15), 최소 5.10, Intel X710(i40e) 10GbE, driver 모드, DUT는 트래픽 싱크(측정용 XDP_DROP 룰). **DUT가 종단 호스트**라는 점이 중요하다. 검사를 통과한 패킷은 DUT의 로컬 스택으로 가야 한다. 브리지·미들박스 토폴로지가 아니다.
+**목표 환경 가정** [확인: `docs/poc-plan.md`, `docs/evaluation.md`]: Ubuntu 22.04(커널 5.15), 최소 5.15(결정됨, Q3), Intel X710(i40e) 10GbE, driver 모드, DUT는 트래픽 싱크(측정용 XDP_DROP 룰). **DUT가 종단 호스트**라는 점이 중요하다. 검사를 통과한 패킷은 DUT의 로컬 스택으로 가야 한다. 브리지·미들박스 토폴로지가 아니다.
 
 ---
 
@@ -122,9 +122,9 @@
 - **패킷 흐름:** 원본은 XDP에서 그대로 진행한다. 사본(헤더와 앞부분 페이로드)만 사용자 공간으로 간다.
 - **판정 반영:** 비동기 사후 차단이다. 판정이 나오면 그 출발지 `/32`(또는 판정이 지정한 범위)에 drop/rate-limit 룰을 `expire`와 함께 설치한다. 판정이 나오기 전에 이미 지나간 패킷(누출)이 생긴다.
 - **BPF 측 변경 — 사본 복사 방식(verifier가 핵심):**
-  - **perf buffer:** `bpf_perf_event_output(ctx, &samples, BPF_F_CURRENT_CPU | ((u64)cap << 32), &meta, sizeof(meta))` 형태로 플래그 상위 비트(`BPF_F_CTXLEN_MASK`, 20비트)에 복사할 패킷 길이를 넣으면 커널이 ctx에서 패킷을 붙여 준다. 헬퍼 문서에 "TC or XDP … packet payload"가 명시되어 있다 [확인: UAPI `bpf.h` 주석, `BPF_F_CTXLEN_MASK = 0xfffff<<32`]. `cap = min(pkt_len, SNAPLEN)`을 **런타임 값**으로 줄 수 있어서 짧은 패킷도 verifier 문제 없이 처리된다. 5.10에서도 쓸 수 있다.
-  - **ring buffer**(커널 5.8+, [확인: libbpf-rs 0.19.1 소스 주석 "As of Linux 5.8"]): `bpf_ringbuf_reserve`는 **상수 크기만** 받는다 [확인: kernel ringbuf 문서]. 그래서 고정 크기 레코드를 예약하고 패킷을 복사해야 한다. 복사 수단은 `bpf_xdp_load_bytes`(헬퍼 존재 [확인: UAPI], 도입 커널 5.18 **[확인 필요]** → 22.04의 5.15에는 없을 수 있음) 아니면 패킷 포인터 경계 검사를 곁들인 bounded loop다(명령어 수 증가). `bpf_ringbuf_output`은 가변 길이를 받지만, 패킷 포인터와 가변 길이의 조합이 verifier를 통과하는지 **[확인 필요]**.
-  - → **1단계는 perf buffer**를 쓴다(5.10~5.15 호환, 가변 길이). 커널 ≥5.18을 확정하면 ringbuf로 바꾸는 것을 검토한다(CPU 간 순서 보장, 메모리 효율 [확인: 문서]).
+  - **perf buffer:** `bpf_perf_event_output(ctx, &samples, BPF_F_CURRENT_CPU | ((u64)cap << 32), &meta, sizeof(meta))` 형태로 플래그 상위 비트(`BPF_F_CTXLEN_MASK`, 20비트)에 복사할 패킷 길이를 넣으면 커널이 ctx에서 패킷을 붙여 준다. 헬퍼 문서에 "TC or XDP … packet payload"가 명시되어 있다 [확인: UAPI `bpf.h` 주석, `BPF_F_CTXLEN_MASK = 0xfffff<<32`]. `cap = min(pkt_len, SNAPLEN)`을 **런타임 값**으로 줄 수 있어서 짧은 패킷도 verifier 문제 없이 처리된다. 5.15(최소 커널)에서 사용 가능하다.
+  - **ring buffer**(커널 5.8+ → 5.15에서 사용 가능하지만 아래 이유로 5.15에서 패킷 사본 운반을 보장하지 못한다, [확인: libbpf-rs 0.19.1 소스 주석 "As of Linux 5.8"]): `bpf_ringbuf_reserve`는 **상수 크기만** 받는다 [확인: kernel ringbuf 문서]. 그래서 고정 크기 레코드를 예약하고 패킷을 복사해야 한다. 복사 수단은 `bpf_xdp_load_bytes`(헬퍼 존재 [확인: UAPI], 도입 커널 5.18 **[확인 필요]** → 22.04의 5.15에는 없을 수 있음) 아니면 패킷 포인터 경계 검사를 곁들인 bounded loop다(명령어 수 증가). `bpf_ringbuf_output`은 가변 길이를 받지만, 패킷 포인터와 가변 길이의 조합이 verifier를 통과하는지 **[확인 필요]**.
+  - → **결정: Phase 1은 perf buffer**(Q3 결정에 따라 확정. 5.15에서 가변 길이 ctx 복사 지원). ringbuf 재검토 조건: 최소 커널 ≥5.18이 되거나, 측정에서 perf의 CPU별 버퍼 메모리·순서 문제가 확인될 때(ringbuf는 CPU 간 순서 보장, 메모리 효율 [확인: 문서]).
   - 버퍼가 가득 차면 ringbuf 예약은 실패하고 블로킹하지 않는다 [확인: 문서]. perf도 출력 실패를 반환한다. 이 실패는 `sample_lost` 카운터로 센다.
 - **daemon 측 변경:** 전용 OS 스레드 `sg-inspect`를 둔다. main에서 맵 fd를 꺼내 넘기고, 스레드 안에서 `libbpf_sys::perf_buffer__new(fd, …)`를 호출한다. libbpf-rs `PerfBufferBuilder`/`RingBufferBuilder`는 `&Map`(main 태스크)을 요구하므로 쓸 수 없다. 동적 룰 설치는 기존 `BpfJob` 채널로 main 태스크에 보내 `MapManager`가 수행한다. 이렇게 하면 데몬 룰 캐시(list-rules)와 맵이 일치한다. 이를 위해 `BpfJob` 채널 생성을 `serve()` 밖(main)으로 끌어올려야 한다. `!Send` 구조와 충돌하지 않는다.
 - **WASM ABI:** v1으로도 동작한다(≠0 → drop 룰 설치). 다만 사본이 snaplen에서 잘리므로 **원래 길이(`pkt_len`)를 게스트에 알려야 한다**. `http_inspector`의 "payload > 4096" 규칙은 잘린 사본에서는 판정할 수 없다. 이는 4.1절 ABI v2에서 다룬다.
@@ -286,15 +286,16 @@ struct sg_inspect_cfg {       /* ARRAY[1], size 16 */
 
 ```
 now = bpf_ktime_get_ns()
-if (now - st->rl_window_ns >= 1e9) {        // 창 만료
-    st->rl_window_ns = now;                 // 경합 시 여러 CPU가 덮어써도 허용(근사)
-    st->rl_count = 0;
+old = st->rl_window_ns
+if (now - old >= 1e9) {                                   // 창 만료
+    if (__sync_val_compare_and_swap(&st->rl_window_ns, old, now) == old)
+        __sync_lock_test_and_set(&st->rl_count, 0);       // CAS에 이긴 CPU 하나만 리셋 (BPF_CMPXCHG/XCHG, v3·5.12+)
 }
-__sync_fetch_and_add(&st->rl_count, 1);      // 결과 미사용 → BPF_XADD (v1 ISA, 5.10 OK)
-if (st->rl_count > st->rl_pps)  → XDP_DROP, rl_drop++   // 비원자 재읽기: 근사
+cnt = __sync_fetch_and_add(&st->rl_count, 1) + 1          // 반환값 사용 = BPF_FETCH (v3·5.12+)
+if (cnt > st->rl_pps)  → XDP_DROP, rl_drop++              // 비원자 재읽기 없음
 ```
 
-- **정확도:** 창 경계에서 최대 2배 버스트와 리셋 경합으로 인한 오차가 있다. 원자적 리셋에는 `__sync_val_compare_and_swap`(BPF_CMPXCHG)을 쓸 수 있는데, 이는 커널 5.12+ 및 `-mcpu=v3`가 필요하다 **[확인 필요: 버전]**. 현재 Makefile은 `-mcpu`를 지정하지 않는다 [확인]. clang 버전별 기본 ISA는 **[확인 필요]**. PoC 오차를 측정해서 보고하는 방식을 제안한다(설정 pps 대비 실측 통과 pps).
+- **정확도:** 남는 오차는 (1) 고정 창 경계의 최대 2배 버스트(방식 고유)와 (2) 리셋과 증가 사이 경합으로 인한 소수 패킷이다. 최소 커널 5.15(Q3 결정)는 BPF_FETCH·BPF_CMPXCHG(5.12+)를 보장하고, Makefile이 `-mcpu=v3`로 빌드한다 [확인: `src/bpf/Makefile` `BPF_CPU ?= v3`]. v1 ISA에서는 fetch 계열 원자 연산의 반환값 사용과 CAS가 컴파일되지 않는다. 원자 연산 대상 필드(`rl_window_ns`, `rl_count`)는 8바이트 정렬을 유지해야 한다(아래 offset 88/96). PoC 오차는 측정해서 보고한다(설정 pps 대비 실측 통과 pps).
 - **per-flow:** `sg_flow_state`의 `rl_*` 필드를 쓴다. verdict `RATE_LIMIT(pps)`가 설정한다.
 - **per-rule(집계):** XDP는 LPM 조회 결과로 **매치된 prefix가 아니라 값만** 받는다. 그래서 별도 해시 맵의 키를 만들 수 없고, 상태를 **값 안에** 둬야 한다(기존 `stats`처럼). 이렇게 하려면 `filter_rule` 레이아웃이 바뀐다.
 
@@ -380,7 +381,7 @@ sg-inspect 스레드 (std::thread, 1개로 시작)
 | R4 판정 방식 | 인라인 동기 | 비동기 사후 | 인라인/미러 | 비동기 + 플로우 캐시 | 인라인 동기 |
 | R5 커버리지 | ◎ 전체(용량 범위 안) | ○ 1:K 또는 전체(저속) | ○ | ○ 플로우 첫 N + 재샘플 | ◎ 전체 |
 | R6 복잡도 | × (UMEM, 큐, 재주입, libxdp) | ◎ (BPF 약 50줄, 스레드 1개) | ○ | ○ ((b) + LRU 맵, 경합 처리) | ○ (iptables 설정 + nfq) |
-| R7 커널/NIC | △ (ZC 드라이버, 큐 스티어링) | ◎ (perf: 5.10 OK, generic도 가능) | ○ | ◎ | ◎ |
+| R7 커널/NIC | △ (ZC 드라이버, 큐 스티어링) | ◎ (perf: 5.15 OK, generic도 가능) | ○ | ◎ | ◎ |
 | R8 verifier | ◎ (단순) | ○ (perf는 쉬움, ringbuf 가변 복사는 까다로움) | ◎ | ○ | — |
 | R9 Rust 생태계 | △ (xsk-rs 0.11 + libxdp-sys, libbpf 중복 [확인 필요]) | ◎ (libbpf-sys 1.5 바인딩만으로) | ◎ | ◎ | ○ (nfq 0.2.5, 2022년 이후 갱신 없음) |
 | R10 실험 적합성 | ○ (인라인 WASM 오버헤드를 정의대로 측정. 반응 시간 개념은 약함) | ○ (2.3·3.1 측정 가능, 누출 정의 필요) | △ (XDP 주장과 불일치) | ◎ (2.3·3.1·반응 시간·누출·rate limit 모두) | ○ (기준선용) |
@@ -399,6 +400,7 @@ sg-inspect 스레드 (std::thread, 1개로 시작)
 
 ### Phase 1 — 최소 실험 가능 버전: (b) 패킷 단위 사본 + 출발지 자동 차단
 - **산출물**
+  - 운반: perf buffer(결정, 8장 Q3). API는 Unix 소켓(`/run/swift-guard/api.sock`, 2026-10-16 변경)을 그대로 쓴다. 새 요청 변형도 같은 접근 제어를 받는다. 새 변경 요청 변형(`InspectConfig` 등)은 daemon의 감사 로그(`API <Variant> from <peer>`, info) 대상 목록에 추가한다.
   - BPF: `ACTION_INSPECT`, `samples` perf 맵, `inspect_cfg`(mode=1, `sample_every_k`, snaplen), 카운터 `inspect_matched/sample_sent/sample_lost`.
   - daemon: `sg-inspect` 스레드(fd dup, `perf_buffer__new`), `WasmManager::inspect_packet` 연결(v1 ABI), 차단 시 출발지 `/32` drop 룰을 `BpfJob`으로 설치(label `auto-<module>-<ip>`, 같은 prefix에 기존 룰이 있으면 건너뜀), `expire` reaper, `verdicts.csv`.
   - API/CLI: `add-rule --action inspect`, `inspect config`, `inspect stats`. `expire`는 auto 룰에만 허용(사용자 API 해제는 3단계).
@@ -436,7 +438,7 @@ sg-inspect 스레드 (std::thread, 1개로 시작)
 
 1. **Q1 (최우선) 논문의 "WASM 오버헤드 10–15%" 가설을 무엇으로 정의할 것인가.** 비동기 구조에서는 원본 경로의 처리량 저하가 거의 없을 것으로 예상된다. 그러면 오버헤드는 "검사 용량"과 "누출·반응 시간"으로 옮겨 간다. 인라인 동기 오버헤드가 꼭 필요하면 Phase 4(NFQUEUE 또는 AF_XDP)가 필수가 된다.
 2. **Q2 판정 전 대기 정책의 기본값:** pass(fail-open, 누출 있음)인가, drop(fail-closed, TCP 핸드셰이크 지연이나 실패 위험)인가. 그리고 N(플로우당 사본 수)과 snaplen 기본값.
-3. **Q3 목표 커널의 최소 버전:** 5.10 유지(perf buffer, cmpxchg 없음)인가, 5.15/5.18+ 상향(ringbuf + `bpf_xdp_load_bytes` [확인 필요], 정확한 rate limit)인가.
+3. **Q3 목표 커널의 최소 버전 — 결정됨 (2026-10-16): 최소 5.15.** 근거: Ubuntu 22.04 GA 커널, 5.12+ BPF_CMPXCHG/BPF_FETCH, ringbuf 5.8+. 5.18은 22.04 GA를 제외하고 `bpf_xdp_load_bytes` 도입 버전이 미확인 **[확인 필요]**이라 채택하지 않았다. 결과: Phase 1은 perf buffer 유지(3(b)), Phase 3은 fetch-add 반환값·cmpxchg 사용(4.4), BPF 빌드는 `-mcpu=v3`. (이전 선택지: 5.10 유지 — perf buffer, cmpxchg 없음 / 5.18+ — ringbuf + `bpf_xdp_load_bytes`.)
 4. **Q4 자동 룰의 범위:** 플로우만 차단할지, 출발지 `/32`까지 차단할지. 같은 prefix에 운영자 룰이 있을 때 우선순위(LPM은 prefix당 룰 1개).
 5. **Q5 탐지율 정의:** 플로우 단위인지 패킷 단위인지. 샘플링 비율을 보고하는 방식.
 6. **Q6 여러 WASM 모듈의 판정 합성:** 가장 강한 판정(drop > rate_limit > redirect > alert > pass)인가, 첫 번째 비PASS인가.
@@ -453,7 +455,7 @@ sg-inspect 스레드 (std::thread, 1개로 시작)
 | `http_inspector` 패턴(`;`, `&`, `--`, 길이 4096 초과)의 높은 오탐 가능성 | FPR이 나쁘게 나옴 | 평가용 모듈 규칙을 정비(wasm-module-dev 작업)하고 snaplen 잘림을 `pkt_len`으로 보정 |
 | fd 수명과 종료 순서 | 닫힌 fd에 쓰기 | 스레드에 `dup()` fd, `MapManager` drop 전에 join |
 | 동적 룰과 운영자 룰 충돌(prefix당 1개) | 운영자 룰 덮어쓰기 | auto 룰은 같은 prefix가 이미 있으면 건너뛰고 로그. label 접두사 `auto-` |
-| 고정 창 rate limit 오차 | 정확도 논란 | 오차 측정·보고. 5.12+ 확정 시 cmpxchg |
+| 고정 창 rate limit 오차 | 정확도 논란 | 5.15 확정 → fetch-add 반환값·CAS 리셋 사용(Phase 3). 고정 창 경계 오차는 측정·보고 |
 | AF_XDP 선택 시 libxdp/libbpf 중복 링크 | 빌드·런타임 충돌 | Phase 4로 미루고, 별도 바이너리(feature flag)로 격리 |
 | 01 계획과의 순서 의존(옵션 거부 → 해제) | API 혼선 | 3단계에서 거부 해제를 명시적 작업으로 두고 변경 이력 기록 |
 
@@ -472,3 +474,4 @@ sg-inspect 스레드 (std::thread, 1개로 시작)
 
 ## 변경 이력
 - 2026-10-14 초안 (HEAD 42d4eea 기준).
+- 2026-10-16 Q3 결정(최소 커널 5.15), 3(b)/4.4/R7/9장 정리, Phase 1 운반 계층 perf buffer 확정, Phase 1에 API Unix 소켓·접근 제어 한 줄 (HEAD fc42b65 기준).

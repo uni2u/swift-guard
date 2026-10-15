@@ -9,9 +9,15 @@ ExecStart=/usr/local/bin/swift-guard-daemon --bpf-obj /usr/local/lib/swift-guard
 Restart=on-failure
 RestartSec=5s
 
+# API socket directory: /run/swift-guard (0755). The daemon creates
+# /run/swift-guard/api.sock as root:swift-guard 0660 (root-only 0600 if the group is missing).
+RuntimeDirectory=swift-guard
+RuntimeDirectoryMode=0755
+
 # Security settings
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_SYS_RESOURCE
-AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_SYS_RESOURCE
+# CAP_CHOWN: needed to set the API socket group to swift-guard
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_SYS_RESOURCE CAP_CHOWN
+AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_SYS_RESOURCE CAP_CHOWN
 NoNewPrivileges=true
 ProtectSystem=full
 ProtectHome=true

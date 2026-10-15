@@ -31,7 +31,7 @@ LAB_IF=sg-lab0; LAB_SRC=10.200.0.2; LAB_DST=10.200.0.1
 
 # ---------------------------------------------------------------- 옵션 (기본값은 bench_finalize_opts 에서)
 IFACE=""; MODE=""; GENERATOR=external; DURATION=""; SRC_IP=""; DST_IP=""; RULE_ACTION=drop
-OUT_DIR=./results; API=127.0.0.1:7654; BPF_OBJ=""; BIN_DIR=""
+OUT_DIR=./results; API=unix:/run/swift-guard/api.sock; BPF_OBJ=""; BIN_DIR=""
 NO_DAEMON=0; NO_ATTACH=0; FORCE_ATTACH=0; TX_DEV=""; DST_MAC=""; PKTGEN_THREADS=1
 NO_PROMPT=0; WARMUP=2
 
@@ -64,7 +64,7 @@ BENCH_COMMON_USAGE='공통 옵션:
                               count 룰 매치 후 XDP_PASS
                               none  룰 없음 → no_match 로 XDP_PASS (커널 스택 경로). pps/gbps(룰 매치)는 0
   --output-dir <dir>        결과 디렉토리 (기본 ./results)
-  --api-server <addr>       daemon API 주소 (기본 127.0.0.1:7654)
+  --api-server <addr>       daemon API 주소 (기본 unix:/run/swift-guard/api.sock, TCP는 tcp:127.0.0.1:<port>)
   --bpf-obj <path>          daemon 기동 시 BPF 오브젝트 (기본 src/bpf/xdp_filter.o, 없으면 /usr/local/lib/swift-guard/xdp_filter.o)
   --bin-dir <dir>           swift-guard-daemon, xdp-filter 위치 (기본 저장소 target/release, 없으면 PATH)
   --no-daemon               daemon을 띄우지 않는다. API가 응답하지 않으면 에러
@@ -141,11 +141,20 @@ bench_finalize_opts() {
   is_uint "$WARMUP" || die "--warmup 은 정수: '$WARMUP'"
   is_uint "$PKTGEN_THREADS" && [ "$PKTGEN_THREADS" -ge 1 ] || die "--pktgen-threads 는 1 이상: '$PKTGEN_THREADS'"
   is_ipv4 "$SRC_IP" || die "--src-ip 가 IPv4가 아니다: '$SRC_IP'"
-  [[ "$API" == *:* ]] || die "--api-server 는 host:port: '$API'"
+  # 형식만 거른다. 최종 검증(루프백 전용 등)은 xdp-filter/daemon 의 주소 파서가 한다
+  case "$API" in
+    unix:/*|/*|tcp:*) ;;
+    *) die "--api-server 는 unix:/path/to/socket 또는 tcp:<loopback-ip>:<port>: '$API' (예전 host:port 형식이면 앞에 tcp: 를 붙인다)" ;;
+  esac
 
   [ "$(uname -s)" = Linux ] || die "Linux 전용"
   [ "$(id -u)" -eq 0 ] || die "root 필요: sudo $0 ..."
   command -v setsid >/dev/null || die "setsid 없음 (util-linux 설치)"
+  local kver kmaj kmin
+  kver="$(uname -r)"; kmaj="${kver%%.*}"; kmin="$(echo "$kver" | cut -d. -f2)"; kmin="${kmin%%[!0-9]*}"
+  if [ "$kmaj" -lt 5 ] || { [ "$kmaj" -eq 5 ] && [ "${kmin:-0}" -lt 15 ]; }; then
+    warn "커널 $kver 은 지원 최소 버전 5.15 보다 낮다 (attach/verifier 가 실패할 수 있다. 벤더 백포트 커널이면 계속 진행)"
+  fi
 
   if [ "$GENERATOR" = lab ]; then
     [ -x "$LAB" ] || die "$LAB 없음"
@@ -193,7 +202,8 @@ bench_finalize_opts() {
 }
 
 xf() { "$XF" --api-server "$API" "$@"; }
-api_up() { (exec 3<>"/dev/tcp/${API%:*}/${API##*:}") 2>/dev/null; }
+# 전송 방식(Unix/TCP)과 무관하게 CLI로 응답 여부를 본다
+api_up() { "$XF" --api-server "$API" list-rules >/dev/null 2>&1; }
 
 # ---------------------------------------------------------------- daemon / attach / 룰
 bench_start_daemon() {
@@ -226,7 +236,8 @@ bench_start_daemon() {
 bench_check_stats_csv() {
   local out hdr row rx
   out="$(xf stats --format csv --count 1 2>&1)" || die "xdp-filter stats --format csv 실패: $(echo "$out" | tail -1)"
-  hdr="$(echo "$out" | head -1)"; row="$(echo "$out" | sed -n 2p)"
+  # 파이프(echo|head) 없이 분리: pipefail 아래에서 head가 먼저 닫으면 SIGPIPE(141)로 실패할 수 있다
+  hdr="${out%%$'\n'*}"; row="$(sed -n 2p <<<"$out")"
   [ "$hdr" = "$STATS_CSV_HEADER" ] \
     || die "xdp-filter stats CSV 헤더가 계약(17열)과 다르다 → xdp-filter 재빌드 필요 (cargo build --release). 받은 헤더: $hdr"
   rx="$(echo "$row" | cut -d, -f6)"
@@ -434,7 +445,7 @@ bench_write_meta() {
   local f="$1"; shift
   local rev drv cpu_model
   rev="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
-  if [ -n "$(git -C "$ROOT" status --porcelain 2>/dev/null | head -1)" ]; then rev="$rev-dirty"; fi
+  if [ -n "$(git -C "$ROOT" status --porcelain 2>/dev/null)" ]; then rev="$rev-dirty"; fi
   drv=""
   if command -v ethtool >/dev/null; then drv="$(ethtool -i "$IFACE" 2>/dev/null | awk '/^driver:/ { print $2 }')"; fi
   [ -z "$drv" ] && [ -e "/sys/class/net/$IFACE/device/driver" ] && drv="$(basename "$(readlink -f "/sys/class/net/$IFACE/device/driver")")"

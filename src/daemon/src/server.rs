@@ -8,15 +8,19 @@
 //! main 태스크를 떠나지 않는다. WASM 요청은 연결 태스크에서 처리하고, 로드는 spawn_blocking 으로 돈다.
 //! 자원 상한 (R3): 프레임 최대 MAX_FRAME, 연결별 read/write timeout, 동시 연결 MAX_CONNECTIONS,
 //! 동시 WASM 로드 MAX_CONCURRENT_LOADS. 상한 초과는 기다리지 않고 즉시 Error 로 거절한다.
+//! 전송 (계획 C-4): 기본은 Unix 소켓(`root:swift-guard 0660`, 그룹이 없으면 `0600` root 전용).
+//! 접근 제어는 소켓 파일 권한이 한다. SO_PEERCRED 는 감사 로그(변경 요청의 uid/gid/pid)에만 쓴다.
+//! TCP 는 `tcp:` 루프백 옵트인(파서가 비루프백을 거부한다, common::endpoint).
 
 use anyhow::{anyhow, Context, Result};
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use std::io::Write;
-use std::path::Path;
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 use tokio::time::{timeout, Instant};
 
@@ -26,14 +30,13 @@ use crate::telemetry::TelemetryCollector;
 use crate::wasm::WasmManager;
 
 use swift_guard::api::{ApiRequest, ApiResponse, SystemStats, WasmModuleInfo};
+use swift_guard::endpoint::ApiEndpoint;
 use swift_guard::types::MatchSide;
 use swift_guard::utils;
 
 /// API 서버
 #[derive(Debug)]
 pub struct ApiServer {
-    /// 바인드 주소
-    addr: String,
     /// 맵 관리자
     map_manager: Arc<Mutex<MapManager>>,
     /// XDP attach 관리자
@@ -129,7 +132,7 @@ fn encode_response(response: &ApiResponse) -> Result<Vec<u8>> {
 /// accept 루프(main 태스크)에서 호출되므로 await 하지 않는다 — std 소켓(이미 non-blocking)으로
 /// 직접 write 한다. 새 소켓의 송신 버퍼는 비어 있어 작은 프레임은 한 번에 들어간다.
 /// 실패(WouldBlock 등)해도 연결만 닫힌다.
-fn reject_busy(stream: TcpStream) {
+fn reject_busy(conn: ApiConn) {
     let frame = match encode_response(&error_response(anyhow!(
         "server busy: too many concurrent connections (max {})",
         MAX_CONNECTIONS
@@ -137,8 +140,266 @@ fn reject_busy(stream: TcpStream) {
         Ok(f) => f,
         Err(_) => return,
     };
-    if let Ok(mut std_stream) = stream.into_std() {
-        let _ = std_stream.write_all(&frame);
+    match conn {
+        ApiConn::Unix(stream) => {
+            if let Ok(mut std_stream) = stream.into_std() {
+                let _ = std_stream.write_all(&frame);
+            }
+        }
+        ApiConn::Tcp(stream) => {
+            if let Ok(mut std_stream) = stream.into_std() {
+                let _ = std_stream.write_all(&frame);
+            }
+        }
+    }
+}
+
+// ---- 전송 계층 (C-4) ----
+
+/// Unix 소켓 정리 guard: 자기가 만든 소켓(dev/ino 일치)만 Drop 시 삭제한다 (D11).
+/// 다른 daemon 이 같은 경로에 새로 만든 소켓은 지우지 않는다.
+#[derive(Debug)]
+pub struct SocketCleanup {
+    path: PathBuf,
+    dev: u64,
+    ino: u64,
+}
+
+impl Drop for SocketCleanup {
+    fn drop(&mut self) {
+        match std::fs::symlink_metadata(&self.path) {
+            Ok(m) if m.dev() == self.dev && m.ino() == self.ino => {
+                match std::fs::remove_file(&self.path) {
+                    Ok(()) => debug!("removed API socket {}", self.path.display()),
+                    Err(e) => warn!("failed to remove API socket {}: {}", self.path.display(), e),
+                }
+            }
+            Ok(_) => debug!(
+                "API socket {} was replaced by another process; not removing it",
+                self.path.display()
+            ),
+            Err(_) => {}
+        }
+    }
+}
+
+/// bind 된 API 리스너. Unix 는 정리 guard 를 소유한다(리스너와 함께 drop → 소켓 삭제).
+#[derive(Debug)]
+pub enum ApiListener {
+    Unix {
+        listener: UnixListener,
+        _cleanup: SocketCleanup,
+    },
+    Tcp(TcpListener),
+}
+
+/// 수락된 연결
+#[derive(Debug)]
+enum ApiConn {
+    Unix(UnixStream),
+    Tcp(TcpStream),
+}
+
+impl ApiListener {
+    /// 연결 하나를 수락하고 감사용 peer 라벨을 만든다.
+    /// (tokio accept 는 cancel-safe 이고 이후 처리는 동기라 select! 분기로 써도 안전하다)
+    async fn accept(&self) -> std::io::Result<(ApiConn, String)> {
+        match self {
+            ApiListener::Unix { listener, .. } => {
+                let (stream, _) = listener.accept().await?;
+                let label = unix_peer_label(&stream);
+                Ok((ApiConn::Unix(stream), label))
+            }
+            ApiListener::Tcp(listener) => {
+                let (stream, addr) = listener.accept().await?;
+                Ok((ApiConn::Tcp(stream), addr.to_string()))
+            }
+        }
+    }
+}
+
+/// SO_PEERCRED 라벨: `uid=U gid=G pid=P` (pid 를 모르면 `?`, 조회 실패 시 `unix peer`)
+fn unix_peer_label(stream: &UnixStream) -> String {
+    match stream.peer_cred() {
+        Ok(c) => format!(
+            "uid={} gid={} pid={}",
+            c.uid(),
+            c.gid(),
+            c.pid().map(|p| p.to_string()).unwrap_or_else(|| "?".into())
+        ),
+        Err(_) => "unix peer".to_string(),
+    }
+}
+
+/// 감사 로그용 요청 이름과 변경 요청 여부 (D14). 와일드카드 없음: 새 변형은 여기서 분류해야 컴파일된다.
+fn audit_kind(request: &ApiRequest) -> (&'static str, bool) {
+    match request {
+        ApiRequest::Attach { .. } => ("Attach", true),
+        ApiRequest::Detach { .. } => ("Detach", true),
+        ApiRequest::AddRule { .. } => ("AddRule", true),
+        ApiRequest::DeleteRule { .. } => ("DeleteRule", true),
+        ApiRequest::LoadWasmModule { .. } => ("LoadWasmModule", true),
+        ApiRequest::UnloadWasmModule { .. } => ("UnloadWasmModule", true),
+        ApiRequest::ListRules { .. } => ("ListRules", false),
+        ApiRequest::GetStats {} => ("GetStats", false),
+        ApiRequest::ListWasmModules {} => ("ListWasmModules", false),
+        ApiRequest::WasmModuleStats { .. } => ("WasmModuleStats", false),
+    }
+}
+
+/// umask 를 잠깐 바꿨다가 Drop 시 복원한다 (에러 경로 포함, D12)
+struct UmaskGuard(nix::sys::stat::Mode);
+
+impl UmaskGuard {
+    fn set(bits: u32) -> Self {
+        use nix::sys::stat::{umask, Mode};
+        UmaskGuard(umask(Mode::from_bits_truncate(bits as _)))
+    }
+}
+
+impl Drop for UmaskGuard {
+    fn drop(&mut self) {
+        nix::sys::stat::umask(self.0);
+    }
+}
+
+/// 부모 디렉토리 준비: 없으면 0755 로 하나만 만든다(비재귀, D8). 있는데 디렉토리가 아니면 에러.
+fn ensure_parent_dir(path: &Path) -> Result<()> {
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => return Ok(()),
+    };
+    match std::fs::metadata(parent) {
+        Ok(m) if m.is_dir() => Ok(()),
+        Ok(_) => Err(anyhow!("{} exists and is not a directory", parent.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::DirBuilder::new()
+                .mode(0o755)
+                .create(parent)
+                .with_context(|| format!("Failed to create API socket directory {}", parent.display()))?;
+            // umask 와 무관하게 0755 로 고정한다
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755))
+                .with_context(|| format!("Failed to set mode on {}", parent.display()))?;
+            Ok(())
+        }
+        Err(e) => Err(anyhow!(e).context(format!("Failed to inspect {}", parent.display()))),
+    }
+}
+
+/// 경로에 이미 무언가 있으면 처리한다 (D11): 살아 있는 소켓 → 에러, stale 소켓 → 삭제, 소켓 아님 → 에러(보존).
+fn clear_stale_socket(path: &Path) -> Result<()> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(anyhow!(e).context(format!("Failed to inspect {}", path.display()))),
+    };
+    if !meta.file_type().is_socket() {
+        return Err(anyhow!(
+            "{} exists and is not a socket; refusing to remove it",
+            path.display()
+        ));
+    }
+    match std::os::unix::net::UnixStream::connect(path) {
+        Ok(_) => Err(anyhow!(
+            "API socket {} is already in use by another swift-guard-daemon \
+             (stop it first, e.g. sudo systemctl stop swift-guard)",
+            path.display()
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+            std::fs::remove_file(path)
+                .with_context(|| format!("Failed to remove stale API socket {}", path.display()))?;
+            info!("removed stale API socket {}", path.display());
+            Ok(())
+        }
+        Err(e) => Err(anyhow!(e).context(format!("Failed to probe existing API socket {}", path.display()))),
+    }
+}
+
+/// 소켓 그룹·권한 설정 (D7): 그룹이 있고 chown 이 성공해야 0660, 아니면 0600(root 전용) 유지 + 경고.
+/// 반환값: 실제 적용된 모드
+fn apply_socket_group(path: &Path, group: &str) -> u32 {
+    use nix::unistd::{chown, Group};
+    let root_only = |path: &Path| {
+        info!("API server listening on unix:{} (mode 0600, root only)", path.display());
+        0o600
+    };
+    match Group::from_name(group) {
+        Ok(Some(g)) => match chown(path, None, Some(g.gid)) {
+            Ok(()) => match std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660)) {
+                Ok(()) => {
+                    info!(
+                        "API server listening on unix:{} (mode 0660, group {})",
+                        path.display(),
+                        group
+                    );
+                    0o660
+                }
+                Err(e) => {
+                    warn!("cannot set group '{}' on {}: {}; API socket is root-only", group, path.display(), e);
+                    root_only(path)
+                }
+            },
+            Err(e) => {
+                warn!("cannot set group '{}' on {}: {}; API socket is root-only", group, path.display(), e);
+                root_only(path)
+            }
+        },
+        Ok(None) => {
+            warn!(
+                "group '{}' not found: API socket {} is root-only (create it with: sudo groupadd --system {})",
+                group,
+                path.display(),
+                group
+            );
+            root_only(path)
+        }
+        Err(e) => {
+            warn!("cannot set group '{}' on {}: {}; API socket is root-only", group, path.display(), e);
+            root_only(path)
+        }
+    }
+}
+
+/// API endpoint 에 bind 한다 (C-4). main 은 BPF 로드 전에 호출해 중복 기동을 먼저 거부한다 (D13).
+pub async fn bind_api(endpoint: &ApiEndpoint, group: &str) -> Result<ApiListener> {
+    match endpoint {
+        ApiEndpoint::Unix(path) => {
+            ensure_parent_dir(path)?;
+            clear_stale_socket(path)?;
+            let std_listener = {
+                // 0600 으로 생성 → chown → chmod 0660. 권한 설정 전 틈에도 root 외 접속 불가 (D12)
+                let _umask = UmaskGuard::set(0o177);
+                std::os::unix::net::UnixListener::bind(path)
+                    .with_context(|| format!("Failed to bind API socket {}", path.display()))?
+            };
+            let meta = std::fs::symlink_metadata(path)
+                .with_context(|| format!("Failed to stat API socket {}", path.display()))?;
+            let cleanup = SocketCleanup {
+                path: path.clone(),
+                dev: meta.dev(),
+                ino: meta.ino(),
+            };
+            std_listener
+                .set_nonblocking(true)
+                .context("Failed to set API socket non-blocking")?;
+            let listener = UnixListener::from_std(std_listener).context("Failed to register API socket")?;
+            apply_socket_group(path, group);
+            Ok(ApiListener::Unix {
+                listener,
+                _cleanup: cleanup,
+            })
+        }
+        ApiEndpoint::Tcp(addr) => {
+            let listener = TcpListener::bind(addr)
+                .await
+                .with_context(|| format!("Failed to bind to tcp:{}", addr))?;
+            warn!(
+                "TCP API enabled on tcp:{}: no authentication, any local user can change rules",
+                addr
+            );
+            info!("API server listening on tcp:{}", addr);
+            Ok(ApiListener::Tcp(listener))
+        }
     }
 }
 
@@ -183,7 +444,7 @@ fn error_response(e: anyhow::Error) -> ApiResponse {
 /// - BPF 요청만 채널로 이 루프에 돌아와 `handle_bpf` 로 동기 처리된다(!Send 객체가 main 태스크를 떠나지 않음).
 /// - 이 future 가 drop 되면(시그널로 종료) 채널 수신자가 사라지고, 남은 연결 태스크의 BPF 요청은
 ///   "daemon is shutting down" 에러로 끝난다.
-async fn serve<F>(listener: TcpListener, wasm: Arc<WasmManager>, mut handle_bpf: F) -> Result<()>
+async fn serve<F>(listener: ApiListener, wasm: Arc<WasmManager>, mut handle_bpf: F) -> Result<()>
 where
     F: FnMut(ApiRequest) -> ApiResponse,
 {
@@ -198,12 +459,12 @@ where
     loop {
         tokio::select! {
             accepted = listener.accept(), if !backing_off => match accepted {
-                Ok((stream, peer)) => {
+                Ok((conn, peer)) => {
                     let permit = match conn_permits.clone().try_acquire_owned() {
                         Ok(p) => p,
                         Err(_) => {
                             debug!("Rejecting connection from {}: connection limit reached", peer);
-                            reject_busy(stream);
+                            reject_busy(conn);
                             continue;
                         }
                     };
@@ -214,7 +475,11 @@ where
                     tokio::spawn(async move {
                         // permit 은 연결이 끝날 때까지 쥔다
                         let _permit = permit;
-                        if let Err(e) = handle_connection(stream, wasm, bpf_tx, load_permits).await {
+                        let r = match conn {
+                            ApiConn::Unix(s) => handle_connection(s, &peer, wasm, bpf_tx, load_permits).await,
+                            ApiConn::Tcp(s) => handle_connection(s, &peer, wasm, bpf_tx, load_permits).await,
+                        };
+                        if let Err(e) = r {
                             error!("Connection error ({}): {:#}", peer, e);
                         }
                     });
@@ -237,7 +502,7 @@ where
 }
 
 /// 요청 프레임 읽기. 길이 헤더 검사(MAX_FRAME)가 본문 버퍼 할당보다 먼저다.
-async fn read_request(stream: &mut TcpStream) -> Result<Vec<u8>> {
+async fn read_request<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Vec<u8>> {
     let mut len_bytes = [0u8; 4];
     stream
         .read_exact(&mut len_bytes)
@@ -255,12 +520,16 @@ async fn read_request(stream: &mut TcpStream) -> Result<Vec<u8>> {
 
 /// 클라이언트 연결 처리 (Send 태스크). 요청을 읽은 뒤에는 항상 응답 프레임을 보낸다.
 /// 프레임 초과 / read timeout 도 가능하면 Error 응답을 보낸 뒤 연결을 닫는다(Err 로 로그).
-async fn handle_connection(
-    mut stream: TcpStream,
+async fn handle_connection<S>(
+    mut stream: S,
+    peer: &str,
     wasm: Arc<WasmManager>,
     bpf_tx: mpsc::Sender<BpfJob>,
     load_permits: Arc<Semaphore>,
-) -> Result<()> {
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let read = match timeout(IO_TIMEOUT, read_request(&mut stream)).await {
         Ok(r) => r,
         Err(_) => Err(anyhow!("request read timed out after {:?}", IO_TIMEOUT)),
@@ -272,6 +541,11 @@ async fn handle_connection(
                 .context("Failed to deserialize request")
             {
                 Ok(request) => {
+                    // D14 감사: 변경 요청은 info 한 줄(페이로드 제외), 조회는 debug
+                    match audit_kind(&request) {
+                        (kind, true) => info!("API {} from {}", kind, peer),
+                        (kind, false) => debug!("API {} from {}", kind, peer),
+                    }
                     debug!("Processing request: {:?}", request);
                     dispatch(request, &wasm, &bpf_tx, &load_permits).await
                 }
@@ -390,14 +664,12 @@ async fn process_wasm_request(
 impl ApiServer {
     /// 새로운 API 서버 생성
     pub fn new(
-        addr: &str,
         map_manager: Arc<Mutex<MapManager>>,
         attach: Arc<Mutex<XdpAttachManager>>,
         telemetry: Arc<TelemetryCollector>,
         wasm: Arc<WasmManager>,
     ) -> Self {
         Self {
-            addr: addr.to_string(),
             map_manager,
             attach,
             telemetry,
@@ -405,17 +677,9 @@ impl ApiServer {
         }
     }
 
-    /// API 주소에 bind 한다. main 은 bind 성공 후에 auto_load 같은 백그라운드 작업을 시작한다.
-    pub async fn bind(&self) -> Result<TcpListener> {
-        let listener = TcpListener::bind(&self.addr)
-            .await
-            .with_context(|| format!("Failed to bind to {}", self.addr))?;
-        info!("API server listening on {}", self.addr);
-        Ok(listener)
-    }
-
-    /// bind 된 리스너로 서버 실행 (무한 루프). main 태스크에서 폴링된다.
-    pub async fn run(&self, listener: TcpListener) -> Result<()> {
+    /// bind 된 리스너(`bind_api`)로 서버 실행 (무한 루프). main 태스크에서 폴링된다.
+    /// 이 future 가 drop 되면 리스너도 drop 되어 Unix 소켓이 삭제된다.
+    pub async fn run(&self, listener: ApiListener) -> Result<()> {
         // MutexGuard 를 쥔 채 await 하지 않도록 BPF 요청은 동기 처리
         serve(listener, self.wasm.clone(), |request| {
             self.process_request(request).unwrap_or_else(error_response)
@@ -691,7 +955,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let wasm = Arc::new(WasmManager::new());
-        tokio::spawn(serve(listener, wasm.clone(), fake_bpf));
+        tokio::spawn(serve(ApiListener::Tcp(listener), wasm.clone(), fake_bpf));
 
         let started = Instant::now();
         let load = tokio::spawn({
@@ -739,7 +1003,7 @@ mod tests {
 
         let started = Instant::now();
         let outcome = tokio::select! {
-            r = serve(listener, wasm.clone(), fake_bpf) => format!("server stopped: {:?}", r),
+            r = serve(ApiListener::Tcp(listener), wasm.clone(), fake_bpf) => format!("server stopped: {:?}", r),
             _ = sig_rx => "signal".to_string(),
         };
         let elapsed = started.elapsed();
@@ -777,7 +1041,7 @@ mod tests {
     async fn oversized_frame_rejected_without_reading_body() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(serve(listener, Arc::new(WasmManager::new()), fake_bpf));
+        tokio::spawn(serve(ApiListener::Tcp(listener), Arc::new(WasmManager::new()), fake_bpf));
 
         for len in [MAX_FRAME as u32 + 1, u32::MAX] {
             let mut s = TcpStream::connect(addr).await.unwrap();
@@ -804,7 +1068,7 @@ mod tests {
         let wasm_path = write_loop_wat("limit");
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(serve(listener, Arc::new(WasmManager::new()), fake_bpf));
+        tokio::spawn(serve(ApiListener::Tcp(listener), Arc::new(WasmManager::new()), fake_bpf));
 
         let slow: Vec<_> = (0..MAX_CONCURRENT_LOADS)
             .map(|i| {
@@ -847,7 +1111,7 @@ mod tests {
     async fn connection_limit_rejects_without_waiting() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(serve(listener, Arc::new(WasmManager::new()), fake_bpf));
+        tokio::spawn(serve(ApiListener::Tcp(listener), Arc::new(WasmManager::new()), fake_bpf));
 
         // 아무것도 보내지 않는 idle 연결로 상한을 채운다
         let mut idle = Vec::new();
@@ -879,5 +1143,210 @@ mod tests {
         assert!(needs_bpf(&ApiRequest::Detach { interface: "x".into() }));
         assert!(!needs_bpf(&ApiRequest::ListWasmModules {}));
         assert!(!needs_bpf(&ApiRequest::UnloadWasmModule { name: "x".into() }));
+    }
+
+    // ---- C-4: Unix 소켓 전송·수명·권한 (BPF 불필요) ----
+
+    fn unix_test_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("sg_srv_{}_{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    const NO_GROUP: &str = "sg-no-such-group-for-test";
+
+    async fn call_unix(path: &Path, req: &ApiRequest) -> ApiResponse {
+        let mut s = UnixStream::connect(path).await.unwrap();
+        let body = serde_json::to_vec(req).unwrap();
+        s.write_all(&(body.len() as u32).to_be_bytes()).await.unwrap();
+        s.write_all(&body).await.unwrap();
+        let mut len = [0u8; 4];
+        s.read_exact(&mut len).await.unwrap();
+        let mut buf = vec![0u8; u32::from_be_bytes(len) as usize];
+        s.read_exact(&mut buf).await.unwrap();
+        serde_json::from_slice(&buf).unwrap()
+    }
+
+    fn mode_of(p: &Path) -> u32 {
+        std::fs::symlink_metadata(p).unwrap().permissions().mode() & 0o777
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unix_round_trip_and_cleanup_on_drop() {
+        let d = unix_test_dir("rt");
+        let sock = d.join("api.sock");
+        let listener = bind_api(&ApiEndpoint::Unix(sock.clone()), NO_GROUP).await.unwrap();
+        let server = tokio::spawn(serve(listener, Arc::new(WasmManager::new()), fake_bpf));
+        let r = call_unix(&sock, &ApiRequest::ListRules { include_stats: false }).await;
+        assert!(matches!(r, ApiResponse::Success { ref message } if message == "bpf:true"), "{:?}", r);
+        let r = call_unix(&sock, &ApiRequest::ListWasmModules {}).await;
+        assert!(matches!(r, ApiResponse::WasmModules { .. }), "{:?}", r);
+        // serve future 를 버리면 리스너와 guard 가 drop 되어 소켓이 지워진다
+        server.abort();
+        let _ = server.await;
+        assert!(!sock.exists(), "socket must be removed on shutdown");
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn creates_missing_parent_dir_0755() {
+        let d = unix_test_dir("mkdir");
+        let sock = d.join("sub").join("api.sock");
+        let l = bind_api(&ApiEndpoint::Unix(sock.clone()), NO_GROUP).await.unwrap();
+        assert_eq!(mode_of(&d.join("sub")), 0o755);
+        assert!(sock.exists());
+        drop(l);
+        // 조부모가 없으면 에러 (비재귀)
+        let deep = d.join("a").join("b").join("api.sock");
+        assert!(bind_api(&ApiEndpoint::Unix(deep), NO_GROUP).await.is_err());
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stale_socket_is_replaced() {
+        let d = unix_test_dir("stale");
+        let sock = d.join("api.sock");
+        drop(std::os::unix::net::UnixListener::bind(&sock).unwrap()); // 리스너 없는 소켓 파일
+        assert!(sock.exists());
+        let l = bind_api(&ApiEndpoint::Unix(sock.clone()), NO_GROUP).await.unwrap();
+        tokio::spawn(serve(l, Arc::new(WasmManager::new()), fake_bpf));
+        let r = call_unix(&sock, &ApiRequest::GetStats {}).await;
+        assert!(matches!(r, ApiResponse::Success { .. }), "{:?}", r);
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn live_socket_is_in_use() {
+        let d = unix_test_dir("inuse");
+        let sock = d.join("api.sock");
+        let first = bind_api(&ApiEndpoint::Unix(sock.clone()), NO_GROUP).await.unwrap();
+        let e = format!("{:#}", bind_api(&ApiEndpoint::Unix(sock.clone()), NO_GROUP).await.unwrap_err());
+        assert_eq!(
+            e,
+            format!(
+                "API socket {} is already in use by another swift-guard-daemon \
+                 (stop it first, e.g. sudo systemctl stop swift-guard)",
+                sock.display()
+            )
+        );
+        // 실패한 두 번째 시도가 첫 번째 소켓을 지우지 않는다
+        assert!(sock.exists());
+        drop(first);
+        assert!(!sock.exists());
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn regular_file_is_refused_and_preserved() {
+        let d = unix_test_dir("file");
+        let sock = d.join("api.sock");
+        std::fs::write(&sock, b"keep me").unwrap();
+        let e = format!("{:#}", bind_api(&ApiEndpoint::Unix(sock.clone()), NO_GROUP).await.unwrap_err());
+        assert_eq!(e, format!("{} exists and is not a socket; refusing to remove it", sock.display()));
+        assert_eq!(std::fs::read(&sock).unwrap(), b"keep me");
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn missing_group_leaves_socket_root_only() {
+        let d = unix_test_dir("nogrp");
+        let sock = d.join("api.sock");
+        // 사용자 umask 가 느슨해도 0600 이어야 한다
+        let old = nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(0o000));
+        let l = bind_api(&ApiEndpoint::Unix(sock.clone()), NO_GROUP).await;
+        nix::sys::stat::umask(old);
+        let _l = l.unwrap();
+        assert_eq!(mode_of(&sock), 0o600);
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn existing_group_sets_0660_and_gid() {
+        let gid = nix::unistd::getegid();
+        let group = match nix::unistd::Group::from_gid(gid) {
+            Ok(Some(g)) => g.name,
+            _ => {
+                eprintln!("skip: no group name for egid {}", gid);
+                return;
+            }
+        };
+        let d = unix_test_dir("grp");
+        let sock = d.join("api.sock");
+        let _l = bind_api(&ApiEndpoint::Unix(sock.clone()), &group).await.unwrap();
+        assert_eq!(mode_of(&sock), 0o660);
+        assert_eq!(std::fs::symlink_metadata(&sock).unwrap().gid(), gid.as_raw());
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn guard_does_not_remove_replaced_socket() {
+        let d = unix_test_dir("replaced");
+        let sock = d.join("api.sock");
+        let l = bind_api(&ApiEndpoint::Unix(sock.clone()), NO_GROUP).await.unwrap();
+        std::fs::remove_file(&sock).unwrap();
+        let _other = std::os::unix::net::UnixListener::bind(&sock).unwrap(); // 다른 프로세스의 소켓
+        drop(l);
+        assert!(sock.exists(), "must not remove a socket it did not create");
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unix_peer_label_has_uid() {
+        let (a, _b) = UnixStream::pair().unwrap();
+        let label = unix_peer_label(&a);
+        assert!(label.starts_with(&format!("uid={} gid=", nix::unistd::geteuid())), "{}", label);
+        assert!(label.contains(&format!("pid={}", std::process::id())), "{}", label);
+    }
+
+    #[test]
+    fn audit_kind_classifies_mutations() {
+        assert_eq!(audit_kind(&ApiRequest::Detach { interface: "x".into() }), ("Detach", true));
+        assert_eq!(audit_kind(&ApiRequest::DeleteRule { label: "x".into() }), ("DeleteRule", true));
+        assert_eq!(audit_kind(&ApiRequest::UnloadWasmModule { name: "x".into() }), ("UnloadWasmModule", true));
+        assert_eq!(audit_kind(&ApiRequest::GetStats {}), ("GetStats", false));
+        assert_eq!(audit_kind(&ApiRequest::ListRules { include_stats: true }), ("ListRules", false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unix_connection_limit_rejects_without_waiting() {
+        let d = unix_test_dir("busy");
+        let sock = d.join("api.sock");
+        let l = bind_api(&ApiEndpoint::Unix(sock.clone()), NO_GROUP).await.unwrap();
+        tokio::spawn(serve(l, Arc::new(WasmManager::new()), fake_bpf));
+        let mut idle = Vec::new();
+        for _ in 0..MAX_CONNECTIONS {
+            idle.push(UnixStream::connect(&sock).await.unwrap());
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let mut s = UnixStream::connect(&sock).await.unwrap();
+        let r = timeout(Duration::from_secs(2), async {
+            let mut len = [0u8; 4];
+            s.read_exact(&mut len).await.unwrap();
+            let mut buf = vec![0u8; u32::from_be_bytes(len) as usize];
+            s.read_exact(&mut buf).await.unwrap();
+            serde_json::from_slice::<ApiResponse>(&buf).unwrap()
+        })
+        .await
+        .expect("over-limit connection must be answered immediately");
+        assert!(matches!(r, ApiResponse::Error { ref message } if message.contains("server busy")), "{:?}", r);
+        drop(idle);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let r = call_unix(&sock, &ApiRequest::GetStats {}).await;
+        assert!(matches!(r, ApiResponse::Success { .. }), "{:?}", r);
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tcp_endpoint_binds_loopback() {
+        // 포트 0(임시 포트)은 파서가 거부하므로 테스트에서는 ApiEndpoint::Tcp 를 직접 만든다
+        let l = bind_api(&ApiEndpoint::Tcp("127.0.0.1:0".parse().unwrap()), "ignored").await.unwrap();
+        let addr = match &l {
+            ApiListener::Tcp(t) => t.local_addr().unwrap(),
+            _ => panic!("expected tcp"),
+        };
+        tokio::spawn(serve(l, Arc::new(WasmManager::new()), fake_bpf));
+        let r = call(addr, &ApiRequest::GetStats {}).await;
+        assert!(matches!(r, ApiResponse::Success { .. }), "{:?}", r);
     }
 }

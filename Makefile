@@ -22,7 +22,7 @@ CONFIG_TEMPLATE = config/swift-guard.yaml
 SYSTEMD_SERVICE = config/swift-guard.service
 
 # Phony targets
-.PHONY: all build build-bpf build-rust build-wasm install install-bpf install-bins install-wasm install-conf install-service uninstall clean help
+.PHONY: all build build-bpf build-rust build-wasm install install-bpf install-bins install-wasm install-conf install-group install-service uninstall clean help
 
 # Default target
 all: build
@@ -73,7 +73,7 @@ build-wasm:
 	cd $(WASMMODDIR) && bash ./build.sh
 
 # Install everything
-install: install-bpf install-bins install-wasm install-conf install-service
+install: install-bpf install-bins install-wasm install-conf install-group install-service
 	@echo "Installation complete. Swift-Guard has been installed to $(PREFIX)."
 	@echo "Configuration is in $(CONFDIR)."
 	@echo ""
@@ -81,7 +81,8 @@ install: install-bpf install-bins install-wasm install-conf install-service
 	@echo "  sudo systemctl enable --now swift-guard"
 	@echo ""
 	@echo "To use the CLI tool, run:"
-	@echo "  xdp-filter --help"
+	@echo "  sudo xdp-filter --help"
+	@echo "Without sudo: sudo usermod -aG swift-guard $$USER, then log out and back in."
 
 # 설치 단계는 빌드하지 않는다: `sudo make install`이 root로 cargo/rustup을 실행하면
 # (rustup은 사용자 계정에 설치되므로) 실패한다. 먼저 일반 사용자로 `make build`.
@@ -128,6 +129,15 @@ install-conf:
 		echo "See $(CONFIG_TEMPLATE) for the latest template."; \
 	fi
 
+# API 소켓 그룹 (그룹 이름은 src/common/endpoint.rs DEFAULT_API_GROUP 및 daemon 기본값과 같아야 한다)
+# 그룹 멤버는 daemon API 로 이 서버의 패킷 필터를 바꿀 수 있다.
+install-group:
+	@if getent group swift-guard >/dev/null; then \
+		echo "Group swift-guard already exists"; \
+	else \
+		groupadd --system swift-guard && echo "Created group swift-guard"; \
+	fi
+
 # Install systemd service
 install-service:
 	@echo "Installing systemd service..."
@@ -151,6 +161,7 @@ uninstall:
 	rm -rf $(LIBDIR)
 	@echo "Swift-Guard has been uninstalled."
 	@echo "Note: Configuration in $(CONFDIR) was not removed."
+	@echo "Note: group 'swift-guard' was not removed (sudo groupdel swift-guard)."
 	@echo "To completely remove Swift-Guard, also run:"
 	@echo "  sudo rm -rf $(CONFDIR)"
 

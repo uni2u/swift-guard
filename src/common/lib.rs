@@ -3,6 +3,7 @@
 
 pub mod api;
 pub mod bpf_layout;
+pub mod endpoint;
 pub mod types;
 pub mod utils;
 

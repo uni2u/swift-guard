@@ -36,10 +36,10 @@ which xdp-filter swift-guard-daemon        # /usr/local/bin/...
 ls /usr/local/lib/swift-guard/             # xdp_filter.o (+ wasm/)
 xdp-filter --version
 xdp-filter --help                           # attach, detach, add-rule, delete-rule, list-rules, stats, wasm
-uname -r                                    # 5.10 이상
+uname -r                                    # 5.15 이상 (Ubuntu 22.04 기본 커널)
 ```
 
-설치하지 않고 저장소에서 빌드만 했다면 `./target/release/xdp-filter`, `./target/release/swift-guard-daemon`, `src/bpf/xdp_filter.o`를 대신 쓴다.
+설치하지 않고 저장소에서 빌드만 했다면 `./target/release/xdp-filter`, `./target/release/swift-guard-daemon`, `src/bpf/xdp_filter.o`를 대신 쓴다(`--version`·`--help`는 sudo 없이 실행된다).
 
 ## 1. 실습 랩 준비
 
@@ -69,7 +69,12 @@ sudo tools/test/lab.sh --to 10.200.0.11 http 10.200.0.2   # 두 번째 서버 IP
 
 목적지는 기본이 `10.200.0.1`이다. `--to 10.200.0.11`을 트래픽 명령 앞에 붙이면 두 번째 서버 IP로 보낸다(예시 11, 12). `--to`에는 이 두 주소만 쓸 수 있다.
 
-아래 예시에서는 편의상 `alias lab='sudo tools/test/lab.sh'`, `alias xf='sudo xdp-filter'`로 줄여 쓴다.
+아래 예시에서는 편의상 `alias lab='sudo tools/test/lab.sh'`, `alias xf='sudo xdp-filter'`로 줄여 쓴다(README와 같은 `sudo xdp-filter` 흐름). daemon은 Unix 소켓 `/run/swift-guard/api.sock`(`root:swift-guard`, `0660`)으로만 명령을 받으므로 `xdp-filter`는 `sudo`로 실행한다. 저장소 빌드본을 쓴다면 `alias xf='sudo ./target/release/xdp-filter'`로 정의한다. `swift-guard` 그룹에 가입한 사용자는 sudo 없이 쓸 수 있다(README 9-5).
+
+```bash
+alias lab='sudo tools/test/lab.sh'
+alias xf='sudo xdp-filter'
+```
 
 ## 2. daemon 시작과 XDP 연결
 
@@ -442,8 +447,9 @@ sudo systemctl stop swift-guard           # SIGTERM → XDP 자동 해제
 
 | 증상 | 확인 |
 |------|------|
-| `Failed to connect` | daemon이 실행 중인지, `--api-addr`와 `--api-server` 주소가 같은지(기본 `127.0.0.1:7654`) |
-| `BPF object load failed` / `BTF is required` | `xdp_filter.o`를 `make -C src/bpf`로 다시 빌드한다(`-g`가 빠지면 BTF가 없다). 커널 5.10 이상인지 확인한다 |
+| `Failed to connect to API server at unix:/run/swift-guard/api.sock: daemon is not running` | daemon이 실행 중이 아니다. `sudo swift-guard-daemon --bpf-obj /usr/local/lib/swift-guard/xdp_filter.o &`(또는 `sudo systemctl start swift-guard`)로 시작한다. daemon을 `--api-addr`로 다른 주소에 띄웠다면 CLI에도 같은 값을 `--api-server`로 준다(기본 `unix:/run/swift-guard/api.sock`) |
+| `Failed to connect to API server at ...: permission denied` | `xdp-filter`를 sudo 없이 실행했다. `sudo xdp-filter ...`로 실행하거나(위 `alias xf`), `sudo usermod -aG swift-guard $USER` 후 로그아웃했다가 다시 로그인한다 |
+| `BPF object load failed` / `BTF is required` | `xdp_filter.o`를 `make -C src/bpf`로 다시 빌드한다(`-g`가 빠지면 BTF가 없다). 커널 5.15 이상인지 확인한다 |
 | attach 실패 (driver) | `--mode generic`으로 재시도한다. 드라이버 지원 여부는 `ethtool -i eth0`로 확인한다 |
 | `already attached` | 이미 붙어 있다. `xf detach <if>` 후 다시 붙이거나 `--force`를 쓴다 |
 | `Total packets`가 0에서 늘지 않음 | `Total packets`는 룰에 매치한 패킷만 센다. `XDP rx packets`가 늘면 트래픽은 XDP에 도달하고 있고 룰이 매치하지 않는 것이다(`no_match`가 함께 는다). `XDP rx packets`도 그대로면 트래픽이 이 인터페이스로 들어오지 않는다 |
@@ -454,6 +460,6 @@ sudo systemctl stop swift-guard           # SIGTERM → XDP 자동 해제
 
 자동 검증:
 ```bash
-sudo tools/test/examples.sh        # 이 문서의 예시 전체 (PASS/FAIL)
+sudo tools/test/examples.sh        # 이 문서의 예시 전체 (PASS/FAIL). 기본 소켓을 쓰므로 서비스가 돌고 있으면 먼저 sudo systemctl stop swift-guard
 sudo tools/test/e2e_check.sh       # 커널 기능 E2E (docs/linux-verification.md)
 ```

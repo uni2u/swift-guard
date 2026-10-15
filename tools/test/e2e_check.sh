@@ -10,9 +10,15 @@
 #           룰별·전역 통계, XDP 전체/결과별 카운터(xdp_stats_map → stats --format csv의 xdp_* 열),
 #           L4 파서(IP 옵션·조각·tiny fragment·비정상 IHL: PROG_TEST_RUN 17케이스 + generic XDP live 송신),
 #           입력 거부(에러 응답·문구, 미구현 옵션 priority/rate-limit/expire/pkt-len), 카운터 불변식,
-#           WASM 모듈 관리(빌드돼 있으면), SIGTERM 정리.
+#           WASM 모듈 관리(빌드돼 있으면), SIGTERM 정리,
+#           API 접근 제어(테스트 전용 Unix 소켓 0660 root:<임시 그룹>, 비멤버 거부·멤버 허용, 감사 로그),
+#           소켓 수명(정상 종료 시 삭제, SIGKILL 후 stale 소켓 재사용, 중복 기동·일반 파일 거부, 그룹 없음 → 0600,
+#           TCP 옵트인: 비루프백·접두사 없는 주소 거부, tcp:127.0.0.1 동작).
 #
-# 요구: Linux 커널 5.10+ (Docker Desktop/macOS 불가 — bpf() 미지원), root, iproute2, ping.
+# API: 시스템 daemon(/run/swift-guard/api.sock)과 겹치지 않게 테스트 전용 소켓 /run/sg-e2e.XXXXXX/api.sock 과
+#      임시 그룹 sg-e2e-api, 임시 사용자 sg-e2e-in(멤버)/sg-e2e-out(비멤버)을 만들고 끝나면 지운다.
+#      useradd/groupadd/runuser가 없으면 접근 제어 단계만 SKIP한다.
+# 요구: Linux 커널 5.15+ (Docker Desktop/macOS 불가 — bpf() 미지원), root, iproute2, ping.
 #       Linux VM(Lima/UTM/Multipass), 클라우드 VM, Linux 호스트 모두 가능.
 #       python3·bpftool이 없으면 파서 단계(9·10)만 SKIP한다(FAIL 아님). 패킷은 tools/test/sg_pkt.py가 만든다.
 # 사용법: sudo tools/test/e2e_check.sh [--build] [--with-ignored] [--keep]
@@ -26,7 +32,7 @@ BUILD=0; WITH_IGNORED=0; KEEP=0
 for a in "$@"; do
   case "$a" in
     --build) BUILD=1 ;; --with-ignored) WITH_IGNORED=1 ;; --keep) KEEP=1 ;;
-    -h|--help) sed -n '2,22p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,29p' "$0"; exit 0 ;;
     *) echo "unknown option: $a" >&2; exit 2 ;;
   esac
 done
@@ -35,13 +41,19 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT" || exit 2
 NS=sg-e2e-src; DUT=sg-e2e-dut; PEER=sg-e2e-peer; RD0=sg-e2e-rd0; RD1=sg-e2e-rd1
 SRC_IP=10.200.0.2; DUT_IP=10.200.0.1; DUT_IP2=10.200.0.11
-API=127.0.0.1:17654
+# 테스트 전용 API 소켓 (기본 /run/swift-guard/api.sock 과 분리). 디렉토리는 preflight에서 만든다.
+SOCK_DIR=""; SOCK=""; API=""
+API_GROUP=sg-e2e-api; U_IN=sg-e2e-in; U_OUT=sg-e2e-out
+TCP_API=tcp:127.0.0.1:17654
+HAVE_USERS=0
+AUX_PIDS=""
 DAEMON="$ROOT/target/release/swift-guard-daemon"
 CLI="$ROOT/target/release/xdp-filter"
 BPF_OBJ="$ROOT/src/bpf/xdp_filter.o"
 SG_PKT="$ROOT/tools/test/sg_pkt.py"
 HAVE_PY=0; HAVE_BPFTOOL=0
 TMP="$(mktemp -d /tmp/sg-e2e.XXXXXX)"
+BIN_DIR="$TMP/bin"   # 다른 사용자(runuser)가 실행할 CLI 복사본 (저장소가 0700 홈 아래일 수 있다. /run 은 noexec일 수 있다)
 DAEMON_PID=""
 PASS=0; FAIL=0; SKIP=0
 
@@ -97,6 +109,11 @@ cleanup() {
     echo "--keep: 정리 생략. daemon log: $TMP/daemon.log"; return $rc
   fi
   [ -n "$DAEMON_PID" ] && kill -TERM "$DAEMON_PID" 2>/dev/null && wait "$DAEMON_PID" 2>/dev/null
+  for p in $AUX_PIDS; do kill -KILL "$p" 2>/dev/null && wait "$p" 2>/dev/null; done
+  if [ $HAVE_USERS -eq 1 ]; then
+    userdel "$U_IN" 2>/dev/null; userdel "$U_OUT" 2>/dev/null; groupdel "$API_GROUP" 2>/dev/null
+  fi
+  [ -n "$SOCK_DIR" ] && rm -rf "$SOCK_DIR"
   ip link set dev "$DUT" xdpgeneric off 2>/dev/null; ip link set dev "$DUT" xdp off 2>/dev/null
   ip link del "$DUT" 2>/dev/null; ip link del "$RD0" 2>/dev/null
   ip netns del "$NS" 2>/dev/null
@@ -116,8 +133,8 @@ if command -v python3 >/dev/null && [ -f "$SG_PKT" ]; then
   else bad "sg_pkt.py --selftest (parser steps SKIP)"; grep -F '[FAIL]' "$TMP/sg_pkt_selftest.log" | head -10; fi
 fi
 echo "python3+sg_pkt.py: $([ $HAVE_PY -eq 1 ] && echo ok || echo 'none → parser steps SKIP'), bpftool: $([ $HAVE_BPFTOOL -eq 1 ] && echo ok || echo 'none → PROG_TEST_RUN SKIP')"
-KVER="$(uname -r)"; KMAJ="${KVER%%.*}"; KMIN="$(echo "$KVER" | cut -d. -f2)"
-if [ "$KMAJ" -lt 5 ] || { [ "$KMAJ" -eq 5 ] && [ "$KMIN" -lt 10 ]; }; then die "커널 5.10+ 필요 (현재 $KVER)"; fi
+KVER="$(uname -r)"; KMAJ="${KVER%%.*}"; KMIN="$(echo "$KVER" | cut -d. -f2)"; KMIN="${KMIN%%[!0-9]*}"
+if [ "$KMAJ" -lt 5 ] || { [ "$KMAJ" -eq 5 ] && [ "${KMIN:-0}" -lt 15 ]; }; then die "커널 5.15+ 필요 (현재 $KVER)"; fi
 echo "kernel $KVER, arch $(uname -m)"
 
 if [ $BUILD -eq 1 ]; then
@@ -130,6 +147,26 @@ fi
 for f in "$DAEMON" "$CLI" "$BPF_OBJ"; do [ -e "$f" ] || die "$f 없음 → --build 로 실행하거나 먼저 빌드"; done
 # 이전 실행 잔여물 제거
 ip netns del "$NS" 2>/dev/null; ip link del "$DUT" 2>/dev/null; ip link del "$RD0" 2>/dev/null
+# 테스트 전용 API 소켓 디렉토리 (0755: 비멤버도 디렉토리는 통과하고 소켓 권한에서 막혀야 한다)
+SOCK_DIR="$(mktemp -d /run/sg-e2e.XXXXXX)" || die "/run 아래 임시 디렉토리를 만들 수 없다"
+chmod 755 "$SOCK_DIR"; SOCK="$SOCK_DIR/api.sock"; API="unix:$SOCK"
+# 접근 제어용 임시 그룹·사용자 (이전 실행 잔여물은 먼저 삭제)
+if command -v useradd >/dev/null && command -v groupadd >/dev/null && command -v runuser >/dev/null \
+   && command -v userdel >/dev/null && command -v groupdel >/dev/null; then
+  userdel "$U_IN" 2>/dev/null; userdel "$U_OUT" 2>/dev/null; groupdel "$API_GROUP" 2>/dev/null
+  NOLOGIN="$(command -v nologin || echo /usr/sbin/nologin)"
+  if groupadd "$API_GROUP" \
+     && useradd -M -N -s "$NOLOGIN" -G "$API_GROUP" "$U_IN" \
+     && useradd -M -N -s "$NOLOGIN" "$U_OUT"; then
+    HAVE_USERS=1
+    mkdir -p "$BIN_DIR"; chmod 711 "$TMP"; chmod 755 "$BIN_DIR"
+    install -m 0755 "$CLI" "$BIN_DIR/xdp-filter"
+  else
+    echo "임시 그룹/사용자 생성 실패 → 접근 제어 단계 SKIP"
+    userdel "$U_IN" 2>/dev/null; userdel "$U_OUT" 2>/dev/null; groupdel "$API_GROUP" 2>/dev/null
+  fi
+fi
+echo "API: $API (group $API_GROUP), access-control users: $([ $HAVE_USERS -eq 1 ] && echo "$U_IN/$U_OUT" || echo 'none → SKIP')"
 
 # ---------------------------------------------------------------- verifier
 step "1. Verifier load"
@@ -154,14 +191,14 @@ ip link add "$RD0" type veth peer name "$RD1"; ip link set "$RD0" up; ip link se
 ping_ok && ok "baseline ping (no XDP)" || bad "baseline ping failed — topology problem"
 ping_ok "$DUT_IP2" && ok "baseline ping to $DUT_IP2 (no XDP)" || bad "baseline ping to $DUT_IP2 failed — topology problem"
 
-"$DAEMON" -b "$BPF_OBJ" -c "$TMP/none.yaml" --api-addr "$API" -v >"$TMP/daemon.log" 2>&1 &
+"$DAEMON" -b "$BPF_OBJ" -c "$TMP/none.yaml" --api-addr "$API" --api-group "$API_GROUP" -v >"$TMP/daemon.log" 2>&1 &
 DAEMON_PID=$!
-for _ in $(seq 1 50); do
-  (exec 3<>/dev/tcp/${API%:*}/${API#*:}) 2>/dev/null && break
+for _ in $(seq 1 100); do
+  [ -S "$SOCK" ] && c list-rules >/dev/null 2>&1 && break
   kill -0 "$DAEMON_PID" 2>/dev/null || break
   sleep 0.1
 done
-if kill -0 "$DAEMON_PID" 2>/dev/null && (exec 3<>/dev/tcp/${API%:*}/${API#*:}) 2>/dev/null; then
+if kill -0 "$DAEMON_PID" 2>/dev/null && [ -S "$SOCK" ] && c list-rules >/dev/null 2>&1; then
   ok "daemon up (pid $DAEMON_PID, $API)"
 else
   bad "daemon failed to start"; tail -30 "$TMP/daemon.log"; exit 1
@@ -177,6 +214,44 @@ S1="$(stats_snap)"
 check_delta "XDP sees every packet" "$S0" "$S1" xdp_rx_packets ge 3
 check_delta "no rule → no_match" "$S0" "$S1" xdp_no_match_packets ge 3
 check_delta "rule-match total unchanged without rules" "$S0" "$S1" total_packets eq 0
+
+# ---------------------------------------------------------------- access control
+step "3b. API access control (Unix socket permissions)"
+if [ $HAVE_USERS -eq 0 ]; then
+  skip "useradd/groupadd/runuser 없음 또는 생성 실패 → 접근 제어 검증 생략"
+else
+  MODE="$(stat -c '%a %U %G' "$SOCK" 2>/dev/null)"
+  [ "$MODE" = "660 root $API_GROUP" ] && ok "socket mode/owner: $MODE" || bad "socket mode/owner '$MODE' (expected '660 root $API_GROUP')"
+  # 비멤버: 조회도 거부되고 sudo/그룹 안내가 나와야 한다
+  OUT="$(runuser -u "$U_OUT" -- "$BIN_DIR/xdp-filter" --api-server "$API" list-rules 2>&1)"; rc=$?
+  if [ $rc -ne 0 ] && printf '%s\n' "$OUT" | grep -qF 'permission denied' && printf '%s\n' "$OUT" | grep -qF 'sudo'; then
+    ok "non-member $U_OUT: list-rules denied with sudo/group hint"
+  else bad "non-member $U_OUT: list-rules rc=$rc, output: $OUT (expected 'permission denied' + 'sudo')"; fi
+  # 멤버: 허용
+  if OUT="$(runuser -u "$U_IN" -- "$BIN_DIR/xdp-filter" --api-server "$API" list-rules 2>&1)"; then
+    ok "group member $U_IN: list-rules allowed"
+  else bad "group member $U_IN: list-rules failed: $OUT"; fi
+  # 비멤버의 변경 시도도 거부되고 룰이 생기지 않아야 한다
+  if runuser -u "$U_OUT" -- "$BIN_DIR/xdp-filter" --api-server "$API" \
+       add-rule --src-ip 10.9.9.30 --action drop --label e2e-unauth >/dev/null 2>&1; then
+    bad "non-member $U_OUT: add-rule accepted (should be denied)"
+  else ok "non-member $U_OUT: add-rule denied"; fi
+  OUT="$(c list-rules 2>/dev/null || true)"
+  printf '%s\n' "$OUT" | grep -qE '^e2e-unauth[[:space:]]' && bad "rule e2e-unauth exists after denied request" \
+    || ok "no rule created by denied request"
+  # 멤버의 변경 요청 → 감사 로그(uid/gid/pid)
+  U_IN_UID="$(id -u "$U_IN")"
+  if runuser -u "$U_IN" -- "$BIN_DIR/xdp-filter" --api-server "$API" \
+       add-rule --src-ip 10.9.9.31 --action count --label e2e-member >/dev/null 2>&1; then
+    ok "group member $U_IN: add-rule allowed"
+    sleep 0.2
+    grep -qE "API AddRule from uid=$U_IN_UID gid=[0-9]+ pid=" "$TMP/daemon.log" \
+      && ok "audit log: 'API AddRule from uid=$U_IN_UID ...'" || bad "audit log line 'API AddRule from uid=$U_IN_UID gid=... pid=...' missing"
+    c delete-rule --label e2e-member >/dev/null || bad "delete e2e-member"
+  else bad "group member $U_IN: add-rule failed"; fi
+  grep -qE "API Attach from uid=0 gid=0 pid=[0-9]+" "$TMP/daemon.log" \
+    && ok "audit log: root attach recorded" || bad "audit log line 'API Attach from uid=0 gid=0 pid=...' missing"
+fi
 
 # ---------------------------------------------------------------- drop /32
 step "4. Drop rule (exact /32)"
@@ -494,6 +569,109 @@ else
   wait "$DAEMON_PID" 2>/dev/null; DAEMON_PID=""
   xdp_on && bad "XDP still attached after SIGTERM" || ok "daemon exited and detached XDP on SIGTERM"
 fi
+
+# ---------------------------------------------------------------- socket lifecycle
+step "15b. API socket lifecycle (stale / in-use / not-a-socket / no group / TCP opt-in)"
+# 보조 daemon은 BPF를 로드하지만 attach하지 않는다. 매번 종료·정리한다.
+# aux_start <log> <daemon 추가 인자...> → AUX_PID
+aux_start() {
+  local log="$1"; shift
+  "$DAEMON" -b "$BPF_OBJ" -c "$TMP/none.yaml" -v "$@" >"$log" 2>&1 &
+  AUX_PID=$!; AUX_PIDS="$AUX_PIDS $AUX_PID"
+}
+# aux_ready <endpoint> <pid> → 0 = 응답함 (최대 10초)
+aux_ready() {
+  local _
+  for _ in $(seq 1 100); do
+    "$CLI" --api-server "$1" list-rules >/dev/null 2>&1 && return 0
+    kill -0 "$2" 2>/dev/null || return 1
+    sleep 0.1
+  done
+  return 1
+}
+# aux_exited <pid> <초> → 0 = 그 안에 종료함. AUX_RC에 종료 코드
+aux_exited() {
+  local _ n=$(($2 * 10))
+  for _ in $(seq 1 "$n"); do
+    if ! kill -0 "$1" 2>/dev/null; then wait "$1" 2>/dev/null; AUX_RC=$?; return 0; fi
+    sleep 0.1
+  done
+  return 1
+}
+aux_stop() { kill -TERM "$1" 2>/dev/null; aux_exited "$1" 5 || { kill -KILL "$1" 2>/dev/null; wait "$1" 2>/dev/null; }; }
+# expect_start_fail "<설명>" <log> <기대 문구> <daemon 인자...> : 5초 안에 비정상 종료 + 로그에 문구
+expect_start_fail() {
+  local d="$1" log="$2" want="$3"; shift 3
+  aux_start "$log" "$@"
+  if ! aux_exited "$AUX_PID" 5; then bad "$d: daemon still running after 5s"; aux_stop "$AUX_PID"
+  elif [ "$AUX_RC" -eq 0 ]; then bad "$d: daemon exited 0 (expected failure)"
+  elif grep -qF -- "$want" "$log"; then ok "$d: refused (exit $AUX_RC, '$want')"
+  else bad "$d: exit $AUX_RC without '$want' in log: $(tail -3 "$log" | tr '\n' ' ')"; fi
+}
+
+# ① 정상 종료(15단계 SIGTERM) 후 소켓이 지워졌는가
+if [ -z "$DAEMON_PID" ]; then
+  [ ! -e "$SOCK" ] && ok "API socket removed after SIGTERM" || bad "API socket $SOCK left after SIGTERM"
+else skip "main daemon not stopped → socket removal not checked"; fi
+
+# ② SIGKILL → stale 소켓 → 같은 경로로 재기동
+AUX="$SOCK_DIR/aux.sock"
+aux_start "$TMP/aux1.log" --api-addr "unix:$AUX"; A1=$AUX_PID
+if aux_ready "unix:$AUX" "$A1"; then
+  ok "aux daemon up on unix:$AUX"
+  kill -KILL "$A1"; wait "$A1" 2>/dev/null
+  [ -S "$AUX" ] && ok "socket left behind after SIGKILL (stale)" || bad "no socket after SIGKILL (cannot test stale path)"
+  aux_start "$TMP/aux2.log" --api-addr "unix:$AUX"; A2=$AUX_PID
+  if aux_ready "unix:$AUX" "$A2"; then
+    ok "restart on stale socket path answers"
+    grep -qF "removed stale API socket $AUX" "$TMP/aux2.log" && ok "log: removed stale API socket" \
+      || bad "log line 'removed stale API socket $AUX' missing"
+    # ③ 살아 있는 daemon의 경로로 하나 더 기동 → 거부, 기존 daemon은 영향 없음
+    expect_start_fail "second daemon on live socket" "$TMP/aux3.log" "already in use" --api-addr "unix:$AUX"
+    aux_ready "unix:$AUX" "$A2" && ok "first daemon still answers after refused duplicate" \
+      || bad "first daemon stopped answering after duplicate start"
+    aux_stop "$A2"
+    [ ! -e "$AUX" ] && ok "aux socket removed on SIGTERM" || bad "aux socket left after SIGTERM"
+  else bad "restart on stale socket failed: $(tail -3 "$TMP/aux2.log" | tr '\n' ' ')"; aux_stop "$A2"; fi
+else bad "aux daemon failed to start: $(tail -3 "$TMP/aux1.log" | tr '\n' ' ')"; aux_stop "$A1"; fi
+
+# ④ 소켓이 아닌 파일 → 삭제하지 않고 기동 실패
+FILE_SOCK="$SOCK_DIR/file.sock"; echo keep >"$FILE_SOCK"
+expect_start_fail "regular file at socket path" "$TMP/aux4.log" "is not a socket" --api-addr "unix:$FILE_SOCK"
+[ "$(cat "$FILE_SOCK" 2>/dev/null)" = keep ] && ok "regular file preserved" || bad "regular file at $FILE_SOCK was modified/removed"
+
+# ⑤ 그룹 없음 → 0600(root 전용)으로 계속 실행
+NG="$SOCK_DIR/nogroup.sock"
+aux_start "$TMP/aux5.log" --api-addr "unix:$NG" --api-group sg-no-such-group; A5=$AUX_PID
+if aux_ready "unix:$NG" "$A5"; then
+  M="$(stat -c '%a %U' "$NG" 2>/dev/null)"
+  [ "$M" = "600 root" ] && ok "missing group → socket mode $M" || bad "missing group → socket mode '$M' (expected '600 root')"
+  grep -qF "group 'sg-no-such-group' not found" "$TMP/aux5.log" && ok "log: group not found warning" \
+    || bad "log line \"group 'sg-no-such-group' not found\" missing"
+else bad "daemon with missing group failed to start: $(tail -3 "$TMP/aux5.log" | tr '\n' ' ')"; fi
+aux_stop "$A5"
+
+# ⑥ TCP 옵트인: 비루프백·접두사 없는 주소는 거부, tcp:127.0.0.1 은 동작
+expect_start_fail "daemon --api-addr tcp:0.0.0.0:17654" "$TMP/aux6.log" "non-loopback" --api-addr tcp:0.0.0.0:17654
+expect_start_fail "daemon --api-addr 127.0.0.1:17654 (no scheme)" "$TMP/aux7.log" "add a scheme" --api-addr 127.0.0.1:17654
+aux_start "$TMP/aux8.log" --api-addr "$TCP_API"; A8=$AUX_PID
+if aux_ready "$TCP_API" "$A8"; then
+  ok "TCP opt-in: --api-server $TCP_API list-rules"
+  grep -qF "TCP API enabled on $TCP_API" "$TMP/aux8.log" && ok "log: TCP no-authentication warning" \
+    || bad "log line 'TCP API enabled on $TCP_API' missing"
+else bad "TCP opt-in daemon failed: $(tail -3 "$TMP/aux8.log" | tr '\n' ' ')"; fi
+aux_stop "$A8"
+# CLI도 같은 파서로 거부한다
+expect_cli_fail() {
+  local d="$1" want="$2" out; shift 2
+  if out="$("$CLI" "$@" 2>&1)"; then bad "$d accepted (should be rejected)"
+  elif printf '%s\n' "$out" | grep -qF -- "$want"; then ok "$d rejected ('$want')"
+  else bad "$d rejected with unexpected message: $out (expected '$want')"; fi
+}
+expect_cli_fail "CLI --api-server tcp:0.0.0.0:17654" "non-loopback" --api-server tcp:0.0.0.0:17654 list-rules
+expect_cli_fail "CLI --api-server 127.0.0.1:17654" "add a scheme" --api-server 127.0.0.1:17654 list-rules
+# ⑦ daemon이 없을 때 CLI 안내
+expect_cli_fail "CLI with no daemon socket" "daemon is not running" --api-server "unix:$SOCK_DIR/none.sock" list-rules
 
 # ---------------------------------------------------------------- ignored tests
 if [ $WITH_IGNORED -eq 1 ]; then

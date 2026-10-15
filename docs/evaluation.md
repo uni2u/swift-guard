@@ -14,7 +14,7 @@ Reference hardware (the environment assumed when setting targets; record the act
 
 ### Software Configuration
 - OS: Ubuntu 22.04 LTS
-- Kernel: Linux 5.10+ minimum (5.15 used as reference)
+- Kernel: Linux 5.15+ minimum (Ubuntu 22.04 GA kernel)
 - Rust: 1.78+
 - LLVM/Clang: 14+
 - libbpf-rs 0.19.1 / libbpf-sys 1.5.0 (as pinned in `Cargo.lock`)

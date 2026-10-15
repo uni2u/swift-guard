@@ -6,6 +6,9 @@
 #   -v  각 예제의 CLI 출력도 보여준다 (문서 갱신용)
 # 바이너리 위치: 설치본(/usr/local/bin, /usr/local/lib/swift-guard)이 있으면 그것을, 없으면 저장소 빌드본을 쓴다.
 #   SG_BIN_DIR, SG_BPF_OBJ 환경변수로 덮어쓸 수 있다.
+# API: 문서와 같이 기본 소켓(unix:/run/swift-guard/api.sock)을 쓴다. 시스템 daemon(systemd 서비스)이
+#   이미 그 소켓으로 응답하면 충돌하므로 시작하지 않는다(sudo systemctl stop swift-guard 후 실행).
+# 요구: Linux 커널 5.15+, root, iproute2, ping, curl, python3
 # 종료 코드: 0 = 전부 기대대로, 1 = 불일치, 2 = 환경 문제
 set -uo pipefail
 
@@ -23,8 +26,15 @@ TMP="$(mktemp -d /tmp/sg-ex.XXXXXX)"; DPID=""
 PASS=0; FAIL=0
 
 [ "$(id -u)" -eq 0 ] || { echo "root 필요" >&2; exit 2; }
+KVER="$(uname -r)"; KMAJ="${KVER%%.*}"; KMIN="$(echo "$KVER" | cut -d. -f2)"; KMIN="${KMIN%%[!0-9]*}"
+if [ "$KMAJ" -lt 5 ] || { [ "$KMAJ" -eq 5 ] && [ "${KMIN:-0}" -lt 15 ]; }; then echo "커널 5.15+ 필요 (현재 $KVER)" >&2; exit 2; fi
 for f in "$XF" "$DAEMON" "$SG_BPF_OBJ"; do [ -e "$f" ] || { echo "$f 없음 (빌드 또는 설치 필요)" >&2; exit 2; }; done
 for t in ip ping curl python3; do command -v $t >/dev/null || { echo "$t 없음" >&2; exit 2; }; done
+DEFAULT_SOCK=/run/swift-guard/api.sock
+if [ -S "$DEFAULT_SOCK" ] && "$XF" list-rules >/dev/null 2>&1; then
+  echo "다른 swift-guard-daemon이 $DEFAULT_SOCK 에서 이미 실행 중이다 (systemd 서비스라면: sudo systemctl stop swift-guard 후 다시 실행)" >&2
+  exit 2
+fi
 
 cleanup() { [ -n "$DPID" ] && kill -TERM "$DPID" 2>/dev/null && wait "$DPID" 2>/dev/null; "$LAB" down >/dev/null 2>&1; rm -rf "$TMP"; }
 trap cleanup EXIT
@@ -56,7 +66,7 @@ title "0. 랩 + daemon + attach"
 "$LAB" up >/dev/null || exit 2
 "$DAEMON" --bpf-obj "$SG_BPF_OBJ" --config "$TMP/none.yaml" >"$TMP/daemon.log" 2>&1 &
 DPID=$!
-for _ in $(seq 1 50); do x list-rules >/dev/null 2>&1 && break; sleep 0.1; done
+for _ in $(seq 1 100); do x list-rules >/dev/null 2>&1 && break; kill -0 "$DPID" 2>/dev/null || break; sleep 0.1; done
 check "daemon 응답" 'x list-rules >/dev/null 2>&1'
 check "attach sg-lab0 (generic)" 'x attach sg-lab0 --mode generic'
 expect OK ping 10.200.0.2

@@ -18,6 +18,12 @@ CFLAGS := -g -O2 -Wall
 #BPF_CFLAGS := -target bpf -D__TARGET_ARCH_$(ARCH) -I$(INCLUDE_DIR) -I$(KERNEL_INCLUDE) -I$(KERNEL_ARCH_INCLUDE) -I$(VMLINUX_INCLUDE)
 BPF_CFLAGS := -target bpf -D__TARGET_ARCH_$(ARCH)
 
+# BPF ISA: 최소 커널 5.15 기준 v3 (JMP32, ALU32, atomics fetch/cmpxchg는 5.12+).
+# clang 버전마다 기본 cpu가 달라 바이트코드가 갈리므로 명시해 고정한다.
+# 문제 시(verifier 거부 등) 되돌리기: make -C src/bpf BPF_CPU=v2
+BPF_CPU ?= v3
+BPF_CFLAGS += -mcpu=$(BPF_CPU)
+
 # 헤더 파일 경로 추가 (존재하는 경우에만)
 ifneq ($(wildcard $(INCLUDE_DIR)),)
   BPF_CFLAGS += -I$(INCLUDE_DIR)

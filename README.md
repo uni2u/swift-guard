@@ -48,25 +48,26 @@ pidof swift-guard-daemon                       # 숫자(PID)가 나오면 실행
 sudo kill -INT $(pidof swift-guard-daemon)     # 종료 (붙였던 XDP 자동 해제)
 
 # 인터페이스에 연결 / 해제
-xdp-filter attach eth0 --mode generic          # 실제 NIC는 --mode driver 권장 (9장)
-xdp-filter detach eth0
+sudo xdp-filter attach eth0 --mode generic          # 실제 NIC는 --mode driver 권장 (9장)
+sudo xdp-filter detach eth0
 
 # 룰 추가 (출발지 기준 / 목적지 기준)
-xdp-filter add-rule --src-ip 203.0.113.7 --action drop --label block-attacker
-xdp-filter add-rule --src-ip 203.0.113.0/24 --action drop --label block-net
-xdp-filter add-rule --dst-ip 192.0.2.80 --protocol tcp --dst-port 22 --action drop --label guard-ssh
+sudo xdp-filter add-rule --src-ip 203.0.113.7 --action drop --label block-attacker
+sudo xdp-filter add-rule --src-ip 203.0.113.0/24 --action drop --label block-net
+sudo xdp-filter add-rule --dst-ip 192.0.2.80 --protocol tcp --dst-port 22 --action drop --label guard-ssh
 
 # 조회 / 삭제 / 통계
-xdp-filter list-rules --stats
-xdp-filter delete-rule --label block-attacker
-xdp-filter stats                               # Ctrl+C 로 종료 (룰 매치 총계 + XDP가 본 전체 패킷·결과별 카운터)
-xdp-filter stats --count 5                     # 1초 간격 5개 샘플 후 종료
-xdp-filter stats --format csv --count 60 > stats.csv   # 1초 간격 60개 샘플(CSV)
+sudo xdp-filter list-rules --stats
+sudo xdp-filter delete-rule --label block-attacker
+sudo xdp-filter stats                               # Ctrl+C 로 종료 (룰 매치 총계 + XDP가 본 전체 패킷·결과별 카운터)
+sudo xdp-filter stats --count 5                     # 1초 간격 5개 샘플 후 종료
+sudo xdp-filter stats --format csv --count 60 > stats.csv   # 1초 간격 60개 샘플(CSV)
 
 # 서비스로 운영 중이라면
 sudo systemctl start|stop|restart swift-guard
 journalctl -u swift-guard -f
 ```
+`xdp-filter`는 daemon의 API 소켓(`/run/swift-guard/api.sock`, root와 `swift-guard` 그룹만 접근 가능)으로 명령을 보내므로 `sudo`를 붙여 실행한다. sudo 없이 쓰려면 [9-5](#9-5-보안-누가-룰을-바꿀-수-있나)를 본다.
 
 ---
 
@@ -85,6 +86,7 @@ journalctl -u swift-guard -f
 | 실시간 통계 | 룰별 / 룰 매치 전체 패킷 수, **XDP가 본 전체 패킷(룰과 무관)과 결과별 카운터**(drop/pass/redirect/count/no_match/invalid/non_ipv4/action_error), 초당 패킷 수, 대역폭 |
 | WASM 모듈 관리 | WebAssembly 보안 검사 모듈 로드/조회/언로드 |
 | 안전한 종료 | daemon이 정상 종료(Ctrl+C, `systemctl stop`)하면 붙였던 XDP를 자동으로 해제 |
+| 접근 제어 | 룰 변경 API는 root와 `swift-guard` 그룹 사용자만 쓸 수 있다(Unix 소켓 파일 권한). 변경 요청은 요청자 uid/pid와 함께 로그에 남는다 |
 
 ### 아직 할 수 없는 것 (현재 버전의 한계)
 - 룰 하나는 **출발지 또는 목적지 중 한쪽** prefix만 쓴다(둘을 함께 거는 AND 조건은 불가). 출발지 룰이 항상 먼저 평가된다.
@@ -101,7 +103,8 @@ journalctl -u swift-guard -f
 
 ```
             ┌───────────────────────── 사용자 공간 ──────────────────────────┐
-  사용자 ──▶ │  xdp-filter (CLI)  ──TCP 127.0.0.1:7654──▶  swift-guard-daemon  │
+  사용자 ──▶ │  sudo xdp-filter (CLI) ──Unix 소켓──▶  swift-guard-daemon         │
+            │      /run/swift-guard/api.sock (root:swift-guard 0660)         │
             │                                              │  ├ 룰 관리 (BPF 맵 갱신)
             │                                              │  ├ 통계 수집
             │                                              │  └ WASM 런타임 (wasmtime)
@@ -116,7 +119,7 @@ journalctl -u swift-guard -f
 |----------|------|------|
 | XDP 프로그램 | `xdp_filter.o` (C, `src/bpf/`) | 커널에서 패킷마다 실행되어 룰을 적용한다 |
 | daemon | `swift-guard-daemon` (Rust, `src/daemon/`) | XDP 프로그램을 로드·연결하고 룰과 통계를 관리한다. **root 권한 필요** |
-| CLI | `xdp-filter` (Rust, `src/cli/`) | daemon에 명령을 보낸다. 일반 사용자도 실행할 수 있다 |
+| CLI | `xdp-filter` (Rust, `src/cli/`) | daemon에 명령을 보낸다. root(`sudo`) 또는 `swift-guard` 그룹 사용자만 쓸 수 있다 |
 | WASM 모듈 | `*.wasm` (`wasm/modules/`) | 선택 기능. 패킷 검사 로직을 플러그인 형태로 제공한다 |
 
 **핵심:** daemon이 먼저 실행 중이어야 CLI 명령이 동작한다.
@@ -130,7 +133,7 @@ journalctl -u swift-guard -f
 | 항목 | 요구 사항 | 확인 명령 |
 |------|----------|----------|
 | 운영체제 | Linux. **Ubuntu 22.04 / 24.04**, Debian 12 권장 | `cat /etc/os-release` |
-| 커널 | **5.10 이상** (5.15 이상 권장) | `uname -r` |
+| 커널 | **5.15 이상** (Ubuntu 22.04 기본 커널) | `uname -r` |
 | CPU | x86_64 (arm64는 빌드는 되지만 검증하지 않았다) | `uname -m` |
 | 권한 | `sudo`를 쓸 수 있는 계정 | `sudo -v` |
 | 디스크 / 메모리 | 여유 공간 약 3GB(빌드용), RAM 2GB 이상 | `df -h ~`, `free -h` |
@@ -247,10 +250,11 @@ $ sudo make install
 | WASM 모듈 (빌드했다면) | `/usr/local/lib/swift-guard/wasm/` |
 | 설정 파일 | `/etc/swift-guard/config.yaml` (이미 있으면 덮어쓰지 않음) |
 | systemd 서비스 | `/etc/systemd/system/swift-guard.service` (systemd가 없는 환경이면 건너뜀) |
+| 그룹 | `swift-guard` (API 소켓 접근용. 이미 있으면 그대로 둔다) |
 
 > `sudo make install`은 빌드하지 않는다. `ERROR: ... 가 없습니다. 먼저 일반 사용자로 'make build' 를 실행하세요.`가 나오면 4-4를 먼저 한다.
 >
-> 설치하지 않고 써도 된다. 그때는 이 문서의 `xdp-filter`를 `./target/release/xdp-filter`로, `swift-guard-daemon`을 `sudo ./target/release/swift-guard-daemon`으로, `/usr/local/lib/swift-guard/xdp_filter.o`를 `src/bpf/xdp_filter.o`로 바꿔 읽는다.
+> 설치하지 않고 써도 된다. 그때는 이 문서의 `sudo xdp-filter`를 `sudo ./target/release/xdp-filter`로, `swift-guard-daemon`을 `sudo ./target/release/swift-guard-daemon`으로, `/usr/local/lib/swift-guard/xdp_filter.o`를 `src/bpf/xdp_filter.o`로 바꿔 읽는다.
 
 ---
 
@@ -259,7 +263,7 @@ $ sudo make install
 ### 5-1. 실행 파일 확인
 ```bash
 $ xdp-filter --version
-xdp-filter 0.1.0
+sudo xdp-filter 0.1.0
 $ xdp-filter --help
 XDP Filtering Tool
 
@@ -285,7 +289,7 @@ Swift-Guard Daemon
 ```bash
 $ sudo tools/test/e2e_check.sh
 ...
-e2e_check: PASS=69 FAIL=0 SKIP=3
+e2e_check: PASS=96 FAIL=0 SKIP=3
 RESULT: ALL PASS
 ```
 - `RESULT: ALL PASS`가 나오면 설치와 커널 기능이 모두 정상이다.
@@ -318,19 +322,21 @@ lab up: XDP 대상 인터페이스 = sg-lab0, 서버 = 10.200.0.1 10.200.0.11 (H
 ```bash
 $ sudo swift-guard-daemon --bpf-obj /usr/local/lib/swift-guard/xdp_filter.o
 [... INFO  swift_guard_daemon] Swift-Guard 데몬 시작 중...
-[... INFO  swift_guard_daemon::server] API server listening on 127.0.0.1:7654
+[... INFO  swift_guard_daemon::server] API server listening on unix:/run/swift-guard/api.sock (mode 0660, group swift-guard)
 ```
 이 터미널은 daemon 로그를 보여주며 계속 실행된다. **닫지 말고 그대로 둔다.**
+- daemon은 명령을 Unix 소켓 `/run/swift-guard/api.sock`으로 받는다. 이 소켓은 root와 `swift-guard` 그룹(`sudo make install`이 만든다)만 쓸 수 있다.
+- `swift-guard` 그룹이 없으면(설치하지 않고 실행한 경우) `group 'swift-guard' not found: API socket /run/swift-guard/api.sock is root-only ...` 경고와 함께 `(mode 0600, root only)`로 뜬다. `sudo`로 쓰는 데는 문제가 없다.
 
 ### 6-3. 이후 명령은 터미널 2에서
-새 터미널을 열고 `swift-guard` 폴더로 이동한다.
+새 터미널을 열고 `swift-guard` 폴더로 이동한다. daemon은 root 전용 소켓으로 명령을 받으므로 `xdp-filter`도 `sudo`로 실행한다.
 ```bash
 $ cd swift-guard
 ```
 
 **① 가상 인터페이스에 Swift-Guard 연결**
 ```bash
-$ xdp-filter attach sg-lab0 --mode generic
+$ sudo xdp-filter attach sg-lab0 --mode generic
 Success: XDP program attached to sg-lab0 in mode 1
 ```
 
@@ -344,7 +350,7 @@ OK
 
 **③ 10.200.0.2를 차단한다**
 ```bash
-$ xdp-filter add-rule --src-ip 10.200.0.2 --action drop --label my-first-rule
+$ sudo xdp-filter add-rule --src-ip 10.200.0.2 --action drop --label my-first-rule
 Rule added: Rule 'my-first-rule' added successfully
 ```
 
@@ -358,7 +364,7 @@ OK                                      # 다른 호스트는 그대로
 
 **⑤ 룰과 통계를 본다**
 ```bash
-$ xdp-filter list-rules --stats
+$ sudo xdp-filter list-rules --stats
 LABEL                ACTION          SOURCE               DEST                 PROTOCOL
 ------------------------------------------------------------------------------------------
 my-first-rule        drop            10.200.0.2           *                    any
@@ -368,7 +374,7 @@ my-first-rule        drop            10.200.0.2           *                    a
 
 **⑥ 룰을 지우면 다시 통신된다**
 ```bash
-$ xdp-filter delete-rule --label my-first-rule
+$ sudo xdp-filter delete-rule --label my-first-rule
 Rule deleted: Rule 'my-first-rule' deleted successfully
 $ sudo tools/test/lab.sh ping 10.200.0.2
 OK
@@ -376,7 +382,7 @@ OK
 
 **⑦ 목적지 기준으로 차단해 본다** — 이번에는 "누가 보냈는지"가 아니라 "어느 서버로 가는지"로 막는다. 두 번째 서버 IP(10.200.0.11)의 웹(TCP 8080)만 차단한다.
 ```bash
-$ xdp-filter add-rule --dst-ip 10.200.0.11 --protocol tcp --dst-port 8080 --action drop --label protect-web2
+$ sudo xdp-filter add-rule --dst-ip 10.200.0.11 --protocol tcp --dst-port 8080 --action drop --label protect-web2
 Rule added: Rule 'protect-web2' added successfully
 $ sudo tools/test/lab.sh --to 10.200.0.11 http 10.200.0.2
 BLOCKED                                 # 10.200.0.11:8080 으로 가는 요청은 차단
@@ -384,7 +390,7 @@ $ sudo tools/test/lab.sh --to 10.200.0.11 http 10.200.0.3
 BLOCKED                                 # 누가 보내든 같다
 $ sudo tools/test/lab.sh http 10.200.0.2
 OK                                      # 다른 서버(10.200.0.1)는 그대로
-$ xdp-filter delete-rule --label protect-web2
+$ sudo xdp-filter delete-rule --label protect-web2
 Rule deleted: Rule 'protect-web2' deleted successfully
 ```
 `lab.sh`의 `--to`는 트래픽을 보낼 서버 IP다(생략하면 10.200.0.1).
@@ -392,7 +398,7 @@ Rule deleted: Rule 'protect-web2' deleted successfully
 ### 6-4. 정리
 ```bash
 # 터미널 2
-$ xdp-filter detach sg-lab0
+$ sudo xdp-filter detach sg-lab0
 Success: XDP program detached from sg-lab0
 # 터미널 1: Ctrl+C 로 daemon 종료
 # 그다음 (아무 터미널에서나)
@@ -413,7 +419,8 @@ lab down
 | `-b, --bpf-obj <파일>` | `src/bpf/xdp_filter.o` | XDP 프로그램 경로. **설치본을 쓸 때는 `/usr/local/lib/swift-guard/xdp_filter.o`를 지정한다** |
 | `-c, --config <파일>` | `/etc/swift-guard/config.yaml` | 설정 파일. 없으면 기본값으로 실행([11장](#11-설정-파일)) |
 | `-i, --interface <이름>` | (없음) | 지정하면 시작할 때 그 인터페이스에 바로 attach. 이때는 `xdp-filter attach`를 다시 하지 않는다 |
-| `--api-addr <주소:포트>` | `127.0.0.1:7654` | CLI가 접속할 주소 |
+| `--api-addr <주소>` | `unix:/run/swift-guard/api.sock` | CLI가 접속할 주소. `unix:/절대/경로`(또는 `/절대/경로`) 또는 `tcp:127.0.0.1:<포트>`. **TCP는 루프백(127.0.0.0/8, `::1`)만** 허용하며 인증이 없다([9-5](#9-5-보안-누가-룰을-바꿀-수-있나)). 접두사 없는 `127.0.0.1:7654`는 거부된다 |
+| `--api-group <그룹>` | `swift-guard` | Unix 소켓의 그룹. 소켓은 `root:<그룹>` `0660`으로 만들어진다. 그룹이 없으면 `0600`(root 전용)으로 열고 경고한다. TCP면 무시 |
 | `-v, --verbose` | | 디버그 로그 출력 |
 
 로그 수준 우선순위: `-v`(debug) > `RUST_LOG` 환경변수(설정돼 있고 비어 있지 않으면) > 설정 파일 `general.log_level` > `info`.
@@ -435,22 +442,22 @@ $ sudo kill -INT $(pidof swift-guard-daemon)  # 종료
 
 ### 7-2. `xdp-filter` (CLI)
 
-공통 옵션: `--api-server <주소:포트>`(기본 `127.0.0.1:7654`), `-v`(상세 로그), `-h`(도움말). 하위 명령마다 `xdp-filter <명령> --help`로 도움말을 볼 수 있다.
+공통 옵션: `--api-server <주소>`(기본 `unix:/run/swift-guard/api.sock`. 형식은 daemon의 `--api-addr`와 같다: `unix:/경로` 또는 `tcp:127.0.0.1:<포트>`), `-v`(상세 로그), `-h`(도움말). 하위 명령마다 `xdp-filter <명령> --help`로 도움말을 볼 수 있다. daemon과 통신하는 명령은 모두 `sudo`로 실행한다(또는 `swift-guard` 그룹 가입, [9-5](#9-5-보안-누가-룰을-바꿀-수-있나)).
 
 | 명령 | 설명 | 예 |
 |------|------|----|
-| `attach <인터페이스> [--mode driver\|generic\|offload] [--force]` | XDP 연결. 기본 모드는 `driver`. 가상 인터페이스나 드라이버 미지원 NIC는 `generic` | `xdp-filter attach eth0 --mode generic` |
-| `detach <인터페이스>` | XDP 해제 | `xdp-filter detach eth0` |
+| `attach <인터페이스> [--mode driver\|generic\|offload] [--force]` | XDP 연결. 기본 모드는 `driver`. 가상 인터페이스나 드라이버 미지원 NIC는 `generic` | `sudo xdp-filter attach eth0 --mode generic` |
+| `detach <인터페이스>` | XDP 해제 | `sudo xdp-filter detach eth0` |
 | `add-rule ...` | 룰 추가 (아래 표) | |
-| `delete-rule --label <이름>` | 룰 삭제 | `xdp-filter delete-rule --label block-web` |
-| `list-rules [--stats]` | 룰 목록. `--stats`를 붙이면 룰별 패킷·바이트 수도 표시 | `xdp-filter list-rules --stats` |
-| `stats [--interval <초>] [--count <N>] [--format text\|csv]` | 전체 통계를 `--interval`초(기본 1) 간격으로 출력. `--count N`이면 N개 샘플 후 종료, 생략(0)하면 `Ctrl+C`까지. `Total packets/bytes`는 **룰에 매치한 패킷만** 센다. `XDP rx`는 **XDP가 본 전체 패킷**(룰과 무관), `XDP verdicts`는 결과별 패킷 수다(아래 표). 초당 값은 CLI가 연속 두 샘플의 총계 차이로 계산하며 첫 샘플은 `n/a`. `--format csv`는 17열 고정 헤더 + 샘플당 1행 — 아래 예 | `xdp-filter stats --count 5` |
+| `delete-rule --label <이름>` | 룰 삭제 | `sudo xdp-filter delete-rule --label block-web` |
+| `list-rules [--stats]` | 룰 목록. `--stats`를 붙이면 룰별 패킷·바이트 수도 표시 | `sudo xdp-filter list-rules --stats` |
+| `stats [--interval <초>] [--count <N>] [--format text\|csv]` | 전체 통계를 `--interval`초(기본 1) 간격으로 출력. `--count N`이면 N개 샘플 후 종료, 생략(0)하면 `Ctrl+C`까지. `Total packets/bytes`는 **룰에 매치한 패킷만** 센다. `XDP rx`는 **XDP가 본 전체 패킷**(룰과 무관), `XDP verdicts`는 결과별 패킷 수다(아래 표). 초당 값은 CLI가 연속 두 샘플의 총계 차이로 계산하며 첫 샘플은 `n/a`. `--format csv`는 17열 고정 헤더 + 샘플당 1행 — 아래 예 | `sudo xdp-filter stats --count 5` |
 | `wasm load --name <이름> --file <경로>` | WASM 모듈 로드 | [12장](#12-wasm-검사-모듈) |
 | `wasm list` / `wasm stats --name <이름>` / `wasm unload --name <이름>` | 모듈 조회 / 통계 / 언로드 | |
 
 **`stats` 출력 예** (실습 랩에서 `10.200.0.2`에 `--action count` 룰을 넣고, 10.200.0.2(룰 매치)와 10.200.0.3(룰 없음)에서 ping을 보내며 실행한 실측 결과. `Total`은 매치한 .2의 패킷만, `XDP rx`는 .3의 패킷(`no_match`)과 IPv6 등(`non_ipv4`)까지 모두 센다)
 ```bash
-$ xdp-filter stats --count 3
+$ sudo xdp-filter stats --count 3
 Collecting 3 samples every 1s...
 Timestamp: 2026-10-14 09:36:36
 Total packets: 5
@@ -488,7 +495,7 @@ XDP verdicts: drop=0 pass=0 redirect=0 count=25 no_match=9 invalid=0 non_ipv4=2 
 ```
 
 ```bash
-$ xdp-filter stats --format csv --count 3
+$ sudo xdp-filter stats --format csv --count 3
 timestamp_ms,total_packets,total_bytes,pps,mbps,xdp_rx_packets,xdp_rx_bytes,xdp_rx_pps,xdp_rx_mbps,xdp_drop_packets,xdp_pass_packets,xdp_redirect_packets,xdp_count_packets,xdp_no_match_packets,xdp_invalid_packets,xdp_non_ipv4_packets,xdp_action_error_packets
 1791970598931,25,2450,,,36,3416,,,0,0,0,25,9,0,2,0
 1791970599933,34,3332,9,0.007,49,4662,13,0.010,0,0,0,34,12,0,3,0
@@ -573,37 +580,37 @@ timestamp_ms,total_packets,total_bytes,pps,mbps,xdp_rx_packets,xdp_rx_bytes,xdp_
 ### 8-2. 자주 쓰는 룰
 ```bash
 # 특정 IP 완전 차단
-xdp-filter add-rule --src-ip 203.0.113.7 --action drop --label block-attacker
+sudo xdp-filter add-rule --src-ip 203.0.113.7 --action drop --label block-attacker
 
 # 대역 차단
-xdp-filter add-rule --src-ip 203.0.113.0/24 --action drop --label block-net
+sudo xdp-filter add-rule --src-ip 203.0.113.0/24 --action drop --label block-net
 
 # 대역은 차단하되 한 IP는 허용 (가장 긴 prefix 우선)
-xdp-filter add-rule --src-ip 10.0.0.0/8  --action drop --label block-internal
-xdp-filter add-rule --src-ip 10.1.2.3    --action pass --label allow-admin
+sudo xdp-filter add-rule --src-ip 10.0.0.0/8  --action drop --label block-internal
+sudo xdp-filter add-rule --src-ip 10.1.2.3    --action pass --label allow-admin
 
 # 특정 호스트의 SSH(22) 접근만 차단
-xdp-filter add-rule --src-ip 198.51.100.5 --protocol tcp --dst-port 22 --action drop --label no-ssh
+sudo xdp-filter add-rule --src-ip 198.51.100.5 --protocol tcp --dst-port 22 --action drop --label no-ssh
 
 # 새 TCP 연결(SYN)만 차단
-xdp-filter add-rule --src-ip 198.51.100.6 --protocol tcp --tcp-flags SYN --action drop --label no-new-conn
+sudo xdp-filter add-rule --src-ip 198.51.100.6 --protocol tcp --tcp-flags SYN --action drop --label no-new-conn
 
 # UDP 포트 범위 차단
-xdp-filter add-rule --src-ip 198.51.100.7 --protocol udp --dst-port 10000-20000 --action drop --label no-udp-range
+sudo xdp-filter add-rule --src-ip 198.51.100.7 --protocol udp --dst-port 10000-20000 --action drop --label no-udp-range
 
 # 차단 없이 관찰만
-xdp-filter add-rule --src-ip 192.0.2.0/24 --action count --label watch
-xdp-filter list-rules --stats
+sudo xdp-filter add-rule --src-ip 192.0.2.0/24 --action count --label watch
+sudo xdp-filter list-rules --stats
 
 # 검사 장비 쪽 인터페이스로 리다이렉트
-xdp-filter add-rule --src-ip 192.0.2.10 --action redirect --redirect-if eth1 --label to-ids
+sudo xdp-filter add-rule --src-ip 192.0.2.10 --action redirect --redirect-if eth1 --label to-ids
 
 # 내 서버(목적지)로 오는 TCP 80만 차단
-xdp-filter add-rule --dst-ip 192.0.2.80 --protocol tcp --dst-port 80 --action drop --label protect-web
+sudo xdp-filter add-rule --dst-ip 192.0.2.80 --protocol tcp --dst-port 80 --action drop --label protect-web
 
 # 서버 대역 보호 + 관리자 출발지는 예외 (출발지 룰이 먼저 평가된다 — 관리자 룰은 모든 목적지에 적용됨에 주의)
-xdp-filter add-rule --dst-ip 192.0.2.0/24 --action drop --label protect-servers
-xdp-filter add-rule --src-ip 198.51.100.10 --action pass --label admin-any
+sudo xdp-filter add-rule --dst-ip 192.0.2.0/24 --action drop --label protect-servers
+sudo xdp-filter add-rule --src-ip 198.51.100.10 --action pass --label admin-any
 ```
 각 예시를 실습 랩에서 직접 확인하는 방법은 [docs/examples.md](docs/examples.md)에 있다.
 
@@ -638,18 +645,18 @@ enp1s0           UP             192.168.0.10/24      ← 이 이름을 쓴다 (e
 ### 9-2. ⚠️ 원격(SSH)으로 작업 중이라면
 잘못된 룰 하나로 **내 SSH 접속이 끊길 수 있다.** 다음을 지킨다.
 1. 내 접속 IP부터 확인한다: `echo $SSH_CLIENT` (첫 번째 값)
-2. 다른 룰보다 먼저 내 IP를 허용한다: `xdp-filter add-rule --src-ip <내IP> --action pass --label allow-me`
+2. 다른 룰보다 먼저 내 IP를 허용한다: `sudo xdp-filter add-rule --src-ip <내IP> --action pass --label allow-me`
 3. 가능하면 콘솔(클라우드 웹 콘솔, IPMI 등) 접근 수단을 확보해 둔다.
 4. 처음에는 `--action count`로 넣어 매치되는 트래픽을 확인한 뒤, 룰을 지우고 `drop`으로 다시 넣는다.
 
 ### 9-3. 연결과 해제
 ```bash
 $ sudo swift-guard-daemon --bpf-obj /usr/local/lib/swift-guard/xdp_filter.o &
-$ xdp-filter attach enp1s0 --mode driver
+$ sudo xdp-filter attach enp1s0 --mode driver
 # driver 모드가 실패하면(드라이버 미지원):
-$ xdp-filter attach enp1s0 --mode generic
+$ sudo xdp-filter attach enp1s0 --mode generic
 $ ip -d link show enp1s0 | grep -o 'xdp[a-z]*'      # 연결 확인 → xdp(driver) / xdpgeneric
-$ xdp-filter detach enp1s0                          # 해제
+$ sudo xdp-filter detach enp1s0                          # 해제
 ```
 | 모드 | 특징 |
 |------|------|
@@ -664,10 +671,55 @@ $ sudo ip link set dev enp1s0 xdp off           # driver 모드였을 때
 $ sudo ip link set dev enp1s0 xdpgeneric off    # generic 모드였을 때
 ```
 
-### 9-5. ⚠️ 보안: 누가 룰을 바꿀 수 있나
-- daemon API(`127.0.0.1:7654`)에는 **인증이 없다.** daemon은 root로 돌지만, 같은 서버에 로그인한 **일반 사용자도 누구나** `xdp-filter`로 룰을 넣고 지우고 XDP를 떼어낼 수 있다. 공용 서버라면 이 점을 감안한다.
-- `--api-addr`를 `0.0.0.0` 같은 외부 주소로 바꾸지 않는다. 그러면 네트워크 너머에서 누구나 룰을 바꿀 수 있다.
-- daemon은 요청 크기(1 MiB), 동시 연결 수(64), 응답 시간(10초)을 제한하지만, 이것은 오동작을 막기 위한 장치이지 접근 제어가 아니다.
+### 9-5. 보안: 누가 룰을 바꿀 수 있나
+daemon API에는 **인증(비밀번호, 토큰)이 없다.** 대신 **누가 API 소켓에 접속할 수 있는지**를 파일 권한으로 막는다.
+
+**기본 동작**
+- daemon은 `/run/swift-guard/api.sock`(Unix 도메인 소켓)에서만 명령을 받는다. 네트워크 포트를 열지 않는다.
+- 소켓 권한은 `srw-rw---- root swift-guard`(`0660`)다. **root와 `swift-guard` 그룹 멤버만** 접속할 수 있다. 그 밖의 사용자가 `xdp-filter`를 실행하면 다음처럼 거부된다.
+  ```
+  Error: Failed to send list rules request
+
+  Caused by:
+      Failed to connect to API server at unix:/run/swift-guard/api.sock: permission denied. Run the command with sudo, or join the 'swift-guard' group: sudo usermod -aG swift-guard $USER (then log out and back in)
+  ```
+- `swift-guard` 그룹이 없으면(설치하지 않고 실행) 소켓은 `0600`(root 전용)이 되고 daemon이 경고를 남긴다. 그룹을 만들려면 `sudo groupadd --system swift-guard` 후 daemon을 다시 시작한다.
+- 확인: `ls -l /run/swift-guard/api.sock` → `srw-rw---- 1 root swift-guard 0 ... /run/swift-guard/api.sock`
+
+**sudo 없이 쓰기 (그룹 가입)**
+
+`swift-guard` 그룹에 들어가면 `sudo` 없이 `xdp-filter`를 쓸 수 있다. **그룹 멤버는 이 서버의 패킷 필터를 마음대로 바꾸고 XDP를 떼어낼 수 있다.** root에 준하는 권한이므로 신뢰하는 관리자만 넣는다.
+```bash
+$ sudo usermod -aG swift-guard $USER     # 그룹 가입
+# 로그아웃 후 다시 로그인한다 (새 그룹은 다시 로그인해야 적용된다)
+$ id                                      # 출력에 swift-guard 가 있으면 적용됨
+uid=1001(sgin) gid=100(users) groups=100(users),999(swift-guard)
+$ xdp-filter list-rules                   # 이제 sudo 없이 동작
+```
+그룹에서 빼려면 `sudo gpasswd -d $USER swift-guard`.
+
+**TCP로 열기 (옵트인, 권장하지 않음)**
+
+`/run`을 쓸 수 없는 특수한 환경을 위해 TCP를 쓸 수 있다. 단, **루프백 주소만** 허용한다.
+```bash
+$ sudo swift-guard-daemon --bpf-obj /usr/local/lib/swift-guard/xdp_filter.o --api-addr tcp:127.0.0.1:7654
+$ sudo xdp-filter --api-server tcp:127.0.0.1:7654 list-rules
+```
+- TCP에는 파일 권한이 없으므로 **같은 서버의 모든 사용자**가 룰을 바꿀 수 있다. daemon도 기동할 때 `TCP API enabled on tcp:127.0.0.1:7654: no authentication, any local user can change rules` 경고를 남긴다.
+- `tcp:0.0.0.0:…`이나 외부 IP는 daemon과 CLI가 모두 거부한다(`refusing non-loopback TCP API address ...`). 네트워크 너머에서 룰을 바꾸게 할 방법은 없다.
+- 이전 버전의 `127.0.0.1:7654`처럼 **접두사가 없는 주소는 거부**된다(`invalid API address '127.0.0.1:7654': add a scheme: tcp:127.0.0.1:7654 ...`). 실수로 인증 없는 TCP를 쓰지 않도록 `tcp:`를 명시해야 한다.
+
+**감사 로그**
+
+룰·XDP·WASM을 **바꾸는 요청**(attach, detach, add-rule, delete-rule, wasm load/unload)은 요청한 사용자와 함께 daemon 로그에 한 줄씩 남는다.
+```
+[... INFO  swift_guard_daemon::server] API AddRule from uid=1001 gid=100 pid=186
+```
+조회 요청(list-rules, stats 등)은 `-v`(debug)일 때만 남는다. 서비스라면 `journalctl -u swift-guard | grep "API "`로 본다.
+
+**요청 제한**
+
+daemon은 요청 크기(1 MiB), 동시 연결 수(64), 응답 시간(10초)을 제한하지만, 이것은 오동작을 막기 위한 장치이지 접근 제어가 아니다.
 
 ---
 
@@ -678,7 +730,10 @@ $ sudo ip link set dev enp1s0 xdpgeneric off    # generic 모드였을 때
 $ sudo systemctl enable --now swift-guard
 $ systemctl status swift-guard              # Active: active (running) 이면 정상
 $ journalctl -u swift-guard -f              # 로그 실시간 보기 (Ctrl+C로 종료)
+$ ls -l /run/swift-guard/api.sock           # srw-rw---- 1 root swift-guard ... 이면 정상
 ```
+- 서비스는 시작할 때 `/run/swift-guard` 디렉토리를 만들고(`RuntimeDirectory=`), daemon이 그 안에 API 소켓을 `root:swift-guard` `0660`으로 만든다(소켓 그룹 설정을 위해 서비스에 `CAP_CHOWN`이 있다). 서비스를 멈추면 소켓은 지워진다.
+- `/etc/swift-guard/rules.sh`(아래)처럼 서비스가 root로 실행하는 스크립트에는 `sudo`가 필요 없다.
 
 서비스가 시작될 때 인터페이스에 자동으로 연결하려면 실행 옵션을 덮어쓴다.
 ```bash
@@ -712,7 +767,7 @@ exit 0
 ```bash
 $ sudo chmod +x /etc/swift-guard/rules.sh
 $ sudo /etc/swift-guard/rules.sh               # 지금 바로 적용
-$ xdp-filter list-rules
+$ sudo xdp-filter list-rules
 ```
 서비스가 시작될 때마다 자동으로 적용하려면 위의 `sudo systemctl edit swift-guard`에 한 줄을 더 넣는다.
 ```ini
@@ -755,14 +810,14 @@ ExecStartPost=/etc/swift-guard/rules.sh
 
 ### 12-1. 사용
 ```bash
-$ xdp-filter wasm load --name http-inspector --file /usr/local/lib/swift-guard/wasm/http_inspector.wasm
+$ sudo xdp-filter wasm load --name http-inspector --file /usr/local/lib/swift-guard/wasm/http_inspector.wasm
 Module loaded: WASM module 'http-inspector' loaded
-$ xdp-filter wasm list
+$ sudo xdp-filter wasm list
 NAME                     STATE        LOADED_AT
 ------------------------------------------------------------
 http-inspector           loaded       2026-10-14 04:31:33
-$ xdp-filter wasm stats --name http-inspector
-$ xdp-filter wasm unload --name http-inspector
+$ sudo xdp-filter wasm stats --name http-inspector
+$ sudo xdp-filter wasm unload --name http-inspector
 ```
 - 모듈을 빌드하는 방법은 [4-5](#4-5-선택-wasm-모듈-빌드)에 있다.
 - **신뢰할 수 있는 모듈만 로드한다.** `init`은 1초, 패킷 검사는 기본 10ms의 실행 시간 제한이 있고 메모리는 기본 32MiB로 제한된다. 검사 시간·메모리 제한은 기본값이며 설정 파일(`wasm.execution_timeout_ms`, `wasm.memory_limit_mb`)로 바꿀 수 있다([11장](#11-설정-파일)). API로 동시에 로드할 수 있는 모듈은 2개까지다.
@@ -795,7 +850,7 @@ extern "C" { #[link_name = "log"] fn host_log(ptr: *const u8, len: i32) -> i32; 
 | 단계 | 확인하는 것 | 필요한 환경 | 명령 |
 |------|------------|------------|------|
 | 1. 빌드·단위 테스트 | 컴파일, 맵 바이트 레이아웃, API, 단위 테스트 | Linux | `cargo test --workspace` |
-| 2. 커널 기능 (E2E) | verifier, attach/detach, 차단·집계·리다이렉트, CIDR, 통계, IP 옵션·조각 파싱(PROG_TEST_RUN과 실제 송신), XDP 카운터, 미구현 옵션 거부, 종료 정리 | Linux 5.10+, root (VM 가능, NIC 불필요) | `sudo tools/test/e2e_check.sh` |
+| 2. 커널 기능 (E2E) | verifier, attach/detach, 차단·집계·리다이렉트, CIDR, 통계, IP 옵션·조각 파싱(PROG_TEST_RUN과 실제 송신), XDP 카운터, 미구현 옵션 거부, 종료 정리 | Linux 5.15+, root (VM 가능, NIC 불필요) | `sudo tools/test/e2e_check.sh` |
 | 2'. 사용 예시 회귀 | [docs/examples.md](docs/examples.md)의 예시 12종이 문서대로 동작하는지 | 위와 같음 | `sudo tools/test/examples.sh -v` |
 | 3. 성능 — 처리량 | 패킷 크기별 pps·Gbps, CPU 사용률 (driver 모드) | 물리 서버 + XDP 지원 NIC + 트래픽 생성기(별도 송신 장비 또는 커널 pktgen) | `sudo tools/bench/basic_throughput_test.sh --interface <NIC> --generator external` (같은 호스트의 다른 NIC로 보낼 때는 `--generator pktgen --tx-dev <송신 NIC>`) |
 | 3. 성능 — 룰 스케일링 | 룰 수(1–10000) 증가에 따른 pps, 룰 추가 시간 | 위와 같음 | `sudo tools/bench/rule_scaling_test.sh --interface <NIC> --generator external` |
@@ -813,13 +868,20 @@ extern "C" { #[link_name = "log"] fn host_log(ptr: *const u8, len: i32) -> i32; 
 | `make build` 중 `bpf/bpf_helpers.h: No such file or directory` | `sudo apt install -y libbpf-dev` |
 | `make build` 중 `gnu/stubs-32.h` | 이전 버전 소스다. 최신 소스를 받는다(`git pull`) |
 | `sudo make install`에서 `ERROR: ... 가 없습니다` | 먼저 일반 사용자로 `make build`를 실행한다 |
-| `Failed to connect` / `Connection refused` | daemon이 실행 중이 아니다. 터미널 1에서 daemon을 실행했는지, `--api-addr`와 `--api-server`가 같은지 확인한다 |
+| `Failed to connect to API server at ...: daemon is not running (...)` | daemon이 실행 중이 아니다(`no socket at ...` 또는 `connection refused`). 터미널 1에서 daemon을 실행했는지 확인한다. daemon을 `--api-addr`로 다른 주소에 띄웠다면 CLI에도 같은 값을 `--api-server`로 준다 |
+| `Failed to connect to API server at ...: permission denied. Run the command with sudo, ...` | API 소켓은 root와 `swift-guard` 그룹만 쓸 수 있다. `sudo xdp-filter ...`로 실행한다. sudo 없이 쓰려면 그룹에 가입하고 다시 로그인한다([9-5](#9-5-보안-누가-룰을-바꿀-수-있나)). 가입했는데도 거부되면 `id`에 `swift-guard`가 있는지, daemon 로그에 `root-only` 경고가 없는지 확인한다 |
+| `invalid API address '127.0.0.1:7654': add a scheme: ...` | 이전 버전의 주소 형식이다. 기본 Unix 소켓을 쓰려면 `--api-server`/`--api-addr`를 빼고, TCP가 꼭 필요하면 `tcp:127.0.0.1:7654`처럼 `tcp:`를 붙인다(루프백만) |
+| `refusing non-loopback TCP API address ...` | API에 인증이 없어 외부 주소(`0.0.0.0` 포함)로는 열 수 없다. 기본 Unix 소켓이나 `tcp:127.0.0.1:<포트>`를 쓴다 |
 | daemon: `Permission denied` / `Operation not permitted` | daemon은 `sudo`로 실행해야 한다 |
-| daemon: `BPF object load failed` / `BTF is required` | `--bpf-obj` 경로가 맞는지 확인한다. 설치본은 `/usr/local/lib/swift-guard/xdp_filter.o`다. `make build`로 다시 빌드한다. 커널 5.10 이상인지(`uname -r`) 확인한다 |
-| daemon: `Address already in use` | 다른 daemon이 이미 실행 중이다(`pgrep -a swift-guard`). 그것을 쓰거나 종료한다. 포트를 바꾸려면 `--api-addr 127.0.0.1:7655`(CLI는 `--api-server`로 맞춘다) |
+| daemon: `BPF object load failed` / `BTF is required` | `--bpf-obj` 경로가 맞는지 확인한다. 설치본은 `/usr/local/lib/swift-guard/xdp_filter.o`다. `make build`로 다시 빌드한다. 커널 5.15 이상인지(`uname -r`) 확인한다 |
+| daemon 로그: `kernel ... is older than the minimum supported version 5.15; ...` | 지원하지 않는 커널이다. daemon은 계속 실행하지만 XDP 로드·연결이 실패할 수 있다. 5.15 이상 커널로 올린다 |
+| Ubuntu 20.04에서 동작하지 않음 | 20.04 기본 커널(5.4)은 지원하지 않는다. HWE 커널(5.15, `sudo apt install linux-generic-hwe-20.04`)이면 쓸 수 있다. 가능하면 22.04 이상을 쓴다 |
+| daemon: `API socket /run/swift-guard/api.sock is already in use by another swift-guard-daemon ...` | 다른 daemon(또는 서비스)이 이미 실행 중이다(`pgrep -a swift-guard`, `systemctl status swift-guard`). 그것을 쓰거나 종료한다(`sudo systemctl stop swift-guard`). 이 검사는 XDP를 건드리기 전에 하므로 실행 중인 daemon에는 영향이 없다 |
+| daemon: `/run/swift-guard/api.sock exists and is not a socket; refusing to remove it` | 그 경로에 소켓이 아닌 파일이 있다. 내용을 확인하고 직접 지운 뒤 다시 실행한다. (강제 종료 후 남은 **소켓**은 daemon이 알아서 지운다: `removed stale API socket ...`) |
+| daemon 로그: `group 'swift-guard' not found: API socket ... is root-only ...` | 그룹이 없어 소켓을 root 전용(`0600`)으로 열었다. `sudo`로는 그대로 쓸 수 있다. 그룹 사용자를 허용하려면 `sudo groupadd --system swift-guard`(또는 `sudo make install`) 후 daemon을 다시 시작한다 |
 | `attach` 실패 (driver 모드) | NIC 드라이버가 XDP를 지원하지 않는다. `--mode generic`으로 다시 시도한다 |
-| `already attached ... (use --force to replace)` | 이미 연결돼 있다. 그대로 쓰거나 `xdp-filter detach <if>` 후 다시 연결한다. daemon을 `-i`로 실행했다면 attach를 할 필요가 없다 |
-| 룰을 넣었는데 차단이 안 됨 | ① 출발지 IP가 맞는지(NAT, 프록시 뒤라면 다를 수 있다) ② 같은 IP에 더 긴 prefix 룰이 있는지 ③ 프로토콜·포트 조건이 맞는지(포트 룰은 ICMP·후속 조각에 매치하지 않는다) ④ 목적지 룰이라면 같은 패킷에 매치하는 출발지 룰이 먼저 적용되지 않았는지 ⑤ VLAN 태그 프레임이 아닌지(`xdp-filter stats`의 `non_ipv4`가 늘면 검사 없이 통과한 것) 확인한다. `xdp-filter list-rules --stats`로 매치 수를 본다. [8-1](#8-1-매칭-규칙-꼭-알아야-할-것)을 참고한다 |
+| `already attached ... (use --force to replace)` | 이미 연결돼 있다. 그대로 쓰거나 `sudo xdp-filter detach <if>` 후 다시 연결한다. daemon을 `-i`로 실행했다면 attach를 할 필요가 없다 |
+| 룰을 넣었는데 차단이 안 됨 | ① 출발지 IP가 맞는지(NAT, 프록시 뒤라면 다를 수 있다) ② 같은 IP에 더 긴 prefix 룰이 있는지 ③ 프로토콜·포트 조건이 맞는지(포트 룰은 ICMP·후속 조각에 매치하지 않는다) ④ 목적지 룰이라면 같은 패킷에 매치하는 출발지 룰이 먼저 적용되지 않았는지 ⑤ VLAN 태그 프레임이 아닌지(`xdp-filter stats`의 `non_ipv4`가 늘면 검사 없이 통과한 것) 확인한다. `sudo xdp-filter list-rules --stats`로 매치 수를 본다. [8-1](#8-1-매칭-규칙-꼭-알아야-할-것)을 참고한다 |
 | daemon: `BPF object has no map 'xdp_stats_map'` (또는 `'dst_rules'`) / `BPF map 'xdp_stats_map' value size ... (rebuild xdp_filter.o)` | 오래된 `xdp_filter.o`다. `make build && sudo make install`로 다시 빌드·설치한 뒤 daemon을 다시 실행한다. `--bpf-obj`가 새 파일을 가리키는지도 확인한다 |
 | `Error: priority is not implemented yet: ...` (`rate_limit`, `expire`도 같음) / `Error: --pkt-len is not implemented yet` | 미구현 옵션이다. 옵션을 빼거나 0으로 둔다([8-3](#8-3-거부되는-입력과-에러-메시지)). 이전 버전에서는 저장만 되고 적용되지 않았다 |
 | daemon 로그: `config key '...' is no longer supported and is ignored` / `unknown config key '...' is ignored` | 동작에는 문제가 없다. 업데이트해도 기존 `/etc/swift-guard/config.yaml`은 덮어쓰지 않으므로 옛 키가 남아 있다. `config/swift-guard.yaml`과 비교해 정리한다([11장](#11-설정-파일)) |
@@ -847,6 +909,7 @@ $ make build
 $ sudo make install
 $ sudo systemctl restart swift-guard     # 서비스로 운영 중이라면
 ```
+- **이전 버전(TCP `127.0.0.1:7654`)에서 올리는 경우:** 새 `xdp-filter`는 기본으로 Unix 소켓에 접속한다. 업데이트 후 daemon(또는 서비스)을 **반드시 재시작**한다. 스크립트에 `--api-server 127.0.0.1:7654`/`--api-addr 127.0.0.1:7654`가 있으면 빼거나(기본 소켓) `tcp:127.0.0.1:7654`로 바꾼다. 일반 사용자로 `xdp-filter`를 쓰던 스크립트는 `sudo`를 붙이거나 그 사용자를 `swift-guard` 그룹에 넣는다([9-5](#9-5-보안-누가-룰을-바꿀-수-있나)). `sudo make install`이 `swift-guard` 그룹을 만든다.
 - `sudo make install`은 기존 `/etc/swift-guard/config.yaml`을 덮어쓰지 않는다. 업데이트 후 daemon 로그에 설정 키 경고가 나오면 `config/swift-guard.yaml`과 비교해 정리한다(경고만 나오고 동작은 그대로다).
 
 ### 제거
@@ -854,6 +917,7 @@ $ sudo systemctl restart swift-guard     # 서비스로 운영 중이라면
 $ cd swift-guard
 $ sudo make uninstall                    # 실행 파일, XDP 프로그램, 서비스 제거
 $ sudo rm -rf /etc/swift-guard           # 설정까지 지우려면
+$ sudo groupdel swift-guard              # API 그룹까지 지우려면 (uninstall은 그룹을 남긴다)
 ```
 
 ---
@@ -870,7 +934,7 @@ swift-guard/
 │   ├── bpf/                   XDP 프로그램 (xdp_filter.c → xdp_filter.o)
 │   ├── daemon/                swift-guard-daemon (맵 관리, API 서버, 통계, WASM 런타임)
 │   ├── cli/                   xdp-filter (CLI)
-│   └── common/                공유 코드 (API 타입, BPF 맵 바이트 레이아웃)
+│   └── common/                공유 코드 (API 타입, API 주소 문법, BPF 맵 바이트 레이아웃)
 ├── wasm/                      WASM 모듈 소스와 빌드 스크립트
 ├── config/                    설정 파일, systemd 서비스 파일
 ├── tools/
@@ -895,7 +959,7 @@ swift-guard/
 |------|--------|------|-----------|
 | 패킷 처리 지연 | 2–5 μs | 5-tuple 분류 | 측정 도구 없음 (P50/P99 미구현) |
 | 최대 처리량 | 약 10–15 Mpps | 단일 코어 | `tools/bench/basic_throughput_test.sh` → `throughput_results.csv`의 `xdp_rx_pps`(XDP가 본 전체 패킷)·`cpu_busiest` |
-| 룰 추가 지연 | < 50 μs | | `tools/bench/rule_scaling_test.sh` → `add_rule_us_avg` (CLI 프로세스 생성·TCP 연결 포함 — 순수 맵 갱신 지연보다 크게 나온다) |
+| 룰 추가 지연 | < 50 μs | | `tools/bench/rule_scaling_test.sh` → `add_rule_us_avg` (CLI 프로세스 생성·API 소켓 연결 포함 — 순수 맵 갱신 지연보다 크게 나온다) |
 | 메모리 | 약 2–5 MB | 룰 1만 개 | 요약 CSV의 `daemon_rss_kb` + `sudo bpftool map show`(맵 memlock) |
 
 *목표 설정 시 가정한 환경: Intel Xeon E5-2680v4 @ 2.4GHz, Linux 5.15, XDP driver 모드*
@@ -931,5 +995,6 @@ swift-guard/
 | **최장 prefix 일치 (LPM)** | 한 IP에 여러 대역 룰이 겹치면 가장 좁은(숫자가 큰) 대역의 룰을 고르는 방식 |
 | **출발지 / 목적지** | 패킷을 보낸 쪽 IP / 받을 쪽 IP |
 | **daemon** | 백그라운드에서 계속 실행되는 프로그램. 여기서는 `swift-guard-daemon` |
+| **Unix 도메인 소켓** | 같은 컴퓨터 안의 프로그램끼리 통신하는 파일 형태의 통로(`/run/swift-guard/api.sock`). 파일 권한으로 접속할 수 있는 사용자를 제한한다 |
 | **WASM** (WebAssembly) | 격리된 환경에서 실행되는 이식성 있는 바이너리 형식. 검사 로직을 플러그인처럼 추가하는 데 쓴다 |
 | **redirect** | 패킷을 원래 목적지 대신 다른 인터페이스로 내보내는 것 |

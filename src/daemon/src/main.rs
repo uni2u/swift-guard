@@ -5,10 +5,14 @@
 //! libbpf-rs Object/Map 은 !Send 라서 MapManager / XdpAttachManager 는 main 태스크에서만 쓴다.
 //! API 서버(accept 루프 + BPF 요청 처리)와 텔레메트리 루프, 시그널은 tokio::select! 로 같은 태스크 안에서
 //! 폴링한다. 연결 I/O 와 WASM 요청은 별도 태스크(로드는 spawn_blocking)라 이 루프를 막지 않는다 (R2-1).
+//!
+//! API 는 기본으로 Unix 소켓 `/run/swift-guard/api.sock`(root:swift-guard 0660)에서 받는다.
+//! 소켓은 BPF 로드 전에 확보한다 — 중복 기동을 XDP·맵을 건드리기 전에 거부한다 (D13).
+//! 커널이 최소 버전(5.15) 미만이면 경고만 하고 계속한다 (D2, 실제 판정은 verifier).
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -23,7 +27,9 @@ mod wasm;
 
 use crate::bpf::{XdpAttachManager, XdpFilterSkel};
 use crate::maps::MapManager;
-use crate::server::ApiServer;
+use crate::server::{bind_api, ApiServer};
+use swift_guard::endpoint::{ApiEndpoint, DEFAULT_API_ENDPOINT, DEFAULT_API_GROUP};
+use swift_guard::utils::kernel_version_warning;
 use crate::telemetry::TelemetryCollector;
 use crate::wasm::{WasmLimits, WasmManager};
 
@@ -42,13 +48,33 @@ struct Args {
     #[clap(short, long)]
     interface: Option<String>,
 
-    /// API 서버 바인드 주소
-    #[clap(long, default_value = "127.0.0.1:7654")]
-    api_addr: String,
+    /// API 주소: unix:/path (기본) 또는 tcp:<loopback-ip>:<port> (루프백만, 인증 없음)
+    #[clap(long, value_name = "ENDPOINT", default_value = DEFAULT_API_ENDPOINT, value_parser = parse_endpoint)]
+    api_addr: ApiEndpoint,
+
+    /// Unix API 소켓 그룹 (기본 swift-guard). 그룹이 없으면 소켓은 0600(root 전용). TCP 면 무시
+    #[clap(long, value_name = "GROUP")]
+    api_group: Option<String>,
 
     /// 상세 로깅
     #[clap(short, long)]
     verbose: bool,
+}
+
+/// clap value_parser: 주소 문법·루프백 검사는 common::endpoint 가 원천이다
+fn parse_endpoint(s: &str) -> std::result::Result<ApiEndpoint, String> {
+    s.parse::<ApiEndpoint>().map_err(|e| format!("{:#}", e))
+}
+
+/// 최소 커널 검사 (C-2): 미만이면 경고만. 읽기·파싱 실패는 debug.
+fn check_kernel_version() {
+    match std::fs::read_to_string("/proc/sys/kernel/osrelease") {
+        Ok(release) => match kernel_version_warning(&release) {
+            Some(msg) => warn!("{}", msg),
+            None => debug!("kernel {} (minimum 5.15)", release.trim()),
+        },
+        Err(e) => debug!("cannot read kernel release: {}", e),
+    }
 }
 
 /// 주기적으로 맵 통계를 읽어 텔레메트리에 반영 (반환하지 않음)
@@ -164,6 +190,17 @@ async fn run() -> Result<()> {
     }
     let cfg = loaded.config;
 
+    // 3a. 커널 버전 경고 (D2: 실패로 막지 않는다)
+    check_kernel_version();
+
+    // 3b. API 소켓 확보 (D13: BPF 로드 전). stale 소켓 정리·중복 기동 거부·권한 설정.
+    //     이후 어떤 경로로 끝나도 listener drop 시 자기 소켓만 지운다.
+    if matches!(args.api_addr, ApiEndpoint::Tcp(_)) && args.api_group.is_some() {
+        info!("--api-group is ignored for TCP API addresses");
+    }
+    let api_group = args.api_group.as_deref().unwrap_or(DEFAULT_API_GROUP);
+    let listener = bind_api(&args.api_addr, api_group).await?;
+
     // 4. BPF 오브젝트 로드
     let skel = XdpFilterSkel::builder()
         .obj_path(&args.bpf_obj)
@@ -202,16 +239,14 @@ async fn run() -> Result<()> {
     };
     let wasm = Arc::new(WasmManager::with_limits(limits));
     let server = ApiServer::new(
-        &args.api_addr,
         map_manager.clone(),
         attach.clone(),
         telemetry.clone(),
         wasm.clone(),
     );
     let interval = Duration::from_secs(cfg.telemetry.interval.max(1));
-    let listener = server.bind().await?;
 
-    // 11. auto_load: bind 이후 백그라운드에서 순차 로드. 실패는 에러 로그 후 계속(데몬 유지).
+    // 11. auto_load: bind(3b) 이후 백그라운드에서 순차 로드. 실패는 에러 로그 후 계속(데몬 유지).
     if cfg.wasm.auto_load && !cfg.wasm.auto_load_modules.is_empty() {
         spawn_auto_load(wasm, &cfg.wasm.modules_dir, &cfg.wasm.auto_load_modules);
     }

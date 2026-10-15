@@ -187,6 +187,38 @@ pub fn port_range_to_string(min: u16, max: u16) -> Option<String> {
     }
 }
 
+/// 지원하는 최소 커널 (major, minor). Ubuntu 22.04 GA 커널.
+pub const MIN_KERNEL: (u32, u32) = (5, 15);
+
+/// 커널 release 문자열에서 (major, minor) 추출.
+/// "5.15.0-91-generic" → Some((5,15)), "7.0.0-linuxkit" → Some((7,0)), "6.8" → Some((6,8)), 실패 → None
+pub fn parse_kernel_release(release: &str) -> Option<(u32, u32)> {
+    let mut parts = release.trim().split('.');
+    let major = parts.next()?.parse::<u32>().ok()?;
+    // minor 뒤에 접미사가 붙을 수 있다 (예: "15-rc1", "8+")
+    let minor_str = parts.next()?;
+    let digits: String = minor_str.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let minor = digits.parse::<u32>().ok()?;
+    Some((major, minor))
+}
+
+/// release 가 MIN_KERNEL 미만이면 daemon 이 출력할 경고 문구(고정 계약), 아니면 None.
+/// 파싱할 수 없으면 None (판단 불가 — verifier 가 실제로 판정한다).
+pub fn kernel_version_warning(release: &str) -> Option<String> {
+    let v = parse_kernel_release(release)?;
+    if v < MIN_KERNEL {
+        Some(format!(
+            "kernel {} is older than the minimum supported version {}.{}; \
+             loading or attaching the XDP program may fail",
+            release.trim(),
+            MIN_KERNEL.0,
+            MIN_KERNEL.1
+        ))
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,5 +274,32 @@ mod tests {
         let u32_addr = ipv4_to_u32(&addr);
         assert_eq!(u32_addr, 0xC0A80101);
         assert_eq!(u32_to_ipv4(u32_addr), addr);
+    }
+
+    #[test]
+    fn kernel_release_parsing() {
+        assert_eq!(parse_kernel_release("5.15.0-91-generic"), Some((5, 15)));
+        assert_eq!(parse_kernel_release("5.4.0"), Some((5, 4)));
+        assert_eq!(parse_kernel_release("6.8.0-45-generic"), Some((6, 8)));
+        assert_eq!(parse_kernel_release("7.0.0-linuxkit"), Some((7, 0)));
+        assert_eq!(parse_kernel_release("5.10"), Some((5, 10)));
+        assert_eq!(parse_kernel_release("6.8\n"), Some((6, 8)));
+        assert_eq!(parse_kernel_release("6.1-rc1"), Some((6, 1)));
+        assert_eq!(parse_kernel_release(""), None);
+        assert_eq!(parse_kernel_release("abc"), None);
+        assert_eq!(parse_kernel_release("6"), None);
+    }
+
+    #[test]
+    fn kernel_version_warning_threshold() {
+        assert_eq!(
+            kernel_version_warning("5.10.0-28-amd64").as_deref(),
+            Some("kernel 5.10.0-28-amd64 is older than the minimum supported version 5.15; loading or attaching the XDP program may fail")
+        );
+        assert!(kernel_version_warning("5.4.0").is_some());
+        assert!(kernel_version_warning("4.19.0").is_some());
+        assert!(kernel_version_warning("5.15.0-91-generic").is_none());
+        assert!(kernel_version_warning("6.8.0").is_none());
+        assert!(kernel_version_warning("garbage").is_none());
     }
 }

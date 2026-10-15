@@ -5,7 +5,7 @@ Swift-Guard 검증은 세 단계(Tier)로 나뉜다. 단계마다 필요한 환�
 | Tier | 무엇을 확인하나 | 필요한 환경 | 실행 |
 |------|----------------|------------|------|
 | **1. 빌드·단위 테스트** | BPF 컴파일(BTF 포함), daemon/CLI 컴파일, 맵 바이트 레이아웃, API, 단위 테스트 | Rust 툴체인이 있는 아무 환경. daemon과 BPF는 Linux(또는 Docker)가 필요 | `cargo test --workspace`, `make -C src/bpf` |
-| **2. 커널 기능 (E2E)** | verifier 로드, XDP attach/detach, drop·count·redirect 매치, CIDR(LPM 바이트 오더), 목적지 룰(dst_rules)과 출발지 룰 우선, 룰별·전역 통계, XDP 전체·결과별 카운터, L4 파서(IP 옵션·조각·tiny fragment·비정상 헤더), 입력 거부(미구현 옵션 포함), SIGTERM 시 정리 | **Linux 커널 5.10+와 root**. 물리 NIC는 필요 없다(veth + generic XDP) | `sudo tools/test/e2e_check.sh --build` |
+| **2. 커널 기능 (E2E)** | verifier 로드, XDP attach/detach, drop·count·redirect 매치, CIDR(LPM 바이트 오더), 목적지 룰(dst_rules)과 출발지 룰 우선, 룰별·전역 통계, XDP 전체·결과별 카운터, L4 파서(IP 옵션·조각·tiny fragment·비정상 헤더), 입력 거부(미구현 옵션 포함), SIGTERM 시 정리, API 접근 제어(소켓 권한·그룹·비루프백 거부·stale 소켓) | **Linux 커널 5.15+와 root**. 물리 NIC는 필요 없다(veth + generic XDP) | `sudo tools/test/e2e_check.sh --build` |
 | **3. 성능** | 프레임 크기별 Mpps·Gbps, CPU 사용률, 룰 수에 따른 처리량, 룰 추가 시간, driver 모드. 지연(P50/P99)은 측정 도구 없음 | 물리 서버, XDP driver 모드를 지원하는 NIC(Intel X520/X710 등), 트래픽 발생기(커널 pktgen 등) | `tools/bench/basic_throughput_test.sh`, `tools/bench/rule_scaling_test.sh`, `tools/analysis/analyze_performance.py` ([`poc-plan.md`](poc-plan.md)). 흐름만 확인: `sudo tools/test/bench_flow_check.sh` |
 
 ---
@@ -26,7 +26,7 @@ cargo test --workspace              # 단위 테스트 (common 바이트 레이�
 
 ### 환경
 다음 중 하나면 된다.
-- Linux VM: Lima, UTM, Multipass, VirtualBox 등. Ubuntu 22.04+ 권장(커널 5.15+)
+- Linux VM: Lima, UTM, Multipass, VirtualBox 등. Ubuntu 22.04+(커널 5.15+) **필수** — 커널이 5.15 미만이면 e2e_check는 환경 부적합(종료 코드 2)으로 멈춘다
 - 클라우드 VM
 - Linux 물리 장비
 - Docker `--privileged` 컨테이너. x86_64 Docker Desktop(커널 7.x linuxkit)에서 동작을 확인했다. 커널이 `bpf()`를 막는 환경에서는 e2e_check가 daemon 기동 단계에서 실패로 알린다.
@@ -34,6 +34,7 @@ cargo test --workspace              # 단위 테스트 (common 바이트 레이�
 ### 실행
 ```bash
 sudo apt install -y iproute2 iputils-ping python3 bpftool   # python3·bpftool은 선택(없으면 파서 단계 9·10만 SKIP)
+# useradd/groupadd/runuser(passwd, util-linux — Ubuntu·Debian 기본 포함)가 없으면 접근 제어 단계 3b만 SKIP
 sudo tools/test/e2e_check.sh --build                 # 빌드부터 E2E까지 한 번에
 # 옵션: --with-ignored (cargo test -- --ignored 실행), --keep (실패 시 토폴로지·로그 보존)
 ```
@@ -44,7 +45,7 @@ sudo tools/test/e2e_check.sh --build                 # 빌드부터 E2E까지 �
 [netns sg-e2e-src] sg-e2e-peer 10.200.0.2  <== veth ==>  sg-e2e-dut 10.200.0.1, 10.200.0.11  [XDP generic 부착]
                                                          sg-e2e-rd0  <== veth ==>  sg-e2e-rd1  (redirect 대상)
 ```
-daemon은 테스트 전용 포트 `127.0.0.1:17654`로 띄우고, 설정 파일 없이 기본값으로 돈다. 그래서 시스템에 설치된 daemon과 충돌하지 않는다.
+daemon은 테스트 전용 Unix 소켓 `/run/sg-e2e.XXXXXX/api.sock`(`--api-addr unix:...`)으로 띄우고, 설정 파일 없이 기본값으로 돈다. 그래서 시스템에 설치된 daemon(`/run/swift-guard/api.sock`)과 충돌하지 않는다. 접근 제어 검증을 위해 임시 그룹 `sg-e2e-api`(daemon `--api-group sg-e2e-api`)와 임시 사용자 `sg-e2e-in`(그룹 멤버)·`sg-e2e-out`(비멤버)을 만들고, CLI 복사본을 다른 사용자도 실행할 수 있는 임시 디렉토리에 두어 `runuser`로 실행한다. 끝나면 사용자·그룹·소켓 디렉토리를 모두 지운다. 15b 단계의 보조 daemon은 같은 디렉토리 아래 다른 소켓과 `tcp:127.0.0.1:17654`를 쓰고, BPF를 로드하지만 attach하지 않는다.
 
 XDP 카운터는 `xdp-filter stats --format csv --count 1`의 헤더로 열 위치를 찾아 읽고, 동작 전후의 차이(delta)로 판정한다. 파서 검증용 패킷은 `tools/test/sg_pkt.py`(python3 표준 라이브러리만 사용)가 만든다. 이 스크립트는 시작할 때 `--selftest`로 손으로 계산한 바이트와 자기 출력을 대조한다.
 
@@ -53,8 +54,9 @@ XDP 카운터는 `xdp-filter stats --format csv --count 1`의 헤더로 열 위�
 | # | 항목 | 판정 기준 |
 |---|------|----------|
 | 1 | verifier | `bpftool prog load` 성공 (bpftool이 없으면 2번에서 대신 확인) |
-| 2 | daemon 기동 | API 포트 응답 |
+| 2 | daemon 기동 | 테스트 소켓 생성 + `list-rules` 응답 |
 | 3 | attach (generic) | `ip -d link`에 xdp 표시, 룰이 없을 때 ping 통과. ping 3회 동안 `xdp_rx_packets` ≥3, `xdp_no_match_packets` ≥3 증가, `total_packets`(룰 매치)는 증가 0 |
+| 3b | API 접근 제어 | 소켓 `660 root sg-e2e-api`. 비멤버(`runuser -u sg-e2e-out`)의 `list-rules`는 실패하고 출력에 `permission denied`와 `sudo` 안내가 있다. 비멤버의 `add-rule`도 거부되고 룰이 생기지 않는다(root로 확인). 멤버(`sg-e2e-in`)의 `list-rules`·`add-rule`은 성공하고, daemon 로그에 감사 줄 `API AddRule from uid=<멤버 uid> gid=... pid=...`와 `API Attach from uid=0 gid=0 pid=...`가 남는다. 사용자 도구가 없으면 SKIP |
 | 4 | drop /32 | ICMP 차단, 룰별 통계 ≥3, 전역 통계(PERCPU 합산) >0, `xdp_drop_packets` ≥3 증가, 삭제 후 복구 |
 | 5 | drop /24 | CIDR 매치. LPM 키를 네트워크 바이트 오더로 넣었는지 검증 |
 | 6 | count | 트래픽은 통과하고 패킷은 집계됨. `xdp_count_packets` ≥3 증가 |
@@ -67,6 +69,7 @@ XDP 카운터는 `xdp-filter stats --format csv --count 1`의 헤더로 열 위�
 | 13 | 카운터 불변식 | `xdp_rx_packets`와 결과별 8개 카운터 합의 차이 ≤10 (읽는 동안 들어온 배경 트래픽 허용) |
 | 14 | detach | CLI로 detach하면 xdp가 해제됨 |
 | 15 | SIGTERM | 5초 안에 종료되고 xdp가 해제됨 |
+| 15b | 소켓 수명 | ① 정상 종료 후 소켓 삭제 ② 보조 daemon을 SIGKILL → 소켓 잔존 → 같은 경로로 재기동하면 응답하고 로그에 `removed stale API socket` ③ 살아 있는 소켓 경로로 또 기동하면 5초 안에 비정상 종료 + `already in use`, 기존 daemon은 계속 응답 ④ 일반 파일 경로면 기동 실패 + `is not a socket`, 파일 보존 ⑤ `--api-group sg-no-such-group`이면 소켓 `600 root` + `group 'sg-no-such-group' not found` 경고 ⑥ `--api-addr tcp:0.0.0.0:17654` → `non-loopback`, `127.0.0.1:17654`(접두사 없음) → `add a scheme`으로 기동 거부, `tcp:127.0.0.1:17654`는 동작(`TCP API enabled ...` 경고). CLI `--api-server`도 같은 두 값을 같은 문구로 거부 ⑦ 소켓이 없으면 CLI가 `daemon is not running` |
 
 9단계 파서 케이스. 룰: R1 `--src-ip 10.77.0.1 --protocol tcp --dst-port 8080 --action drop`, R2 `--src-ip 10.77.0.2 --action drop`, R3 `--src-ip 10.77.0.3 --protocol tcp --tcp-flags SYN --action drop`, R4 `--src-ip 10.77.0.4 --protocol udp --dst-port 5353 --action count`. "이전 코드"는 IHL과 조각을 보지 않던 버전의 결과다(참고).
 
@@ -99,7 +102,7 @@ XDP 카운터는 `xdp-filter stats --format csv --count 1`의 헤더로 열 위�
 
 ### 추가 수동 점검 (자동화하지 않은 항목)
 ```bash
-X=./target/release/xdp-filter
+X="sudo ./target/release/xdp-filter"     # 기본 소켓 /run/swift-guard/api.sock 은 root(또는 swift-guard 그룹)만 접속
 sudo ./target/release/swift-guard-daemon -b src/bpf/xdp_filter.o -i veth0 -v & DPID=$!
 
 # 외부 프로그램이 교체해 넣은 XDP는 detach하지 않아야 한다
@@ -110,20 +113,23 @@ $X detach veth0; ip -d link show veth0 | grep -c xdp      # Error 메시지, 1 (
 ping -c 3 -s 3000 <veth0 건너편 IP>                     # 응답 3개, stats의 invalid 증가 0
 
 # 요청 프레임 상한(1 MiB): 큰 길이 헤더를 보내면 Error 후 연결이 닫히고 daemon은 살아 있어야 한다
-printf '\xff\xff\xff\xff' | nc -q2 127.0.0.1 7654 | xxd | head -2; kill -0 $DPID && echo alive
+printf '\xff\xff\xff\xff' | sudo nc -U -q2 /run/swift-guard/api.sock | xxd | head -2; sudo kill -0 $DPID && echo alive
 
 # 동시 연결 상한(64): idle 연결 64개를 붙잡은 상태에서는 busy 응답, 10초 IO timeout이 지나면 정상
-for i in $(seq 64); do (sleep 15 | nc 127.0.0.1 7654 >/dev/null &); done; sleep 0.5
+for i in $(seq 64); do (sleep 15 | sudo nc -U /run/swift-guard/api.sock >/dev/null &); done; sleep 0.5
 $X list-rules            # server busy (또는 connection reset)
 sleep 12; $X list-rules  # 정상
 
 sudo kill -TERM $DPID
+ls /run/swift-guard/api.sock             # 없어야 한다 (정상 종료 시 daemon이 자기 소켓을 지운다)
 ```
+`nc -U`는 OpenBSD netcat(`netcat-openbsd`, Ubuntu 기본)의 Unix 소켓 옵션이다.
 
 ### 알려진 한계
-- `cargo test -- --ignored`의 기존 통합 테스트(`tests/integration/`)는 `sudo`와 `target/debug/` 바이너리를 하드코딩하고 기본 포트 7654를 쓴다. 그래서 root 셸이나 컨테이너에서는 실패한다. 같은 범위를 `e2e_check.sh`가 더 넓게 검증한다.
+- `cargo test -- --ignored`의 기존 통합 테스트(`tests/integration/`)는 `sudo`와 `target/debug/` 바이너리를 하드코딩하고 기본 소켓 `/run/swift-guard/api.sock`을 쓴다(e2e_check의 테스트 소켓이 아니다). 그래서 root 셸이나 컨테이너에서는 실패한다. 같은 범위를 `e2e_check.sh`가 더 넓게 검증한다.
 - generic 모드만 검증한다. driver 모드와 offload 모드는 NIC 드라이버가 지원해야 하므로 Tier 3에서 확인한다.
-- verifier 통과는 이 환경의 커널에서만 확인된다. L4 위치가 IHL에 따라 바뀌는 가변 오프셋 접근은 커널 버전마다 verifier 반응이 다를 수 있으므로, 운영 커널(예: 5.10, 5.15)에서 한 번 로드해 본다: `make -C src/bpf && sudo bpftool prog load src/bpf/xdp_filter.o /sys/fs/bpf/sgtest && sudo rm /sys/fs/bpf/sgtest`.
+- verifier 통과는 이 환경의 커널에서만 확인된다. L4 위치가 IHL에 따라 바뀌는 가변 오프셋 접근은 커널 버전마다 verifier 반응이 다를 수 있으므로, 운영 커널(예: 5.15, 6.8)에서 한 번 로드해 본다: `make -C src/bpf && sudo bpftool prog load src/bpf/xdp_filter.o /sys/fs/bpf/sgtest && sudo rm /sys/fs/bpf/sgtest`. BPF는 `-mcpu=v3`(JMP32·ALU32·atomics fetch/cmpxchg, 5.15에서 모두 지원)로 빌드되므로 코드 생성이 v1/v2와 다르다. Docker 컨테이너는 호스트 커널(Docker Desktop은 7.x)을 쓰므로 5.15 verifier를 대신할 수 없다.
+- **사용자 장비 절차 — Ubuntu 22.04 GA 커널(5.15) VM에서 verifier 로드.** 예: `multipass launch 22.04` 후 `uname -r`이 `5.15.*`인지(HWE 커널이 아닌지) 확인하고, 위 `bpftool prog load` 명령과 `sudo tools/test/e2e_check.sh --build`를 실행한다. 이어서 일반 사용자로 `xdp-filter list-rules`가 `permission denied` 안내로 거부되는지, `sudo usermod -aG swift-guard $USER` 후 다시 로그인하면 성공하는지 확인한다.
 - daemon이 `SIGKILL`로 죽으면 XDP가 붙은 채 남는다. `sudo ip link set dev <if> xdp off`(또는 `xdpgeneric off`)로 직접 해제한다.
 
 ### 사용 예시 회귀
@@ -131,6 +137,7 @@ sudo kill -TERM $DPID
 ```bash
 sudo tools/test/examples.sh -v
 ```
+문서와 같이 기본 소켓(`/run/swift-guard/api.sock`)으로 daemon을 띄운다. systemd 서비스가 이미 그 소켓으로 응답하면 충돌을 피하려고 시작하지 않는다(종료 코드 2) → `sudo systemctl stop swift-guard` 후 실행한다.
 
 ## Tier 3 — 성능
 
@@ -142,7 +149,7 @@ sudo tools/test/examples.sh -v
 - 측정 전에 `xdp-filter stats --format csv` 헤더가 17열 계약과 같은지, daemon이 XDP 카운터를 주는지 확인한다. 다르면 "재빌드 필요"로 중단한다.
 - driver 모드를 지원하는 NIC(`ethtool -i <nic>`로 드라이버 확인). generic 모드 수치는 driver 모드와 비교할 수 없다.
 - 권장: `irqbalance` 정지, 수신 큐 IRQ와 CPU 고정, CPU 주파수 고정(performance governor).
-- daemon: API(`127.0.0.1:7654`)가 응답하지 않으면 스크립트가 직접 띄우고 끝나면 종료한다. 이미 실행 중이면 재사용한다(기존 룰이 결과에 영향을 줄 수 있다는 경고를 출력하고, 스크립트가 넣은 룰만 지운다). 그 daemon이 인터페이스에 이미 붙여 두었으면 `--no-attach`를 쓴다. 재사용 daemon에서는 `--force-attach`가 거부되고, `bench-match` 라벨이 이미 있으면 에러로 중단한다.
+- daemon: API(`--api-server`, 기본 `unix:/run/swift-guard/api.sock`. TCP는 `tcp:127.0.0.1:<port>`만)가 응답하지 않으면 스크립트가 직접 띄우고 끝나면 종료한다. 이미 실행 중이면 재사용한다(기존 룰이 결과에 영향을 줄 수 있다는 경고를 출력하고, 스크립트가 넣은 룰만 지운다). 그 daemon이 인터페이스에 이미 붙여 두었으면 `--no-attach`를 쓴다. 재사용 daemon에서는 `--force-attach`가 거부되고, `bench-match` 라벨이 이미 있으면 에러로 중단한다.
 - 측정 중 daemon이 죽거나 stats 수집이 실패하면 그 행을 기록하지 않고 종료 코드 1로 끝난다.
 
 ### 트래픽 생성기 (`--generator`)
@@ -188,4 +195,5 @@ python3 tools/analysis/analyze_performance.py --results-dir results
 ```bash
 sudo tools/test/bench_flow_check.sh            # --build: 먼저 빌드, --keep: 결과 디렉토리 보존
 ```
+테스트 전용 소켓 `unix:/run/sg-bench-flow/api.sock`으로 daemon을 띄우므로 시스템 daemon과 충돌하지 않는다.
 실습 랩과 lab 생성기로 위 스크립트 전체(daemon 기동 → stats CSV 계약 확인 → attach → 매치 룰 → 트래픽 → stats CSV → 요약 CSV → 분석 → 정리)를 실제로 실행하고, CSV 헤더·행 수·`pps>0`·`xdp_rx_pps>0`·`--rule-action none`에서 `xdp_rx_pps>0`이고 `pps=0`인지·분석 산출물(처리량 지표 표시, 이전 형식 결과 읽기)·정리 상태를 판정한다. **수치는 veth와 python 송신의 한계일 뿐이며 성능 결과가 아니다.**

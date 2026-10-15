@@ -8,7 +8,7 @@
 |----------|----------|-----------|------|
 | 기본 처리량 (2.1) | `tools/bench/basic_throughput_test.sh` | ✅ | 프레임 크기별 pps·Gbps·CPU (1차 지표 `xdp_rx_pps`) |
 | 룰 스케일링 (2.2) | `tools/bench/rule_scaling_test.sh` | ✅ | 룰 수별 pps (1차 지표 `xdp_rx_pps`) |
-| 룰 추가 지연 (2.2) | `tools/bench/rule_scaling_test.sh` (`add_rule_us_avg`) | △ | CLI 프로세스 생성·TCP 연결 포함. 순수 맵 갱신 지연 아님 |
+| 룰 추가 지연 (2.2) | `tools/bench/rule_scaling_test.sh` (`add_rule_us_avg`) | △ | CLI 프로세스 생성·API 연결(Unix 소켓) 포함. 순수 맵 갱신 지연 아님 |
 | 지연 P50/P99 | — | ❌ | 측정 도구 없음 (6장) |
 | WASM 오버헤드 (2.3) | — | ❌ | XDP→WASM 데이터 경로가 없다 |
 | 보안 효과성 (3.1) | — | ❌ | 같은 이유 + 공격 트래픽·판정 하네스 없음 |
@@ -25,7 +25,7 @@
 - 송신 장비: 커널 pktgen을 돌릴 Linux 장비 1대(권장) 또는 DUT의 두 번째 NIC
 
 ### 소프트웨어
-- OS: Ubuntu 22.04 LTS 이상, 커널 5.10+ (5.15 이상 권장)
+- OS: Ubuntu 22.04 LTS 이상, 커널 5.15+ (Ubuntu 22.04 GA 커널. 5.15 미만이면 벤치 스크립트가 경고한다)
 - Rust **1.78+** (Cargo.lock v4)
 - 패키지: `clang llvm libelf-dev libbpf-dev build-essential pkg-config linux-headers-$(uname -r) iproute2`
 - 분석: `python3`, `matplotlib` (`pip install -r tools/analysis/requirements.txt`. 없으면 summary.md만 만든다)
@@ -55,7 +55,7 @@
   - `count`: 룰 매치 후 XDP_PASS(커널 스택으로 감).
   - `none`: 룰을 넣지 않는다. 모든 패킷이 `no_match`로 XDP_PASS된다(커널 스택 경로). `pps`/`gbps`는 0이고 `xdp_rx_pps`로 처리량을 잰다.
 - **계약 확인:** 측정 전에 stats CSV 헤더가 17열 계약과 같은지, daemon이 XDP 카운터를 주는지(`xdp_rx_packets`가 빈 칸이 아닌지) 확인한다. 다르면 "재빌드 필요"로 중단한다(이전 버전 `xdp-filter`·daemon·`xdp_filter.o` 혼용 방지).
-- **daemon:** 스크립트가 API(`--api-server`, 기본 `127.0.0.1:7654`) 응답을 확인한다. 응답이 없으면 설정 파일 없이(기본값) daemon을 띄우고 끝나면 종료한다. 이미 실행 중이면 재사용한다. 이때는 기존 룰이 결과와 룰 한도에 영향을 준다는 경고를 출력하고, 끝나면 스크립트가 넣은 룰만 지운다. 재사용 daemon에 label `bench-match` 룰이 이미 있으면 지우지 않고 에러로 중단한다.
+- **daemon:** 스크립트가 API(`--api-server`, 기본 `unix:/run/swift-guard/api.sock`. TCP는 `tcp:127.0.0.1:<port>` 루프백만) 응답을 `xdp-filter list-rules`로 확인한다. 스크립트는 root로 실행하므로 소켓 권한(`root:swift-guard 0660`)에 막히지 않는다. 응답이 없으면 설정 파일 없이(기본값) daemon을 띄우고 끝나면 종료한다. 이미 실행 중이면 재사용한다. 이때는 기존 룰이 결과와 룰 한도에 영향을 준다는 경고를 출력하고, 끝나면 스크립트가 넣은 룰만 지운다. 재사용 daemon에 label `bench-match` 룰이 이미 있으면 지우지 않고 에러로 중단한다.
 - **attach:** 기본 `--mode driver`. 스크립트가 attach하고 끝나면 detach한다. 재사용 daemon이 이미 그 인터페이스에 붙여 두었으면 `--no-attach`를 쓴다(attach도 detach도 하지 않는다). `--force-attach`(다른 프로그램의 XDP를 교체)는 스크립트가 daemon을 띄운 경우에만 허용되고, 재사용 daemon에서는 거부된다 — 교체 후 정리 단계의 detach가 운영 중인 필터를 떼어내지 않게 하기 위해서다.
 - **실패 처리:** 측정 중 daemon이 응답하지 않거나 `xdp-filter stats`가 실패하면(데이터 행 0 포함) 그 측정의 요약 행을 기록하지 않고 종료 코드 1로 중단한다. 앞서 끝난 측정의 행은 남는다. 정리(trap)는 백그라운드 stats·생성기를 프로세스 그룹째 종료한다.
 - **비율 계산:** pps·Mbps(룰 매치)와 xdp_rx_pps·xdp_rx_mbps(전체)는 CLI가 연속 두 샘플(1초 간격) 총계의 차이로 계산한다. 첫 샘플은 비율이 없다(CSV 빈 칸).
@@ -103,7 +103,7 @@ sudo tools/bench/rule_scaling_test.sh --generator lab --rule-counts 1,10,100 --d
 - 단계(`--rule-counts`, 기본 `1,10,100,1000,5000,10000`)마다 filler 룰을 **누적** 추가하고 측정한다. `rule_count`는 매치 룰을 포함한 bench 룰 총수다.
 - filler: `198.19.<i/256>.<i%256>/32`, label `bench-fill-<i>`, action pass. 트래픽과 매치하지 않는다. `--src-ip`·`--dst-ip`가 198.19.0.0/16이면 거부한다.
 - 데이터 구조: 출발지 맵(`filter_rules`)과 목적지 맵(`dst_rules`)이 각각 LPM trie, **맵당 최대 10240**(`MAX_FILTER_RULES`), **prefix당 룰 1개**. 패킷마다 `/32` 키로 출발지 맵을 1회 조회하고, 미스(또는 조건 불일치)면 목적지 맵을 1회 더 조회한다. `--side dst`는 매치 룰과 filler를 목적지 맵에 넣어 모든 패킷이 두 번 조회되게 한다.
-- `add_rule_us_avg` = 단계에서 추가한 filler 수로 나눈 벽시계 시간이다. `xdp-filter add-rule` 프로세스 생성과 TCP 연결을 포함하므로 **순수 맵 갱신 지연이 아니다.** 매치 룰은 준비 단계에서 넣으므로 `rules_added`에 포함되지 않는다.
+- `add_rule_us_avg` = 단계에서 추가한 filler 수로 나눈 벽시계 시간이다. `xdp-filter add-rule` 프로세스 생성과 API 연결(Unix 소켓)을 포함하므로 **순수 맵 갱신 지연이 아니다.** 매치 룰은 준비 단계에서 넣으므로 `rules_added`에 포함되지 않는다.
 - 가설(미측정): LPM trie 조회 비용은 룰 수보다 prefix 길이 분포에 좌우되므로, 모두 /32인 이 시나리오에서는 룰 수에 대해 평탄할 것으로 예상한다.
 
 ### 2.3 WASM 모듈 오버헤드 — 현재 측정 불가
