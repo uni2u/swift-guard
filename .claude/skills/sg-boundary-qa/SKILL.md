@@ -22,8 +22,8 @@ description: Swift-Guard 경계면 교차 검증 체크리스트와 스크립트
 | `linux_check.sh [bpf\|cargo\|test\|all]` | Docker로 BPF 컴파일 + daemon 포함 cargo check/test | 0 PASS / 1 FAIL / 2 알 수 없는 모드(옵션은 별도 인자: `examples -v`) / 3 docker 없음(SKIP) |
 | `bpf_unit_check.sh` | privileged Docker에서 Makefile 빌드 → verifier 로드 → `bpf_prog_test_run.py`로 PROG_TEST_RUN 케이스(IHL/조각/tiny fragment/src→dst 우선/결과 카운터 불변식 RX=Σ결과). daemon 없이 가장 빠른 BPF 회귀 검사. src/bpf·include 변경 시 실행 | 0 / 1 / 3 |
 | `linux_check.sh bench` | privileged Docker에서 `tools/test/bench_flow_check.sh` — Tier 3 스크립트 흐름(daemon 기동→attach→lab 트래픽→`stats --format csv`→요약 CSV→분석기→정리). 수치는 의미 없음. `tools/bench`, `tools/analysis`, `xdp-filter stats` 변경 시 실행 | 0 / 1 / 3 |
-| `systemd_check.sh` | systemd를 init으로 띄운 Ubuntu 24.04 컨테이너에서 README 10장(설치→enable→override `-i`+`ExecStartPost`→stop 시 detach→재시작 시 룰 재적용→uninstall)을 실행. rules.sh·override는 **README 본문에서 추출**하므로 문서와 동작이 함께 검증된다. README 10장/service/Makefile 변경 시 실행 | 0 / 1 / 3 |
-| `readme_check.sh [22.04 24.04]` | 깨끗한 Ubuntu에서 일반 사용자로 README 4~6장·WASM·예시 회귀·제거를 그대로 실행(초급자 경로). README의 설치/사용 명령이나 Makefile을 바꾸면 실행. README와 `readme_sim_inner.sh`의 단계는 함께 갱신 | 0 / 1 / 3 |
+| `systemd_check.sh` | (소켓 0660 root:swift-guard·비멤버 거부·멤버 허용·stop 시 소켓 삭제 포함) systemd를 init으로 띄운 Ubuntu 24.04 컨테이너에서 README 10장(설치→enable→override `-i`+`ExecStartPost`→stop 시 detach→재시작 시 룰 재적용→uninstall)을 실행. rules.sh·override는 **README 본문에서 추출**하므로 문서와 동작이 함께 검증된다. README 10장/service/Makefile 변경 시 실행 | 0 / 1 / 3 |
+| `readme_check.sh [22.04 24.04]` | (그룹 생성·소켓 권한·비멤버 거부/멤버 허용 포함) 깨끗한 Ubuntu에서 일반 사용자로 README 4~6장·WASM·예시 회귀·제거를 그대로 실행(초급자 경로). README의 설치/사용 명령이나 Makefile을 바꾸면 실행. README와 `readme_sim_inner.sh`의 단계는 함께 갱신 | 0 / 1 / 3 |
 | `linux_check.sh examples [-v]` | privileged Docker에서 `tools/test/examples.sh` — `docs/examples.md` 예시가 문서대로 동작하는지(CLI 출력·에러 문구 포함). CLI/룰 의미/에러 메시지를 바꾸면 실행하고, 출력이 바뀌면 문서도 갱신 | 0 / 1 / 3 |
 | `linux_check.sh e2e [--with-ignored]` | privileged Docker에서 `tools/test/e2e_check.sh`(Tier 2: veth+generic XDP, verifier·attach·매치·통계·SIGTERM) | 0 PASS / 1 FAIL / 3 docker 없음 |
 
@@ -36,7 +36,7 @@ description: Swift-Guard 경계면 교차 검증 체크리스트와 스크립트
 
 ### 0. 엔트리포인트 연결 (가장 먼저)
 경계 양쪽이 일치해도 **실제로 연결되어 실행되지 않으면** 의미가 없다.
-1. `src/daemon/src/main.rs`가 설정 로드 → BPF 오브젝트 로드 → MapManager → TelemetryCollector → ApiServer(listen) → WASM 매니저를 실제로 생성·실행하는가. CLI가 접속하는 주소/포트와 서버 bind 주소가 같은가.
+1. `src/daemon/src/main.rs`가 설정 로드 → BPF 오브젝트 로드 → MapManager → TelemetryCollector → ApiServer(listen) → WASM 매니저를 실제로 생성·실행하는가. CLI·daemon 기본 endpoint가 모두 `common::endpoint::DEFAULT_API_ENDPOINT`를 쓰는가, 문서·스크립트의 주소가 `unix:`/`tcp:<루프백>` 문법인가, 소켓 권한(0660 root:swift-guard)과 비권한 사용자 거부가 검증되는가.
 2. `server.rs`의 각 요청 처리가 실제 동작(맵 갱신, attach 등)을 호출하는가, 아니면 아무것도 하지 않고 `Success`만 반환하는가.
 3. CLI `main.rs`의 서브커맨드가 모두 ApiClient 호출로 이어지는가.
 4. 테스트가 실제로 실행되는가: `cargo test -- --list`에 기대한 테스트가 나오는가(`tests/integration/`은 cargo가 자동 인식하지 않는다 — mac_check가 WARN으로 표시).
@@ -67,6 +67,7 @@ description: Swift-Guard 경계면 교차 검증 체크리스트와 스크립트
 ### D. 문서·스크립트 ↔ CLI
 1. README, `tools/bench/*.sh`, `docs/poc-plan.md`에 나오는 `xdp-filter` 서브커맨드/옵션이 `cli/src/main.rs`의 clap 정의에 존재하는가. 이번 변경으로 CLI가 바뀌었다면 문서 갱신 여부.
 2. `config/swift-guard.yaml` 키 ↔ `daemon/src/config.rs` serde 구조체.
+5. README의 daemon 통신 명령은 `sudo xdp-filter …`(`--version`/`--help` 제외), 최소 커널 표기는 5.15.
 4. 벤치 CSV 계약: `xdp-filter stats --format csv` 헤더 ↔ `tools/bench/*` 파싱 ↔ 요약 CSV 헤더 ↔ `tools/analysis/analyze_performance.py`가 읽는 열 ↔ 문서(poc-plan, README 13장)에 적힌 열 이름을 대조한다.
 3. README 설치 절차 재현: 빌드 의존성이나 README/Makefile이 바뀌었으면 `readme_check.sh`를 돌린다(깨끗한 Ubuntu + 일반 사용자 + README 명령 그대로). `linux_check.sh`는 자체 의존성을 설치하므로 README 누락을 잡지 못한다. 복사는 `git clone`이 아니라 작업 트리 기준으로 한다(clone은 커밋된 코드만 가져온다).
 

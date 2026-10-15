@@ -28,6 +28,8 @@ verifier는 "모든 경로에서 메모리 접근이 증명 가능하게 안전�
 - 헬퍼 함수는 `static __always_inline`. 스택은 512바이트 제한 — 큰 구조체를 스택에 복사하지 말고 맵 값 포인터를 쓴다.
 - 비트필드 TCP 헤더 파싱은 엔디안 종속이다. 현재 정의는 little-endian 전제이므로 다른 타깃을 고려하면 `doff_res`/flags 바이트를 직접 마스킹하는 방식을 쓴다.
 
+- 최소 커널 5.15(2026-10-16 결정): JMP32/ALU32, `__sync_fetch_and_add` 반환값 사용(BPF_FETCH)·`__sync_val_compare_and_swap`(5.12+) 사용 가능. `bpf_xdp_load_bytes`(5.18 [확인 필요]) 이후 헬퍼는 쓰지 않는다. Docker 커널(7.x)은 5.15 verifier를 대신할 수 없으므로 사용자 장비(Ubuntu 22.04 GA)에서 1회 로드 확인이 필요하다.
+
 ## 바이트 오더
 - `iph->saddr`는 네트워크 바이트 오더 그대로 LPM key에 들어간다. LPM trie는 key의 `data` 바이트를 상위 비트부터 비교하므로 **네트워크 오더**여야 CIDR 매칭이 맞다. Rust 쪽이 key를 만들 때 이 규칙과 일치하는지 QA가 확인한다 — 새 매칭 필드를 추가할 때도 같은 원칙을 문서화한다.
 - 포트는 `bpf_ntohs`로 호스트 오더 변환 후 비교한다(맵에 저장되는 port_min/max는 호스트 오더).
@@ -41,7 +43,7 @@ verifier는 "모든 경로에서 메모리 접근이 증명 가능하게 안전�
 | 사용자 Linux 장비 | `make -C src/bpf` → `sudo bpftool prog load src/bpf/xdp_filter.o /sys/fs/bpf/sgtest && sudo rm /sys/fs/bpf/sgtest` | verifier 실통과 확인 |
 
 verifier 실통과는 커널에 로드해야만 확인된다(`linux_check.sh e2e` 1단계). 컴파일 성공을 verifier 통과로 보고하지 않는다.
-- 빌드는 반드시 `make -C src/bpf` 경로로 확인한다. Makefile 플래그(`-g -O2`)가 빠지면 BTF가 없어 libbpf가 BTF 정의 맵(`.maps`)을 열지 못한다 — 직접 clang 호출로는 이 회귀를 못 잡는다.
+- 빌드는 반드시 `make -C src/bpf` 경로로 확인한다. Makefile 플래그는 `-g -O2 -mcpu=v3`(`BPF_CPU ?= v3`)다. `-g`가 빠지면 BTF가 없어 libbpf가 BTF 정의 맵(`.maps`)을 열지 못하고, `-mcpu=v3`가 빠지면 clang 기본값(v1)으로 내려가 fetch 계열 원자 연산·cmpxchg를 쓸 수 없고 clang 버전마다 바이트코드가 달라진다. 직접 clang 호출로는 이런 Makefile 회귀를 못 잡는다.
 
 ## 보고서 형식 (`_workspace/02_bpf_report.md`)
 ```markdown

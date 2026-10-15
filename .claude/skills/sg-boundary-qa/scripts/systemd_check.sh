@@ -30,12 +30,18 @@ systemctl is-system-running --wait >/dev/null 2>&1
 mkdir -p /root/sg && cd /src && git config --global --add safe.directory /src && git ls-files -co --exclude-standard | while read -r f; do [ -e "$f" ] && echo "$f"; done | tar -cf - -T - | tar -xf - -C /root/sg
 cd /root/sg && mkdir -p target/release && cp /art/xdp-filter /art/swift-guard-daemon target/release/ && cp /art/xdp_filter.o src/bpf/
 make install >/dev/null 2>&1 && [ -f /etc/systemd/system/swift-guard.service ] || fail "make install / service file"
+getent group swift-guard >/dev/null || fail "group swift-guard not created"
 ip link add enp1s0 type veth peer name enp1s0p; ip link set enp1s0 up; ip link set enp1s0p up
 # README 10장의 rules.sh 블록을 그대로 추출해 사용
 awk '/^#!\/bin\/bash$/{f=1} f{print} /^exit 0$/{if(f){exit}}' README.md > /etc/swift-guard/rules.sh
 grep -q "xdp-filter" /etc/swift-guard/rules.sh || fail "could not extract rules.sh from README"
 chmod +x /etc/swift-guard/rules.sh
 systemctl enable --now swift-guard >/dev/null 2>&1; sleep 2; systemctl is-active -q swift-guard || fail "enable --now"
+[ "$(stat -c '%a %U %G' /run/swift-guard/api.sock 2>/dev/null)" = "660 root swift-guard" ] || fail "socket perms: $(stat -c '%a %U %G' /run/swift-guard/api.sock 2>&1)"
+useradd -M sgout 2>/dev/null; useradd -M -G swift-guard sgin 2>/dev/null
+OUTMSG=$(runuser -u sgout -- xdp-filter list-rules 2>&1) && fail "non-member allowed"
+echo "$OUTMSG" | grep -qi "permission denied" || fail "deny message: $OUTMSG"
+runuser -u sgin -- xdp-filter list-rules >/dev/null 2>&1 || fail "group member denied"
 mkdir -p /etc/systemd/system/swift-guard.service.d
 # README 10장의 마지막 [Service] override 블록(ExecStartPost 포함)을 그대로 추출
 awk '/^```ini$/{buf=""; f=1; next} /^```$/{if(f){last=buf}; f=0; next} f{buf=buf $0 "\n"} END{printf "%s", last}' README.md > /etc/systemd/system/swift-guard.service.d/override.conf
@@ -45,6 +51,7 @@ systemctl is-active -q swift-guard || fail "active after override"
 xdp_on || fail "-i attach"
 R=$(xdp-filter list-rules | grep -cE "block-bad-net|guard-ssh"); [ "$R" -eq 2 ] || fail "ExecStartPost rules ($R)"
 systemctl stop swift-guard; sleep 2; xdp_on && fail "XDP left after stop"
+[ -e /run/swift-guard/api.sock ] && fail "socket left after stop"
 systemctl start swift-guard; sleep 3; R=$(xdp-filter list-rules | grep -cE "block-bad-net|guard-ssh"); [ "$R" -eq 2 ] || fail "rules after restart"
 make uninstall >/dev/null 2>&1; sleep 1; xdp_on && fail "XDP left after uninstall"
 [ -e /usr/local/bin/xdp-filter ] && fail "binary left after uninstall"

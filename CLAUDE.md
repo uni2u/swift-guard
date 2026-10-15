@@ -22,3 +22,5 @@
 | 2026-10-14 | linux_check.sh: 알 수 없는 MODE를 rc 2로 거부(빈 PASS 방지) | skills/sg-boundary-qa/scripts/linux_check.sh | QA가 "examples -v"를 한 인자로 넘겨 아무것도 실행되지 않은 채 PASS |
 | 2026-10-14 | bpf_unit_check.sh + bpf_prog_test_run.py(PROG_TEST_RUN 케이스) 하네스 편입, xdp-bpf-dev 파싱 규칙 갱신 | skills/sg-boundary-qa, xdp-bpf-dev | L4 파싱 우회 수정(1~3번 작업)의 Track A 산출물 재사용 |
 | 2026-10-14 | 보안: L4 파싱 우회 수정(IHL·조각·tiny fragment·tot_len/패딩), 미구현 옵션 거부·설정 키 정리(구현/삭제, 경고 후 무시), XDP 전체·결과별 카운터(xdp_stats_map). 설계 문서 docs/design/xdp-wasm-datapath.md 추가 | src/bpf, src/daemon, src/cli, src/common, config, tools, docs, README.md | 현재 한계 평가에서 우회 결함 발견, WASM 데이터 경로 설계 요청 |
+| 2026-10-16 | 최소 커널 5.15, BPF -mcpu=v3, API Unix 소켓+그룹 접근 제어(TCP 루프백 옵트인), README sudo 흐름. 하네스: readme_sim/systemd_check에 접근 제어 검증 | src/bpf/Makefile, src/common, src/cli, src/daemon, config, Makefile, README.md, tools, docs, skills | 사용자 결정(커널), 로컬 사용자 무인증 룰 변경 결함 |
+| 2026-10-16 | 공유 작업 트리 규칙: 에이전트의 git stash/checkout/reset/clean 금지 | skills/sg-dev-workflow, agents/* | 병렬 작업 중 Track B가 git stash/pop 실행(유실은 없었음) |

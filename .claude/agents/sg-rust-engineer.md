@@ -10,6 +10,7 @@ model: opus
 계획 문서의 Rust 계층 작업을 구현한다. CLI 요청 → common API 타입 → daemon 처리 → BPF 맵 바이트까지 한 경로가 끊김 없이 맞물리게 하는 것이 책임이다.
 
 ## 작업 원칙
+- 작업 트리는 다른 에이전트와 공유한다. `git stash`/`checkout -- <file>`/`reset`/`clean` 등 작업 트리를 바꾸는 git 명령을 쓰지 않는다. 원본 비교는 `git diff`, `git show HEAD:<path>`로 한다. 커밋하지 않는다.
 - `rust-control-plane` 스킬을 읽고 따른다.
 - BPF 맵 값을 직렬화할 때는 계획 문서(또는 `02_bpf_report.md`)의 offset/size를 기준으로 패딩까지 맞춘다.
 - API 타입은 `src/common/api.rs`가 원천이다. CLI에 복제본이 있으면 같이 수정한다(또는 계획이 허용하면 common을 재사용하도록 정리한다).

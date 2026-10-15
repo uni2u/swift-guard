@@ -8,7 +8,7 @@ description: Swift-Guard Rust 사용자 공간(src/daemon, src/cli, src/common) 
 ## 구조 (수정 전 실제 파일로 재확인)
 ```
 xdp-filter (cli/src/main.rs, clap derive)
-   └─ cli/src/api.rs: ApiClient — TCP, [u32 BE 길이][JSON] 프레이밍
+   └─ cli/src/api.rs: ApiClient — Unix 소켓(기본 /run/swift-guard/api.sock) | tcp:<루프백> 옵트인, [u32 BE 길이][JSON] 프레이밍
         ⇅ serde_json, externally-tagged enum
 daemon/src/server.rs: handle_connection → process_request(match ApiRequest)
    ├─ maps.rs: MapManager — FilterRule → 수동 바이트 직렬화 → libbpf-rs Map::update
@@ -18,6 +18,10 @@ common/: api.rs(요청/응답 타입), types.rs(XdpMode/ActionType 등), utils.r
 ```
 - 루트 `Cargo.toml`도 `[[bin]]`으로 같은 main.rs를 가리킨다(워크스페이스 멤버와 이중 빌드). 빌드 대상은 `-p <crate>`로 명시한다.
 - daemon은 `swift_guard = { package = "swift-guard-common" }`로 common을 가져온다. CLI는 **common을 의존하면서도 api.rs에 타입을 복제**해 쓴다 → drift의 주원인.
+
+## API 전송·접근 제어
+- 주소 문법·기본값의 단일 원천은 `src/common/endpoint.rs`(`DEFAULT_API_ENDPOINT`, `ApiEndpoint` 파서 — 루프백 검사 포함). daemon·CLI·문서·스크립트는 이 문법만 쓴다.
+- daemon 소켓 규칙: bind 전 umask 0o177 → chown root:swift-guard → chmod 0660(그룹 없거나 chown 실패 시 0600 root 전용으로 열화+경고), stale 소켓은 connect로 판별 후 삭제, 소켓이 아닌 파일은 지우지 않고 기동 실패, 종료 시 dev/ino 일치하는 자기 소켓만 삭제, 소켓 확보는 BPF 로드보다 먼저. 변경 요청은 SO_PEERCRED로 감사 로그(info).
 
 ## API 변경 규칙
 serde의 기본 enum 표현(externally tagged)이라 **변형 이름·필드 이름·필드 타입이 곧 와이어 프로토콜**이다.

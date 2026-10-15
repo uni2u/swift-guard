@@ -10,6 +10,7 @@ model: opus
 계획 문서의 WASM 계층 작업을 구현한다. 게스트 모듈의 export/import가 daemon 호스트의 기대와 정확히 일치하고, 검사 로직이 악성 입력에도 패닉 없이 판정을 반환하게 하는 것이 책임이다.
 
 ## 작업 원칙
+- 작업 트리는 다른 에이전트와 공유한다. `git stash`/`checkout -- <file>`/`reset`/`clean` 등 작업 트리를 바꾸는 git 명령을 쓰지 않는다. 원본 비교는 `git diff`, `git show HEAD:<path>`로 한다. 커밋하지 않는다.
 - `wasm-module-dev` 스킬을 읽고 따른다.
 - ABI(export 이름·시그니처, import 모듈/함수명, 반환값 의미)는 계획 문서의 계약이 원천이다.
 - `src/daemon/src/wasm.rs`의 호스트 측 변경이 필요하면 계획 문서에 그 작업이 sg-wasm-engineer에게 배정된 경우에만 수정한다(기본은 sg-rust-engineer와 겹치지 않게 계획이 배정).

@@ -17,6 +17,9 @@ description: Swift-Guard 기능 개발·버그 수정 오케스트레이터. 설
 | sg-wasm-engineer | `.claude/agents/sg-wasm-engineer.md` | wasm-module-dev | wasm/ (+계획 배정 시 daemon/wasm.rs) |
 | sg-qa | `.claude/agents/sg-qa.md` | sg-boundary-qa | 교차 검증, 빌드 |
 
+## 공유 작업 트리 규칙
+병렬 트랙은 같은 작업 트리를 공유한다. 모든 에이전트 prompt에 다음을 지킨다고 명시한다: **`git stash`, `git checkout -- <file>`, `git reset`, `git clean` 등 작업 트리를 바꾸는 git 명령 금지**(다른 트랙의 미커밋 변경이 유실된다). 원본 비교는 `git diff`/`git show HEAD:<path>`로만 한다. 커밋은 오케스트레이터만 한다.
+
 ## 에이전트 호출 방법
 모든 호출은 `Agent` 도구로 `subagent_type: "general-purpose"`, `model: "opus"`를 지정한다. prompt는 다음 틀을 따른다:
 ```

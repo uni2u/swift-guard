@@ -26,6 +26,7 @@ grep -i "skipping WASM" /tmp/build.log
 ls -l src/bpf/xdp_filter.o target/release/xdp-filter target/release/swift-guard-daemon || fail "build outputs"
 step "4-6 sudo make install"
 sudo make install >/tmp/install.log 2>&1 || { cat /tmp/install.log; fail "sudo make install"; }
+getent group swift-guard || fail "group swift-guard not created by make install"
 grep -E "skipping|Installation complete|No built WASM" /tmp/install.log
 step "5-1"
 xdp-filter --version || fail version; xdp-filter --help | head -4; swift-guard-daemon --help | head -3
@@ -34,23 +35,31 @@ sudo tools/test/e2e_check.sh > /tmp/e2e.out 2>&1; rc=$?; grep -E "^\[FAIL|^\[SKI
 step "6 tutorial"
 sudo tools/test/lab.sh up || fail "lab up"
 sudo swift-guard-daemon --bpf-obj /usr/local/lib/swift-guard/xdp_filter.o >/tmp/d.log 2>&1 &
-sleep 2
-xdp-filter attach sg-lab0 --mode generic || fail attach
+for i in $(seq 50); do sudo xdp-filter list-rules >/dev/null 2>&1 && break; sleep 0.2; done
+step "9-5 access control (Unix socket)"
+stat -c '%a %U %G' /run/swift-guard/api.sock
+[ "$(stat -c '%a %U %G' /run/swift-guard/api.sock)" = "660 root swift-guard" ] || fail "socket perms"
+if xdp-filter list-rules >/tmp/deny.out 2>&1; then fail "non-member user must be denied"; fi
+grep -qi "permission denied" /tmp/deny.out || { cat /tmp/deny.out; fail "denied message must say permission denied"; }
+sudo usermod -aG swift-guard "$USER"
+sg swift-guard -c "xdp-filter list-rules" >/dev/null || fail "group member must be allowed"
+sudo gpasswd -d "$USER" swift-guard >/dev/null
+sudo xdp-filter attach sg-lab0 --mode generic || fail attach
 [ "$(sudo tools/test/lab.sh ping 10.200.0.2)" = OK ] || fail "ping before"
 [ "$(sudo tools/test/lab.sh http 10.200.0.2)" = OK ] || fail "http before"
-xdp-filter add-rule --src-ip 10.200.0.2 --action drop --label my-first-rule || fail add
+sudo xdp-filter add-rule --src-ip 10.200.0.2 --action drop --label my-first-rule || fail add
 [ "$(sudo tools/test/lab.sh ping 10.200.0.2)" = BLOCKED ] || fail "blocked"
 [ "$(sudo tools/test/lab.sh ping 10.200.0.3)" = OK ] || fail "other ok"
-xdp-filter list-rules --stats
-xdp-filter delete-rule --label my-first-rule || fail del
+sudo xdp-filter list-rules --stats
+sudo xdp-filter delete-rule --label my-first-rule || fail del
 [ "$(sudo tools/test/lab.sh ping 10.200.0.2)" = OK ] || fail "restored"
 step "6 tutorial step 7 (dst rule)"
-xdp-filter add-rule --dst-ip 10.200.0.11 --protocol tcp --dst-port 8080 --action drop --label protect-web2 || fail "dst add"
+sudo xdp-filter add-rule --dst-ip 10.200.0.11 --protocol tcp --dst-port 8080 --action drop --label protect-web2 || fail "dst add"
 [ "$(sudo tools/test/lab.sh --to 10.200.0.11 http 10.200.0.2)" = BLOCKED ] || fail "dst blocked .2"
 [ "$(sudo tools/test/lab.sh --to 10.200.0.11 http 10.200.0.3)" = BLOCKED ] || fail "dst blocked .3"
 [ "$(sudo tools/test/lab.sh http 10.200.0.2)" = OK ] || fail "other server ok"
-xdp-filter delete-rule --label protect-web2 || fail "dst del"
-xdp-filter detach sg-lab0 || fail detach
+sudo xdp-filter delete-rule --label protect-web2 || fail "dst del"
+sudo xdp-filter detach sg-lab0 || fail detach
 sudo kill -INT $(pidof swift-guard-daemon) || fail "kill via pidof"; sleep 1
 pidof swift-guard-daemon && fail "daemon still running"
 step "0/7-1 background run + rules.sh (10장)"
@@ -69,7 +78,7 @@ exit 0
 RULES
 sudo chmod +x /etc/swift-guard/rules.sh
 sudo /etc/swift-guard/rules.sh || fail "rules.sh"
-xdp-filter list-rules | tee /tmp/rules.out
+sudo xdp-filter list-rules | tee /tmp/rules.out
 grep -q block-bad-net /tmp/rules.out && grep -q guard-ssh /tmp/rules.out || fail "rules not applied"
 sudo /etc/swift-guard/rules.sh >/dev/null 2>&1 || fail "rules.sh rerun must exit 0 even with duplicates"
 sudo kill -INT $(pidof swift-guard-daemon); sleep 1
